@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import multiprocessing as mp
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -26,12 +27,21 @@ if __name__ == "__main__":
     horizon = 10
     action_dim = 14
     times = 10
-    robotwin = RoboTwin(task_name, n_envs, horizon, steps)
+
+    # 构造与 env worker 一致的最小 cfg（不要把 n_envs 直接传入构造函数）
+    cfg = SimpleNamespace(
+        init_params={"num_envs": n_envs},
+        horizon=horizon,
+        image_size=(224, 224),
+        twin2_task_config="demo_clean",
+        twin2_ckpt_setting="demo_clean",
+        twin2_instruction_type="unseen",
+    )
+    robotwin = RoboTwin(cfg, seed_offset=0, total_num_processes=1)
     actions = np.zeros((n_envs, horizon, action_dim))
     for t in range(times):
-        prev_obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv = (
-            robotwin.init_process()
-        )
+        # 获取初始观测（不再调用 init_process）
+        prev_obs_venv, info_venv = robotwin.reset()
         for step in range(steps):
             actions += np.random.randn(n_envs, horizon, action_dim) * 0.05
             actions = np.clip(actions, 0, 1)

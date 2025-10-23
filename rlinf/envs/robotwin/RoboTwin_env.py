@@ -17,13 +17,13 @@ import os
 from multiprocessing import Array, Event, Semaphore, Value
 
 import cv2
-import envs  # robotwin.envs
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.multiprocessing as mp
 import yaml
 from omegaconf.omegaconf import OmegaConf
+from RoboTwin_wrapper import RobotwinEnvWrapper
 
 """
 Input values:
@@ -32,17 +32,6 @@ Complete return values:
 images[step,3,3,480,640]
 states[step,action_dim]
 """
-
-
-def class_decorator(task_name):
-    envs_module = importlib.import_module(f"envs.{task_name}")
-    try:
-        env_class = getattr(envs_module, task_name)
-        env_instance = env_class()
-    except Exception as e:
-        print(f"Error in class_decorator: {e}")
-        raise SystemExit("No Task")
-    return env_instance
 
 
 def worker(
@@ -61,11 +50,8 @@ def worker(
     HORIZON = args["horizon"]
     ACTION_DIM = args["action_dim"]
     RESULT_SIZE = args["result_size"]
-    # INPUT_SIZE = args['input_size']
 
-    envs_finish = False
-
-    def filling_up(return_poses):
+    def filling_up(return_poses: np.ndarray):
         if len(return_poses) < HORIZON:
             new_poses = np.empty((HORIZON, *return_poses.shape[1:]))
             new_poses[: len(return_poses)] = return_poses
@@ -73,32 +59,24 @@ def worker(
             return new_poses
         return return_poses
 
-    task = class_decorator(task_name)
+    env_wrapper = RobotwinEnvWrapper(
+        task_name,
+        trial_id=0,
+        trial_seed=0,
+        config=args,
+        version="2.0",
+    )
+    env_wrapper.initialize()
 
-    valid_seed = False
-    while not valid_seed:
-        try:
-            with seed_id.get_lock():
-                now_seed = seed_id.value
-                seed_id.value += 1
-                if seed_id.value >= 30:
-                    seed_id.value %= 30
-            task.setup_demo(now_ep_num=now_seed, seed=now_seed, **args)
-            valid_seed = True
-        except Exception as e:
-            print(
-                f"Error in process {process_id} during setup_demo with seed {now_seed}: {e}"
-            )
-
-    # After successful initialization, need to return initial scene
+    # Initial observation push
     action_input_sem.acquire()
-    task.run_steps = 0  # Used to record current step, ends when greater than max steps per environment (450 steps in shoe_place)
-    prev_obs_venv = task.get_obs()
-    return_pose = np.array([task.get_return_pose()])
-    return_pose = filling_up(return_pose)
-    prev_obs_venv = [prev_obs_venv]
-    image_return = update_obs(prev_obs_venv[-1])[0] + update_obs(prev_obs_venv[-1])[0]
-    state_return = update_obs(prev_obs_venv[-1])[1]
+    prev_obs = env_wrapper.get_obs()
+    imgs, state = update_obs(prev_obs)
+    image_return = imgs + imgs  # duplicate 3 cams to 6
+    state_return = state
+    return_poses = np.zeros((HORIZON, 6), dtype=np.float64)
+    return_poses = filling_up(return_poses[0:1, :])
+
     image_return = np.array(image_return)
     state_return = np.array(state_return)
 
@@ -109,14 +87,13 @@ def worker(
             np.array([0]),
             np.array([0]),
             np.array([0]),
-            return_pose.flatten(),
+            return_poses.flatten(),
         ]
     )
     results[RESULT_SIZE * process_id : (process_id + 1) * RESULT_SIZE] = result
     result_output_sem.release()
 
     while True:
-        # Receive action_input_event semaphore, indicating actions need to be updated
         action_input_sem.acquire()
         numpy_actions = np.frombuffer(actions.get_obj()).reshape(
             NUM_PROCESSES, HORIZON, ACTION_DIM
@@ -125,7 +102,6 @@ def worker(
 
         if reset_event.is_set():
             valid_seed = False
-
             while not valid_seed:
                 try:
                     with seed_id.get_lock():
@@ -133,28 +109,34 @@ def worker(
                         seed_id.value += 1
                         if seed_id.value >= 30:
                             seed_id.value %= 30
-                    task.setup_demo(now_ep_num=now_seed, seed=now_seed, **args)
+                    # Recreate wrapper with new seed
+                    try:
+                        env_wrapper.close()
+                    except Exception:
+                        pass
+                    env_wrapper = RobotwinEnvWrapper(
+                        task_name,
+                        trial_id=now_seed,
+                        trial_seed=now_seed,
+                        config=args,
+                        version="2.0",
+                    )
+                    env_wrapper.initialize()
                     valid_seed = True
                 except Exception as e:
                     print(
-                        f"Error in process {process_id} during setup_demo with seed {now_seed}: {e}"
+                        f"Error in process {process_id} during reset with seed {now_seed}: {e}"
                     )
-            task.run_steps = 0  # Used to record current step, ends when greater than max steps per environment (450 steps in shoe_place)
-            task.reward_step = 0  # Corresponds to reward acquisition phase
-            envs_finish = False
-            prev_obs_venv = task.get_obs()
-            prev_obs_venv = [prev_obs_venv]
-            image_return = (
-                update_obs(prev_obs_venv[-1])[0] + update_obs(prev_obs_venv[-1])[0]
-            )
-            state_return = update_obs(prev_obs_venv[-1])[1]
-            image_return = np.array(image_return)
-            state_return = np.array(state_return)
-            task.reward.initialize()
+
+            prev_obs = env_wrapper.get_obs()
+            imgs, state = update_obs(prev_obs)
+            image_return = imgs + imgs
+            state_return = state
+            return_poses = np.zeros((HORIZON, 6), dtype=np.float64)
+            return_poses = filling_up(return_poses[0:1, :])
 
             image_return = np.array(image_return)
             state_return = np.array(state_return)
-
             result = np.concatenate(
                 [
                     image_return.flatten(),
@@ -162,63 +144,73 @@ def worker(
                     np.array([0]),
                     np.array([0]),
                     np.array([1]),
-                    return_pose.flatten(),
+                    return_poses.flatten(),
                 ]
             )
             results[RESULT_SIZE * process_id : RESULT_SIZE * (process_id + 1)] = result
             result_output_sem.release()
-
             continue
 
-        """
-        obs_venv,
-        reward_venv,
-        terminated_venv,
-        truncated_venv,
-        info_venv,
-        """
-        obs_venv, reward_venv, terminated_venv, _, return_poses = (
-            task.gen_dense_reward_once(input_actions)
-        )
-        # TODO something return_poses is [1,6], sometimes is [2,6]
-        return_poses = return_poses[0:1, :]
-        return_poses = filling_up(return_poses)
-        if len(obs_venv) > 1:  # Indicates not finished/successful
-            image_return = update_obs(obs_venv[-2])[0] + update_obs(obs_venv[-1])[0]
-            state_return = update_obs(obs_venv[-1])[1]
-        # Encode in order
-        # Check if need to start new environment
-        if terminated_venv[0] == 1:
-            envs_finish = True
+        # Rollout HORIZON steps
+        last_reward = 0.0
+        last_terminated = False
+        last_truncated = False
+        obs_list = []
+        cur_obs = prev_obs
+        for t in range(HORIZON):
+            action = input_actions[t].reshape(1, ACTION_DIM)
+            cur_obs, r, terminated, truncated, info = env_wrapper.step(action)
+            last_reward = float(r)
+            last_terminated = bool(terminated)
+            last_truncated = bool(truncated)
+            obs_list.append(cur_obs)
+            if last_terminated:
+                break
 
-        if envs_finish:
-            valid_seed = False
+        # Build image/state return using last two obs
+        if len(obs_list) >= 1:
+            last_obs = obs_list[-1]
+        else:
+            last_obs = prev_obs
 
-            while not valid_seed:
-                try:
-                    with seed_id.get_lock():
-                        now_seed = seed_id.value
-                        seed_id.value += 1
-                        if seed_id.value >= 30:
-                            seed_id.value %= 30
-                    task.setup_demo(now_ep_num=now_seed, seed=now_seed, **args)
-                    valid_seed = True
-                except Exception as e:
-                    print(
-                        f"Error in process {process_id} during setup_demo with seed {now_seed}: {e}"
-                    )
-            task.run_steps = 0  # Used to record current step, ends when greater than max steps per environment (450 steps in shoe_place)
-            task.reward_step = 0  # Corresponds to reward acquisition phase
-            envs_finish = False
-            prev_obs_venv = task.get_obs()
-            prev_obs_venv = [prev_obs_venv]
-            image_return = (
-                update_obs(prev_obs_venv[-1])[0] + update_obs(prev_obs_venv[-1])[0]
+        if len(obs_list) >= 2:
+            penult_obs = obs_list[-2]
+        else:
+            penult_obs = prev_obs
+
+        imgs_a, _ = update_obs(penult_obs)
+        imgs_b, state_b = update_obs(last_obs)
+        image_return = imgs_a + imgs_b
+        state_return = state_b
+
+        return_poses = np.zeros((HORIZON, 6), dtype=np.float64)
+        return_poses = filling_up(return_poses[0:1, :])
+
+        # Auto reset if terminated: immediately start new episode and send its first obs next time
+        if last_terminated:
+            try:
+                with seed_id.get_lock():
+                    now_seed = seed_id.value
+                    seed_id.value += 1
+                    if seed_id.value >= 30:
+                        seed_id.value %= 30
+            except Exception:
+                now_seed = 0
+            try:
+                env_wrapper.close()
+            except Exception:
+                pass
+            env_wrapper = RobotwinEnvWrapper(
+                task_name,
+                trial_id=now_seed,
+                trial_seed=now_seed,
+                config=args,
+                version="2.0",
             )
-            state_return = update_obs(prev_obs_venv[-1])[1]
-            image_return = np.array(image_return)
-            state_return = np.array(state_return)
-            task.reward.initialize()
+            env_wrapper.initialize()
+            prev_obs = env_wrapper.get_obs()
+        else:
+            prev_obs = last_obs
 
         image_return = np.array(image_return)
         state_return = np.array(state_return)
@@ -227,9 +219,9 @@ def worker(
             [
                 image_return.flatten(),
                 state_return.flatten(),
-                reward_venv.flatten(),
-                terminated_venv.flatten(),
-                np.array([0]),
+                np.array([last_reward]),
+                np.array([1 if last_terminated else 0]),
+                np.array([1 if last_truncated else 0]),
                 return_poses.flatten(),
             ]
         )
@@ -255,7 +247,11 @@ class RoboTwin(gym.Env):
         self.record_metrics = record_metrics
         self._is_start = True
         self.info_logging_keys = ["is_src_obj_grasped", "consecutive_grasp", "success"]
-        self.env_args = OmegaConf.to_container(cfg.init_params, resolve=True)
+        try:
+            self.env_args = OmegaConf.to_container(cfg.init_params, resolve=True)
+        except Exception:
+            # 兼容直接传入 dict 的用法
+            self.env_args = dict(cfg.init_params)
         if self.record_metrics:
             self._init_metrics()
 
@@ -263,95 +259,29 @@ class RoboTwin(gym.Env):
         self.n_envs = self.num_envs
         self.horizon = getattr(cfg, "horizon", 1)
         self.action_dim = 14
-        self.root_path = envs.__file__.split("envs")[0]
-        head_camera_type = "D435"
-        seed = 1
-        rdt_step = 10
         self.image_size = self.cfg.image_size
-        with open(
-            os.path.join(self.root_path, f"task_config/{self.task_name}.yml"),
-            "r",
-            encoding="utf-8",
-        ) as f:
-            args = yaml.load(f.read(), Loader=yaml.FullLoader)
-        embodiment_type = args.get("embodiment")
-        embodiment_config_path = os.path.join(
-            self.root_path, "task_config/_embodiment_config.yml"
-        )
-
-        with open(embodiment_config_path, "r", encoding="utf-8") as f:
-            _embodiment_types = yaml.load(f.read(), Loader=yaml.FullLoader)
-
-        with open(
-            self.root_path + "task_config/_camera_config.yml", "r", encoding="utf-8"
-        ) as f:
-            _camera_config = yaml.load(f.read(), Loader=yaml.FullLoader)
-
-        args["head_camera_h"] = _camera_config[head_camera_type]["h"]
-        args["head_camera_w"] = _camera_config[head_camera_type]["w"]
-
-        def get_embodiment_file(embodiment_type):
-            robot_file = _embodiment_types[embodiment_type]["file_path"]
-            if robot_file is None:
-                raise "No embodiment files"
-            return robot_file
-
-        def get_embodiment_config(robot_file):
-            robot_config_file = os.path.join(robot_file, "config.yml")
-            with open(robot_config_file, "r", encoding="utf-8") as f:
-                embodiment_args = yaml.load(f.read(), Loader=yaml.FullLoader)
-            return embodiment_args
-
-        if len(embodiment_type) == 1:
-            args["left_robot_file"] = os.path.join(
-                self.root_path, get_embodiment_file(embodiment_type[0])
-            )
-            args["right_robot_file"] = os.path.join(
-                self.root_path, get_embodiment_file(embodiment_type[0])
-            )
-            args["dual_arm_embodied"] = True
-        elif len(embodiment_type) == 3:
-            args["left_robot_file"] = get_embodiment_file(embodiment_type[0])
-            args["right_robot_file"] = get_embodiment_file(embodiment_type[1])
-            args["embodiment_dis"] = embodiment_type[2]
-            args["dual_arm_embodied"] = False
-        else:
-            raise "embodiment items should be 1 or 3"
-
-        args["left_embodiment_config"] = get_embodiment_config(args["left_robot_file"])
-        args["right_embodiment_config"] = get_embodiment_config(
-            args["right_robot_file"]
-        )
-
-        if len(embodiment_type) == 1:
-            embodiment_name = str(embodiment_type[0])
-        else:
-            embodiment_name = str(embodiment_type[0]) + "_" + str(embodiment_type[1])
-
-        args["embodiment_name"] = embodiment_name
-        args["expert_seed"] = seed
-
-        args["rdt_step"] = rdt_step
-        args["save_path"] += f"/{self.task_name}_reward"
-
-        # global NUM_PROCESSES, HORIZON, ACTION_DIM, RESULT_SIZE, INPUT_SIZE
-        args["n_envs"] = self.num_envs
-        args["horizon"] = self.horizon
-        args["action_dim"] = 14
 
         self.NUM_IMAGES = 6
-        self.IMAGE_SHAPE = (240, 320, 3)  # Shape of each image
-        self.STATE_SHAPE = (1, 14)  # Shape of state vector
-        self.TARGET_SHAPE = (self.horizon, 6)  # Target object xyz + target position xyz
+        self.IMAGE_SHAPE = (240, 320, 3)
+        self.STATE_SHAPE = (1, 14)
+        self.TARGET_SHAPE = (self.horizon, 6)
 
-        self.IMAGE_SIZE = np.prod(self.IMAGE_SHAPE)  # Size of each image
-        self.STATE_SIZE = np.prod(self.STATE_SHAPE)  # Size of state vector
-        self.TARGET_SIZE = np.prod(self.TARGET_SHAPE)  # Size of target vector
+        self.IMAGE_SIZE = np.prod(self.IMAGE_SHAPE)
+        self.STATE_SIZE = np.prod(self.STATE_SHAPE)
+        self.TARGET_SIZE = np.prod(self.TARGET_SHAPE)
 
+        args = {}
+        args["n_envs"] = self.n_envs
+        args["horizon"] = self.horizon
+        args["action_dim"] = self.action_dim
         args["result_size"] = int(
             self.NUM_IMAGES * self.IMAGE_SIZE + self.STATE_SIZE + 3 + self.TARGET_SIZE
-        )  # Output size
-        args["input_size"] = int(self.horizon * 14)  # Input size
+        )
+        args["input_size"] = int(self.horizon * self.action_dim)
+        # RobotWin 2.0 configuration for wrapper
+        args["twin2_task_config"] = getattr(self.cfg, "twin2_task_config", "demo_clean")
+        args["twin2_ckpt_setting"] = getattr(self.cfg, "twin2_ckpt_setting", "demo_clean")
+        args["twin2_instruction_type"] = getattr(self.cfg, "twin2_instruction_type", "unseen")
 
         self.args = args
         self.auto_reset = False
@@ -553,7 +483,12 @@ class RoboTwin(gym.Env):
             self.output_sem.acquire()
 
         self.reset_event.clear()
-        return
+        results = np.frombuffer(self.share_results.get_obj()).reshape(
+        self.n_envs, self.args["result_size"]
+    )
+        results = self.de_initialize_result(results)
+        obs_venv, _, _, _, info_venv = self.transform(results)
+        return obs_venv, info_venv
 
     def transform(self, results):
         def jpeg_mapping(img):
