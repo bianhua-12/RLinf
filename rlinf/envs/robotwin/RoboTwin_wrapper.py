@@ -22,18 +22,22 @@ from multiprocessing import Process, Queue
 def get_robotwin2_task(task_name, config):
     """Get robotwin 2.0 task"""
     robotwin2_path = envs.__file__.split("envs")[0]
+
     if robotwin2_path not in sys.path:
         sys.path.append(robotwin2_path)
-        
+
     robotwin2_utils_path = os.path.join(robotwin2_path, 'description', 'utils')
     if robotwin2_utils_path not in sys.path:
         sys.path.append(robotwin2_utils_path)
     
     from envs import CONFIGS_PATH
-    
-    envs_module = importlib.import_module(f"envs.{task_name}")
+
+    CONFIGS_PATH = os.path.join(robotwin2_path, 'task_config')
+
     try:
+        envs_module = importlib.import_module(f"envs.{task_name}")
         env_class = getattr(envs_module, task_name)
+        
         env_instance = env_class()
     except:
         raise SystemExit(f"No Task: {task_name}")
@@ -50,15 +54,16 @@ def get_robotwin2_task(task_name, config):
     
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
-    
+    print("embodiment_config_path:", embodiment_config_path)
     with open(embodiment_config_path, "r", encoding="utf-8") as f:
         _embodiment_types = yaml.load(f.read(), Loader=yaml.FullLoader)
     
-    def get_embodiment_file(embodiment_type):
+    def get_embodiment_file(embodiment_type, robotwin2_path):
         robot_file = _embodiment_types[embodiment_type]["file_path"]
         if robot_file is None:
             raise ValueError("No embodiment files")
-        return robot_file
+        absolute_robot_file = os.path.join(robotwin2_path, robot_file)
+        return absolute_robot_file
     
     def get_embodiment_config(robot_file):
         robot_config_file = os.path.join(robot_file, "config.yml")
@@ -67,12 +72,12 @@ def get_robotwin2_task(task_name, config):
         return embodiment_args
     
     if len(embodiment_type) == 1:
-        args["left_robot_file"] = get_embodiment_file(embodiment_type[0])
-        args["right_robot_file"] = get_embodiment_file(embodiment_type[0])
+        args["left_robot_file"] = get_embodiment_file(embodiment_type[0], robotwin2_path)
+        args["right_robot_file"] = get_embodiment_file(embodiment_type[0], robotwin2_path)
         args["dual_arm_embodied"] = True
     elif len(embodiment_type) == 3:
-        args["left_robot_file"] = get_embodiment_file(embodiment_type[0])
-        args["right_robot_file"] = get_embodiment_file(embodiment_type[1])
+        args["left_robot_file"] = get_embodiment_file(embodiment_type[0], robotwin2_path)
+        args["right_robot_file"] = get_embodiment_file(embodiment_type[1], robotwin2_path)
         args["embodiment_dis"] = embodiment_type[2]
         args["dual_arm_embodied"] = False
     else:
@@ -80,8 +85,9 @@ def get_robotwin2_task(task_name, config):
     
     args["left_embodiment_config"] = get_embodiment_config(args["left_robot_file"])
     args["right_embodiment_config"] = get_embodiment_config(args["right_robot_file"])
-    
-    with open(CONFIGS_PATH + "_camera_config.yml", "r", encoding="utf-8") as f:
+    # print(CONFIGS_PATH)
+    camera_config_path = os.path.join(CONFIGS_PATH, "_camera_config.yml")
+    with open(camera_config_path, "r", encoding="utf-8") as f:
         _camera_config = yaml.load(f.read(), Loader=yaml.FullLoader)
     
     head_camera_type = args["camera"]["head_camera_type"]

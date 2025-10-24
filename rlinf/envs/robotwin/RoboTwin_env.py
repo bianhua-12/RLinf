@@ -23,8 +23,19 @@ import torch
 import torch.multiprocessing as mp
 import yaml
 from omegaconf.omegaconf import OmegaConf
-from RoboTwin_wrapper import RobotwinEnvWrapper
-
+from rlinf.envs.robotwin.RoboTwin_wrapper import RobotwinEnvWrapper
+from rlinf.envs.libero.utils import (
+    get_benchmark_overridden,
+    get_libero_image,
+    get_libero_wrist_image,
+    list_of_dict_to_dict_of_list,
+    put_info_on_image,
+    quat2axisangle,
+    save_rollout_video,
+    tile_images,
+    to_tensor,
+)
+from typing import Optional
 """
 Input values:
 actions[step,14]
@@ -327,9 +338,6 @@ class RoboTwin(gym.Env):
         ).to(self.device)
         self.update_reset_state_ids()
 
-    def update_reset_state_ids(self):
-        # TODO check if this is needed
-        pass
 
     def _extract_obs_image(self, raw_obs):
         obs_image = raw_obs["sensor_data"]["3rd_view_camera"]["rgb"].to(torch.uint8)
@@ -616,3 +624,27 @@ class RoboTwin(gym.Env):
         if self.seed > 3000:
             self.seed = 0
         self.process = []
+
+    def flush_video(self, video_sub_dir: Optional[str] = None):
+        output_dir = os.path.join(self.video_cfg.video_base_dir, f"seed_{self.seed}")
+        if video_sub_dir is not None:
+            output_dir = os.path.join(output_dir, f"{video_sub_dir}")
+        save_rollout_video(
+            self.render_images,
+            output_dir=output_dir,
+            video_name=f"{self.video_cnt}",
+        )
+        self.video_cnt += 1
+        self.render_images = []
+    
+    def add_new_frames(self, raw_obs, plot_infos):
+        images = []
+        for env_id, raw_single_obs in enumerate(raw_obs):
+            info_item = {
+                k: v if np.size(v) == 1 else v[env_id] for k, v in plot_infos.items()
+            }
+            img = raw_single_obs["agentview_image"][::-1, ::-1]
+            img = put_info_on_image(img, info_item)
+            images.append(img)
+        full_image = tile_images(images, nrows=int(np.sqrt(self.num_envs)))
+        self.render_images.append(full_image)
