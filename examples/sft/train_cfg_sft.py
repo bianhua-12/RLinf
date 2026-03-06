@@ -34,7 +34,7 @@ from rlinf.workers.cfg.fsdp_cfg_worker import FSDPCfgWorker
 mp.set_start_method("spawn", force=True)
 
 
-@hydra.main(version_base="1.1", config_path="config", config_name="libero_cfg_sft")
+@hydra.main(version_base="1.1", config_path="config", config_name="libero_cfg_openpi")
 def main(cfg) -> None:
     # Set environment variables for data loading
     data_cfg = cfg.get("data", {})

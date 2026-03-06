@@ -1,7 +1,7 @@
 # Test config for VLA lib value model training — 5 steps, freeze VLM
 #
 # Usage:
-#   bash run_vla_lib_sft.sh libero_value_model_test
+#   bash run_vla_lib_sft.sh libero_sft_value_test
 
 defaults:
   - model/vla_lib_value_model@actor.model
@@ -34,7 +34,7 @@ runner:
   save_interval: 5
 
 data:
-  train_data_paths: ["dummy"]  # Required by validate_sft_cfg; VlaLibSFTRunner uses datasets list below
+  train_data_paths: ["dummy"]  # Required by validate_sft_cfg; FSDPValueSftWorker uses datasets list below
   datasets:
     - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/libero_10_3shot
       type: "sft"

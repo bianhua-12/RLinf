@@ -1,7 +1,7 @@
 # Test config for CFG SFT training — 5 steps, small batch
 #
 # Usage:
-#   bash run_cfg_sft.sh libero_cfg_sft_test
+#   bash run_cfg_sft.sh libero_cfg_openpi_test
 
 defaults:
   - model/pi0_5@actor.model
