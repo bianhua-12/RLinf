@@ -27,22 +27,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
-from .io_processing.libero import LiberoInputs, LiberoOutputs
+from .libero import LiberoInputs, LiberoOutputs
 from .transforms import (
     AbsoluteActions,
     DataTransformFn,
     DeltaActions,
-    FASTTokenizerTransform,
     Group,
     InjectDefaultPrompt,
-    LiberoEcotBBoxReasoningTransform,
-    LiberoEcotPointingReasoningTransform,
-    LiberoEcotSubtaskReasoningTransform,
     Normalize,
     PadStatesAndActions,
     RepackTransform,
     ResizeImages,
-    SubtaskReasoningTransform,
     compose,
     make_bool_mask,
 )
@@ -137,30 +132,6 @@ class DataConfigFactory(abc.ABC):
     # Set to False for most cases as LIBERO/Franka actions are already delta in the dataset.
     extra_delta_transform: bool = False
 
-    # Subtask reasoning: if True, adds prefix/response from subtask annotations
-    subtask_reasoning: bool = False
-    subtask_prefix: str = "Subtask:"
-    # Root directory for ECOT subtask data (contains file_name/demo_id/subtasks.json)
-    # Required when subtask_reasoning=True for Libero datasets
-    subtask_data_root: Optional[str] = None
-
-    # BBox reasoning: if True, adds prefix/response from bbox annotations
-    bbox_reasoning: bool = False
-    bbox_prefix: str = "BBox:"
-
-    # Pointing reasoning: if True, adds prefix/response from pointing annotations
-    pointing_reasoning: bool = False
-    pointing_prefix: str = "Point:"
-
-    # Visual CoT data normalization: when enabled, bbox/pointing coordinates from
-    # ECOT JSON (assumed 256x256 grid) are rescaled to normalization_size
-    visual_cot_data_normalization: bool = False
-    normalization_size: Optional[tuple[int, int]] = None
-
-    # FAST tokenization: if True, adds FAST action tokens alongside continuous actions
-    fast_tokenize: bool = False
-    fast_tokenizer_path: str = "physical-intelligence/fast"
-
     @abc.abstractmethod
     def create(self, action_dim: int, *args, **kwargs) -> DataConfig:
         """Create a data configuration."""
@@ -222,9 +193,6 @@ class LiberoDataConfig(DataConfigFactory):
       OpenPI determines this based on model_type != PI0.
     - norm_stats_dir: Path to config-specific norm_stats (e.g., norm_stats/pi0_libero/)
 
-    FAST Tokenization:
-    - When fast_tokenize=True, adds FASTTokenizerTransform to model_transforms
-    - This tokenizes state/actions and adds tokens alongside continuous actions
     """
 
     def create(
@@ -247,7 +215,6 @@ class LiberoDataConfig(DataConfigFactory):
             "observation/state": "state",
             "actions": "actions",
             "prompt": "prompt",
-            # Always include episode/frame indices for ECOT-based reasoning transforms
             "episode_index": "episode_index",
             "frame_index": "frame_index",
         }
@@ -282,76 +249,6 @@ class LiberoDataConfig(DataConfigFactory):
             PadStatesAndActions(model_action_dim=action_dim),
         ]
 
-        # Add subtask reasoning transform if enabled
-        if self.subtask_reasoning and Path(self.repo_id).exists():
-            subtask_transform = None
-            if self.subtask_data_root:
-                subtask_transform = (
-                    LiberoEcotSubtaskReasoningTransform.from_dataset_and_ecot(
-                        dataset_path=self.repo_id,
-                        ecot_data_root=self.subtask_data_root,
-                        prefix=self.subtask_prefix,
-                    )
-                )
-            else:
-                subtask_transform = SubtaskReasoningTransform.from_dataset_path(
-                    self.repo_id, prefix=self.subtask_prefix
-                )
-            if subtask_transform is not None:
-                model_transforms_list.append(subtask_transform)
-                logger.info(
-                    f"Added subtask reasoning transform with prefix '{self.subtask_prefix}'"
-                )
-
-        # Add bbox reasoning transform if enabled (uses same ECOT root as subtask)
-        if (
-            self.bbox_reasoning
-            and self.subtask_data_root
-            and Path(self.repo_id).exists()
-        ):
-            bbox_transform = LiberoEcotBBoxReasoningTransform.from_dataset_and_ecot(
-                dataset_path=self.repo_id,
-                ecot_data_root=self.subtask_data_root,
-                bbox_data_root=self.subtask_data_root,
-                prefix=self.bbox_prefix,
-                normalize_coords=self.visual_cot_data_normalization,
-                normalization_size=self.normalization_size,
-            )
-            if bbox_transform is not None:
-                model_transforms_list.append(bbox_transform)
-                logger.info(
-                    f"Added bbox reasoning transform with prefix '{self.bbox_prefix}'"
-                )
-
-        # Add pointing reasoning transform if enabled (uses same ECOT root as subtask)
-        if (
-            self.pointing_reasoning
-            and self.subtask_data_root
-            and Path(self.repo_id).exists()
-        ):
-            pointing_transform = (
-                LiberoEcotPointingReasoningTransform.from_dataset_and_ecot(
-                    dataset_path=self.repo_id,
-                    ecot_data_root=self.subtask_data_root,
-                    points_data_root=self.subtask_data_root,
-                    prefix=self.pointing_prefix,
-                    normalize_coords=self.visual_cot_data_normalization,
-                    normalization_size=self.normalization_size,
-                )
-            )
-            if pointing_transform is not None:
-                model_transforms_list.append(pointing_transform)
-                logger.info(
-                    f"Added pointing reasoning transform with prefix '{self.pointing_prefix}'"
-                )
-
-        # Add FAST tokenization to compute action tokens alongside continuous actions
-        if self.fast_tokenize:
-            model_transforms_list.append(
-                FASTTokenizerTransform(fast_tokenizer_path=self.fast_tokenizer_path)
-            )
-            logger.info("Added FASTTokenizerTransform")
-
         model_transforms = Group(inputs=model_transforms_list)
 
         # Load normalization stats from norm_stats_dir (OpenPI pattern) or dataset meta
@@ -382,31 +279,17 @@ class LiberoDataConfig(DataConfigFactory):
 class LiberoV2DataConfig(DataConfigFactory):
     """Configuration factory for Libero datasets in LeRobot v2.1 format.
 
-    This config is for newer LeRobot v2.1 format datasets like:
-    - libero_goal_no_noops_1.0.0_lerobot
-    - libero_object_no_noops_1.0.0_lerobot
-    - libero_spatial_no_noops_1.0.0_lerobot
-    - libero_10_no_noops_1.0.0_lerobot
-    - libero_90_no_noops_lerobot
-
     Key differences from v2.0:
     - observation.images.image instead of image
     - observation.images.wrist_image instead of wrist_image
     - observation.state instead of state
     - action (singular) instead of actions (plural)
-
-    When fast_tokenize=True, adds FASTTokenizerTransform for action tokenization.
     """
 
     def create(
         self, action_dim: int, skip_norm_stats: bool = False, *args, **kwargs
     ) -> DataConfig:
-        """Create Libero v2.1 dataset configuration.
-
-        Args:
-            action_dim: Action dimension for padding.
-            skip_norm_stats: If True, skip loading norm stats (useful for stats computation).
-        """
+        """Create Libero v2.1 dataset configuration."""
 
         # LeRobot v2.1 format key mapping
         repack_keys = {
@@ -415,7 +298,6 @@ class LiberoV2DataConfig(DataConfigFactory):
             "observation/state": "observation.state",
             "actions": "action",  # v2.1 uses singular 'action'
             "prompt": "prompt",
-            # Always include episode/frame indices for ECOT-based reasoning transforms
             "episode_index": "episode_index",
             "frame_index": "frame_index",
         }
@@ -438,76 +320,6 @@ class LiberoV2DataConfig(DataConfigFactory):
             ResizeImages(224, 224),
             PadStatesAndActions(model_action_dim=action_dim),
         ]
-
-        # Add subtask reasoning transform if enabled
-        if self.subtask_reasoning and Path(self.repo_id).exists():
-            subtask_transform = None
-            if self.subtask_data_root:
-                subtask_transform = (
-                    LiberoEcotSubtaskReasoningTransform.from_dataset_and_ecot(
-                        dataset_path=self.repo_id,
-                        ecot_data_root=self.subtask_data_root,
-                        prefix=self.subtask_prefix,
-                    )
-                )
-            else:
-                subtask_transform = SubtaskReasoningTransform.from_dataset_path(
-                    self.repo_id, prefix=self.subtask_prefix
-                )
-            if subtask_transform is not None:
-                model_transforms_list.append(subtask_transform)
-                logger.info(
-                    f"Added subtask reasoning transform with prefix '{self.subtask_prefix}'"
-                )
-
-        # Add bbox reasoning transform if enabled (uses same ECOT root as subtask)
-        if (
-            self.bbox_reasoning
-            and self.subtask_data_root
-            and Path(self.repo_id).exists()
-        ):
-            bbox_transform = LiberoEcotBBoxReasoningTransform.from_dataset_and_ecot(
-                dataset_path=self.repo_id,
-                ecot_data_root=self.subtask_data_root,
-                bbox_data_root=self.subtask_data_root,
-                prefix=self.bbox_prefix,
-                normalize_coords=self.visual_cot_data_normalization,
-                normalization_size=self.normalization_size,
-            )
-            if bbox_transform is not None:
-                model_transforms_list.append(bbox_transform)
-                logger.info(
-                    f"Added bbox reasoning transform with prefix '{self.bbox_prefix}'"
-                )
-
-        # Add pointing reasoning transform if enabled (uses same ECOT root as subtask)
-        if (
-            self.pointing_reasoning
-            and self.subtask_data_root
-            and Path(self.repo_id).exists()
-        ):
-            pointing_transform = (
-                LiberoEcotPointingReasoningTransform.from_dataset_and_ecot(
-                    dataset_path=self.repo_id,
-                    ecot_data_root=self.subtask_data_root,
-                    points_data_root=self.subtask_data_root,
-                    prefix=self.pointing_prefix,
-                    normalize_coords=self.visual_cot_data_normalization,
-                    normalization_size=self.normalization_size,
-                )
-            )
-            if pointing_transform is not None:
-                model_transforms_list.append(pointing_transform)
-                logger.info(
-                    f"Added pointing reasoning transform with prefix '{self.pointing_prefix}'"
-                )
-
-        # Add FAST tokenization to compute action tokens alongside continuous actions
-        if self.fast_tokenize:
-            model_transforms_list.append(
-                FASTTokenizerTransform(fast_tokenizer_path=self.fast_tokenizer_path)
-            )
-            logger.info("Added FASTTokenizerTransform")
 
         model_transforms = Group(inputs=model_transforms_list)
 
@@ -570,18 +382,6 @@ def create_data_config_factory(
     extra_delta_transform: bool = False,
     norm_stats_dir: Optional[str] = None,
     asset_id: Optional[str] = None,
-    adapt_to_pi: bool = True,
-    subtask_reasoning: bool = False,
-    subtask_prefix: str = "Subtask:",
-    subtask_data_root: Optional[str] = None,
-    bbox_reasoning: bool = False,
-    bbox_prefix: str = "BBox:",
-    pointing_reasoning: bool = False,
-    pointing_prefix: str = "Point:",
-    visual_cot_data_normalization: bool = False,
-    normalization_size: Optional[tuple[int, int]] = None,
-    fast_tokenize: bool = False,
-    fast_tokenizer_path: str = "physical-intelligence/fast",
     action_norm_skip_dims: Optional[dict[str, list[int]]] = None,
     **kwargs,
 ) -> DataConfigFactory:
@@ -592,22 +392,10 @@ def create_data_config_factory(
     robot_type = robot_type.lower()
     logger.info(f"Creating data config factory for robot type: {robot_type}")
 
-    # Common parameters inherited from DataConfigFactory base class
     common_params = {
         "default_prompt": default_prompt,
         "model_type": model_type or "pi05",
         "extra_delta_transform": extra_delta_transform,
-        "subtask_reasoning": subtask_reasoning,
-        "subtask_prefix": subtask_prefix,
-        "subtask_data_root": subtask_data_root,
-        "bbox_reasoning": bbox_reasoning,
-        "bbox_prefix": bbox_prefix,
-        "pointing_reasoning": pointing_reasoning,
-        "pointing_prefix": pointing_prefix,
-        "visual_cot_data_normalization": visual_cot_data_normalization,
-        "normalization_size": normalization_size,
-        "fast_tokenize": fast_tokenize,
-        "fast_tokenizer_path": fast_tokenizer_path,
     }
 
     if robot_type == "libero":
@@ -648,21 +436,5 @@ def create_data_config_factory_from_dict(config: dict[str, Any]) -> DataConfigFa
         extra_delta_transform=config.get("extra_delta_transform", False),
         norm_stats_dir=config.get("norm_stats_dir"),
         asset_id=config.get("asset_id"),
-        adapt_to_pi=config.get("adapt_to_pi", True),
-        subtask_reasoning=config.get("subtask_reasoning", False),
-        subtask_prefix=config.get("subtask_prefix", "Subtask:"),
-        subtask_data_root=config.get("subtask_data_root"),
-        bbox_reasoning=config.get("bbox_reasoning", False),
-        bbox_prefix=config.get("bbox_prefix", "BBox:"),
-        pointing_reasoning=config.get("pointing_reasoning", False),
-        pointing_prefix=config.get("pointing_prefix", "Point:"),
-        visual_cot_data_normalization=config.get(
-            "visual_cot_data_normalization", False
-        ),
-        normalization_size=config.get("normalization_size"),
-        fast_tokenize=config.get("fast_tokenize", False),
-        fast_tokenizer_path=config.get(
-            "fast_tokenizer_path", "physical-intelligence/fast"
-        ),
         action_norm_skip_dims=config.get("action_norm_skip_dims"),
     )

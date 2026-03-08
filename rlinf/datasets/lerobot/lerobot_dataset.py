@@ -23,17 +23,9 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 
-import cv2
 import numpy as np
-import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from torch.utils.data import Dataset, Subset
-
-# Import unified interface (which inherits from Dataset)
-from rlinf.datasets.base_interface import UnifiedDatasetInterface
-
-# Import decorator for auto-registration
-from rlinf.datasets.factory import register_dataset
 
 from .config import (
     DataConfigFactory,
@@ -72,8 +64,7 @@ class TransformedDataset(Dataset):
         return len(self._dataset)
 
 
-@register_dataset("vla/lerobot", [r"lerobot/", r"data/.+", "lerobot"])
-class LeRobotPyTorchDataset(UnifiedDatasetInterface):
+class LeRobotPyTorchDataset(Dataset):
     """Simple PyTorch dataset that follows OpenPI's exact logic."""
 
     def __init__(
@@ -378,75 +369,6 @@ class LeRobotPyTorchDataset(UnifiedDatasetInterface):
             return min(base_len, self.max_samples)
         return base_len
 
-    def _normalize_video_timestamps(self) -> None:
-        """
-        Fix video timestamp metadata to be relative to each mp4 file.
-
-        The original LeRobot metadata may store cumulative timestamps across
-        concatenated video files. torchcodec expects timestamps within each
-        video file. We detect per-file durations, then wrap episode
-        from/to timestamps into the valid range for that file.
-        """
-        logger = logging.getLogger(__name__)
-        meta = getattr(self.base_dataset, "meta", None)
-        fps = getattr(self.base_dataset, "fps", None)
-        if meta is None or fps is None:
-            return
-
-        # Derive durations for every (video_key, file_index)
-        video_keys = []
-        for k in meta.features.keys():
-            if k.startswith("observation.images."):
-                video_keys.append(k)
-        if not video_keys:
-            return
-
-        durations = {}  # (video_key, file_idx) -> duration_seconds
-        for video_key in video_keys:
-            file_indices = meta.episodes[f"videos/{video_key}/file_index"].unique()
-            for file_idx in file_indices:
-                # Find one episode that uses this file to recover the path
-                ep_idx = int(
-                    meta.episodes[
-                        meta.episodes[f"videos/{video_key}/file_index"] == file_idx
-                    ]["episode_index"].iloc[0]
-                )
-                file_path = self.base_dataset.root / meta.get_video_file_path(
-                    ep_idx, video_key
-                )
-                cap = cv2.VideoCapture(str(file_path))
-                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                cap.release()
-                if frame_count <= 0:
-                    logger.warning(
-                        f"{video_key} file_index={file_idx} has invalid frame count ({frame_count}); "
-                        "skip timestamp normalization for this file."
-                    )
-                    continue
-                durations[(video_key, int(file_idx))] = frame_count / fps
-
-        # Apply wrap-around per episode
-        episodes = meta.episodes.copy()
-        for video_key in video_keys:
-            from_col = f"videos/{video_key}/from_timestamp"
-            to_col = f"videos/{video_key}/to_timestamp"
-            file_idx_col = f"videos/{video_key}/file_index"
-            if from_col not in episodes.columns:
-                continue
-            for idx, row in episodes.iterrows():
-                file_idx = int(row[file_idx_col])
-                duration = durations.get((video_key, file_idx))
-                if duration is None or duration <= 0:
-                    continue
-                new_from = float(row[from_col]) % duration
-                # Use episode length (frames) to recompute to_timestamp
-                ep_len = int(row["length"])
-                new_to = new_from + max(ep_len - 1, 0) / fps
-                episodes.at[idx, from_col] = new_from
-                episodes.at[idx, to_col] = new_to
-
-        meta.episodes = episodes
-
     def __getitem__(self, idx: int) -> dict[str, Any]:
         """Get a single sample from the dataset."""
         if idx >= len(self):
@@ -511,125 +433,3 @@ class LeRobotPyTorchDataset(UnifiedDatasetInterface):
         """
         # Use the repo_id as the source name
         return self.repo_id.replace("/", "_").replace("-", "_").lower()
-
-
-def create_lerobot_dataset(
-    dataset_path: str | None = None,
-    repo_id: str | None = None,  # Alias for dataset_path
-    action_horizon: int = 10,
-    split: str = "train",
-    data_config_factory: Optional[DataConfigFactory] = None,
-    action_dim: Optional[int] = None,
-    # Config-based creation (preferred)
-    robot_type: Optional[str] = None,
-    model_type: Optional[str] = None,
-    default_prompt: Optional[str] = None,
-    extra_delta_transform: bool = False,
-    norm_stats_dir: Optional[str] = None,
-    asset_id: Optional[str] = None,
-    config: Optional[dict[str, Any]] = None,
-    max_samples: Optional[int] = None,
-    # Episode-level data scaling
-    episode_percentage: Optional[float] = None,
-    shuffle_episodes: bool = False,
-    episode_seed: int = 42,
-) -> LeRobotPyTorchDataset:
-    """
-    Create a LeRobot dataset following OpenPI's pattern.
-
-    This function provides a clean interface for creating VLA datasets.
-    Configuration can be provided via:
-    1. config dict (from YAML/Hydra) - preferred
-    2. Individual parameters (robot_type, model_type, etc.)
-    3. data_config_factory (legacy)
-
-    Args:
-        dataset_path: Path or repo_id of the dataset
-        repo_id: Alias for dataset_path
-        action_horizon: Number of future actions to predict
-        split: Dataset split
-        data_config_factory: Legacy factory interface
-        action_dim: Action dimensionality
-        robot_type: Robot type (libero, droid, aloha, generic)
-        model_type: Model type (pi0, pi05)
-        default_prompt: Default prompt
-        extra_delta_transform: Extra delta transform flag
-        norm_stats_dir: Norm stats directory
-        asset_id: Asset ID
-        config: Full config dict from YAML
-        max_samples: Max samples for testing
-        episode_percentage: Percentage of episodes to use (0-100) for data scaling experiments
-        shuffle_episodes: If True, randomly select episodes; if False, use first N episodes
-        episode_seed: Random seed for reproducible episode selection
-
-    Example:
-        # From YAML config
-        >>> dataset = create_lerobot_dataset(config=cfg.dataset, action_dim=32)
-
-        # With explicit params
-        >>> dataset = create_lerobot_dataset(
-        ...     dataset_path="data/libero",
-        ...     robot_type="libero",
-        ...     model_type="pi05",
-        ...     action_dim=32,
-        ... )
-
-        # With episode scaling (use 50% of episodes, randomly selected)
-        >>> dataset = create_lerobot_dataset(
-        ...     dataset_path="data/libero",
-        ...     episode_percentage=50.0,
-        ...     shuffle_episodes=True,
-        ... )
-    """
-    return LeRobotPyTorchDataset(
-        dataset_path=dataset_path or repo_id,
-        action_horizon=action_horizon,
-        split=split,
-        data_config_factory=data_config_factory,
-        action_dim=action_dim,
-        robot_type=robot_type,
-        model_type=model_type,
-        default_prompt=default_prompt,
-        extra_delta_transform=extra_delta_transform,
-        norm_stats_dir=norm_stats_dir,
-        asset_id=asset_id,
-        config=config,
-        max_samples=max_samples,
-        episode_percentage=episode_percentage,
-        shuffle_episodes=shuffle_episodes,
-        episode_seed=episode_seed,
-    )
-
-
-def vla_data_collator(features):
-    """
-    Custom data collator for VLA training that handles multi-modal inputs.
-
-    This collator handles:
-    - Images (multiple cameras)
-    - State vectors
-    - Actions
-    - Text prompts
-    """
-    batch = {}
-
-    # Handle different types of inputs
-    for key in features[0].keys():
-        values = [f[key] for f in features]
-
-        if key in ["image", "wrist_image"]:
-            # Stack images
-            batch[key] = torch.stack(values)
-        elif key in ["state", "actions"]:
-            # Stack numerical arrays
-            batch[key] = torch.stack(values)
-        elif key == "prompt":
-            # Keep prompts as list for tokenization
-            batch[key] = values
-        else:
-            # Default behavior
-            batch[key] = (
-                torch.stack(values) if isinstance(values[0], torch.Tensor) else values
-            )
-
-    return batch

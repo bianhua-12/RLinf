@@ -19,7 +19,7 @@ This module provides a dataset that extends LeRobotRLDataset to format samples
 for training a PI0.5 model in VLM mode to predict discretized returns.
 
 Inheritance chain:
-    ValueDataset -> LeRobotRLDataset -> LeRobotPyTorchDataset -> UnifiedDatasetInterface
+    ValueDataset -> LeRobotRLDataset -> LeRobotPyTorchDataset -> Dataset
 
 The key difference from VLA training:
 - VLA: predicts actions via flow matching
@@ -42,8 +42,7 @@ from typing import Any, Optional
 
 import torch
 
-from rlinf.datasets.factory import register_dataset
-from rlinf.datasets.vla_lib.lerobot_datasets.config import DataConfigFactory
+from rlinf.datasets.lerobot.config import DataConfigFactory
 
 from .config import RLDataConfig, create_rl_config
 from .rl_dataset import LeRobotRLDataset
@@ -51,7 +50,6 @@ from .rl_dataset import LeRobotRLDataset
 logger = logging.getLogger(__name__)
 
 
-@register_dataset("rl/value", [r"value/", r"value_"])
 class ValueDataset(LeRobotRLDataset):
     """Dataset for value prediction training.
 
@@ -59,7 +57,7 @@ class ValueDataset(LeRobotRLDataset):
     models to predict discretized return tokens.
 
     Inheritance chain:
-        ValueDataset -> LeRobotRLDataset -> LeRobotPyTorchDataset -> UnifiedDatasetInterface
+        ValueDataset -> LeRobotRLDataset -> LeRobotPyTorchDataset -> Dataset
 
     The sample structure matches PI05DataCollator expectations for VLM mode:
     - 'images': camera images

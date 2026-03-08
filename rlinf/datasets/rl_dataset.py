@@ -30,19 +30,16 @@ from typing import Any, Optional
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
-from rlinf.datasets.factory import register_dataset
-
-# Reuse VLA dataset transforms
-from rlinf.datasets.vla_lib.lerobot_datasets.config import (
+from rlinf.datasets.lerobot.config import (
     DataConfigFactory,
     create_data_config_factory,
     create_data_config_factory_from_dict,
 )
-from rlinf.datasets.vla_lib.lerobot_datasets.lerobot_dataset import (
+from rlinf.datasets.lerobot.lerobot_dataset import (
     LeRobotPyTorchDataset,
     TransformedDataset,
 )
-from rlinf.datasets.vla_lib.lerobot_datasets.transforms import (
+from rlinf.datasets.lerobot.transforms import (
     DataTransformFn,
     Normalize,
     PromptFromLeRobotTask,
@@ -52,12 +49,11 @@ from rlinf.datasets.vla_lib.lerobot_datasets.transforms import (
 )
 
 from .config import RLDataConfig, create_rl_config
-from .io_processing.value_transforms import ReturnDiscretizer
+from .value_transforms import ReturnDiscretizer
 
 logger = logging.getLogger(__name__)
 
 
-@register_dataset("rl/lerobot", [r"rl/", r"critic/"])
 class LeRobotRLDataset(LeRobotPyTorchDataset):
     """RL Dataset with temporal structure for value learning.
 

@@ -13,24 +13,19 @@
 # limitations under the License.
 
 """
-Advantage Mixture Dataset for CFG-RL Training.
+Mixture datasets for value and advantage training.
 
-This module provides a mixture dataset that combines multiple datasets
-with weighted sampling for training CFG models on heterogeneous data.
-
-Similar to ValueMixtureDataset but specifically for CFG-RL training where
-each sample has a precomputed binary advantage label for guidance selection.
-
-Note: Advantages are already binary (computed by compute_advantages.py).
-No threshold computation is needed in this class.
+This module provides:
+- AdvantageMixtureDataset: for CFG-RL training with binary advantage labels
+- ValueMixtureDataset: for training value models on multiple datasets
 """
 
 import hashlib
 from typing import Any, Optional, Protocol, Sequence, runtime_checkable
 
 import numpy as np
+from torch.utils.data import Dataset
 
-from rlinf.datasets.base_interface import UnifiedDatasetInterface
 from rlinf.utils.dist_utils import get_logger
 
 logger = get_logger(__name__)
@@ -53,15 +48,8 @@ def _safe_hash(input_tuple) -> int:
     return seed & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
 
 
-class AdvantageMixtureDataset(UnifiedDatasetInterface):
-    """Mixture of multiple datasets with weighted sampling.
-
-    This class combines multiple advantage datasets with configurable weights
-    and sampling strategies for training CFG models on heterogeneous data.
-
-    Note: Advantages are already binary in each dataset (computed by
-    compute_advantages.py). No threshold computation is needed.
-    """
+class _MixtureBase(Dataset):
+    """Shared logic for mixture datasets."""
 
     def __init__(
         self,
@@ -70,14 +58,6 @@ class AdvantageMixtureDataset(UnifiedDatasetInterface):
         balance_dataset_weights: bool = True,
         seed: int = 42,
     ):
-        """Initialize AdvantageMixtureDataset.
-
-        Args:
-            datasets: List of (dataset, weight) tuples
-            mode: "train", "val", or "test"
-            balance_dataset_weights: Whether to balance by dataset length
-            seed: Random seed for sampling
-        """
         # Filter out empty datasets
         valid_datasets = []
         for ds, weight in datasets:
@@ -97,7 +77,6 @@ class AdvantageMixtureDataset(UnifiedDatasetInterface):
 
         self._dataset_lengths = np.array([len(ds) for ds in self.datasets])
 
-        # Compute sampling weights
         self._dataset_sampling_weights = self._raw_weights.copy()
         if self.balance_dataset_weights:
             self._dataset_sampling_weights *= self._dataset_lengths
@@ -111,21 +90,12 @@ class AdvantageMixtureDataset(UnifiedDatasetInterface):
         else:
             self._dataset_sampling_weights /= weight_sum
 
-        # Identify primary datasets for length computation
         self._primary_indices = self._raw_weights == 1.0
         if not np.any(self._primary_indices):
             max_weight = self._raw_weights.max()
             self._primary_indices = self._raw_weights == max_weight
 
         self._epoch = 0
-
-        logger.info("AdvantageMixtureDataset initialized:")
-        logger.info(f"  Datasets: {len(self.datasets)}")
-        logger.info(f"  Total samples: {sum(self._dataset_lengths)}")
-        logger.info(f"  Dataset lengths: {self._dataset_lengths.tolist()}")
-        logger.info(f"  Raw weights: {self._raw_weights.tolist()}")
-        logger.info(f"  Sampling weights: {self._dataset_sampling_weights.tolist()}")
-        logger.info(f"  Mode: {mode}")
 
     @property
     def dataset_lengths(self) -> np.ndarray:
@@ -136,11 +106,9 @@ class AdvantageMixtureDataset(UnifiedDatasetInterface):
         return self._dataset_sampling_weights
 
     def set_epoch(self, epoch: int) -> None:
-        """Set epoch for deterministic sampling."""
         self._epoch = epoch
 
     def __len__(self) -> int:
-        """Compute effective length based on primary datasets."""
         primary_lengths = self._dataset_lengths[self._primary_indices]
         primary_weights = self._dataset_sampling_weights[self._primary_indices]
 
@@ -152,14 +120,6 @@ class AdvantageMixtureDataset(UnifiedDatasetInterface):
         return int(ratios.max())
 
     def _sample_step(self, index: int) -> tuple[SizedDataset, int]:
-        """Sample a dataset and index for the given iteration.
-
-        Args:
-            index: Iteration index
-
-        Returns:
-            Tuple of (dataset, sample_index)
-        """
         if self.mode != "train":
             seed = index
         else:
@@ -173,28 +133,42 @@ class AdvantageMixtureDataset(UnifiedDatasetInterface):
         return dataset, sample_idx
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        """Get sample from mixture.
-
-        Args:
-            index: Iteration index
-
-        Returns:
-            Sample dict with advantage field (bool)
-        """
         dataset, sample_idx = self._sample_step(index)
         return dataset[sample_idx]
+
+    def get_custom_tokens(self) -> Optional[list[str]]:
+        tokens = set()
+        for ds in self.datasets:
+            if hasattr(ds, "get_custom_tokens"):
+                ds_tokens = ds.get_custom_tokens()
+                if ds_tokens:
+                    tokens.update(ds_tokens)
+        return list(tokens) if tokens else None
+
+
+class AdvantageMixtureDataset(_MixtureBase):
+    """Mixture of multiple datasets with weighted sampling for CFG-RL training."""
+
+    def __init__(
+        self,
+        datasets: Sequence[tuple[SizedDataset, float]],
+        mode: str = "train",
+        balance_dataset_weights: bool = True,
+        seed: int = 42,
+    ):
+        super().__init__(datasets, mode, balance_dataset_weights, seed)
+
+        logger.info("AdvantageMixtureDataset initialized:")
+        logger.info(f"  Datasets: {len(self.datasets)}")
+        logger.info(f"  Total samples: {sum(self._dataset_lengths)}")
+        logger.info(f"  Dataset lengths: {self._dataset_lengths.tolist()}")
+        logger.info(f"  Raw weights: {self._raw_weights.tolist()}")
+        logger.info(f"  Sampling weights: {self._dataset_sampling_weights.tolist()}")
+        logger.info(f"  Mode: {mode}")
 
     def get_train_val_split(
         self, validation_split: Optional[float] = None
     ) -> tuple["AdvantageMixtureDataset", "AdvantageMixtureDataset"]:
-        """Split mixture into train and validation sets.
-
-        Args:
-            validation_split: Fraction for validation (default: 0.1)
-
-        Returns:
-            Tuple of (train_mixture, val_mixture)
-        """
         if validation_split is None:
             validation_split = 0.1
 
@@ -232,18 +206,7 @@ class AdvantageMixtureDataset(UnifiedDatasetInterface):
 
         return train_mixture, val_mixture
 
-    def get_custom_tokens(self) -> Optional[list[str]]:
-        """Get custom tokens from all datasets."""
-        tokens = set()
-        for ds in self.datasets:
-            if hasattr(ds, "get_custom_tokens"):
-                ds_tokens = ds.get_custom_tokens()
-                if ds_tokens:
-                    tokens.update(ds_tokens)
-        return list(tokens) if tokens else None
-
     def get_source_name(self) -> str:
-        """Get combined source name."""
         names = []
         for ds in self.datasets:
             if hasattr(ds, "get_source_name"):
@@ -251,3 +214,73 @@ class AdvantageMixtureDataset(UnifiedDatasetInterface):
             elif hasattr(ds, "repo_id"):
                 names.append(ds.repo_id)
         return "_".join(names[:3]) if names else "advantage_mixture"
+
+
+class ValueMixtureDataset(_MixtureBase):
+    """Mixture of multiple ValueDatasets with weighted sampling."""
+
+    def __init__(
+        self,
+        datasets: Sequence[tuple[SizedDataset, float]],
+        mode: str = "train",
+        balance_dataset_weights: bool = True,
+        seed: int = 42,
+    ):
+        super().__init__(datasets, mode, balance_dataset_weights, seed)
+
+        logger.info("ValueMixtureDataset initialized:")
+        logger.info(f"  Datasets: {len(self.datasets)}")
+        logger.info(f"  Total samples: {sum(self._dataset_lengths)}")
+        logger.info(f"  Dataset lengths: {self._dataset_lengths.tolist()}")
+        logger.info(f"  Raw weights: {self._raw_weights.tolist()}")
+        logger.info(f"  Sampling weights: {self._dataset_sampling_weights.tolist()}")
+        logger.info(f"  Mode: {mode}")
+
+    def get_train_val_split(
+        self, validation_split: Optional[float] = None
+    ) -> tuple["ValueMixtureDataset", "ValueMixtureDataset"]:
+        if validation_split is None:
+            validation_split = 0.1
+
+        train_datasets = []
+        val_datasets = []
+
+        for ds, weight in zip(self.datasets, self._raw_weights):
+            if hasattr(ds, "get_train_val_split"):
+                train_ds, val_ds = ds.get_train_val_split(validation_split)
+            else:
+                total = len(ds)
+                val_size = int(total * validation_split)
+                indices = np.arange(total)
+                np.random.shuffle(indices)
+                from torch.utils.data import Subset
+
+                val_ds = Subset(ds, indices[:val_size].tolist())
+                train_ds = Subset(ds, indices[val_size:].tolist())
+
+            train_datasets.append((train_ds, weight))
+            val_datasets.append((val_ds, weight))
+
+        train_mixture = ValueMixtureDataset(
+            datasets=train_datasets,
+            mode="train",
+            balance_dataset_weights=self.balance_dataset_weights,
+            seed=self.seed,
+        )
+        val_mixture = ValueMixtureDataset(
+            datasets=val_datasets,
+            mode="val",
+            balance_dataset_weights=self.balance_dataset_weights,
+            seed=self.seed,
+        )
+
+        return train_mixture, val_mixture
+
+    def get_source_name(self) -> str:
+        names = []
+        for ds in self.datasets:
+            if hasattr(ds, "get_source_name"):
+                names.append(ds.get_source_name())
+            elif hasattr(ds, "repo_id"):
+                names.append(ds.repo_id)
+        return "_".join(names[:3]) if names else "value_mixture"
