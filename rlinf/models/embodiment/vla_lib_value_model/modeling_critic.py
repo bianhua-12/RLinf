@@ -182,8 +182,11 @@ class ValueCriticModel(PI05FlowMatching):
         self.pi05 = True
         self.critic_forward_mode = getattr(config, "critic_forward_mode", "expert")
         self.expert_loss_type = getattr(config, "expert_loss_type", "mse")
+        self.backbone_variant = getattr(config, "backbone_variant", "paligemma_2b")
 
-        paligemma_config = get_config(config.paligemma_variant)
+        paligemma_config = None
+        if self.backbone_variant == "paligemma_2b":
+            paligemma_config = get_config(config.paligemma_variant)
         expert_config = get_config(config.critic_expert_variant)
 
         logger.info(
@@ -209,6 +212,9 @@ class ValueCriticModel(PI05FlowMatching):
             precision=config.dtype,
             freeze_vision_encoder=getattr(config, "freeze_vision_encoder", False),
             freeze_vlm=getattr(config, "freeze_vlm", False),
+            backbone_variant=self.backbone_variant,
+            siglip_path=getattr(config, "siglip_path", None),
+            gemma3_path=getattr(config, "gemma3_path", None),
         )
 
         self.gradient_checkpointing_enabled = False
@@ -265,10 +271,8 @@ class ValueCriticModel(PI05FlowMatching):
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = (
-            True
-        )
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
+        self._set_gradient_checkpointing_flag(self._get_language_model(), True)
+        self._set_gradient_checkpointing_flag(self._get_vision_tower(), True)
         for expert in self.paligemma_with_expert.experts.values():
             expert.model.gradient_checkpointing = True
         logger.info("Enabled gradient checkpointing for ValueCritic")
@@ -276,13 +280,41 @@ class ValueCriticModel(PI05FlowMatching):
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = (
-            False
-        )
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
+        self._set_gradient_checkpointing_flag(self._get_language_model(), False)
+        self._set_gradient_checkpointing_flag(self._get_vision_tower(), False)
         for expert in self.paligemma_with_expert.experts.values():
             expert.model.gradient_checkpointing = False
         logger.info("Disabled gradient checkpointing for ValueCritic")
+
+    def _get_language_model(self) -> nn.Module:
+        """Return the active language model for the configured backbone."""
+        if self.backbone_variant == "paligemma_800m":
+            return self.paligemma_with_expert.gemma3.model
+        return self.paligemma_with_expert.paligemma.language_model
+
+    def _get_vision_tower(self) -> nn.Module:
+        """Return the active vision tower for the configured backbone."""
+        if self.backbone_variant == "paligemma_800m":
+            return self.paligemma_with_expert.vision_tower
+        return self.paligemma_with_expert.paligemma.vision_tower
+
+    def _set_gradient_checkpointing_flag(
+        self, module: nn.Module, enabled: bool
+    ) -> None:
+        """Best-effort toggle for gradient checkpointing across HF variants."""
+        if hasattr(module, "gradient_checkpointing"):
+            module.gradient_checkpointing = enabled
+        if hasattr(module, "vision_model") and hasattr(
+            module.vision_model, "gradient_checkpointing"
+        ):
+            module.vision_model.gradient_checkpointing = enabled
+        if hasattr(module, "model") and hasattr(module.model, "gradient_checkpointing"):
+            module.model.gradient_checkpointing = enabled
+
+    def _get_model_dtype(self) -> torch.dtype:
+        """Get the attention projection dtype used by the active LM."""
+        language_model = self._get_language_model()
+        return language_model.layers[0].self_attn.q_proj.weight.dtype
 
     def get_cls_embedding(self, batch_size: int) -> Tensor:
         """Get CLS embedding from ValueHead."""
@@ -411,16 +443,16 @@ class ValueCriticModel(PI05FlowMatching):
         stop_gradient_to_vlm: bool = False,
     ):
         """Forward through VLM + value expert."""
-        model_dtype = self.paligemma_with_expert.paligemma.language_model.layers[
-            0
-        ].self_attn.q_proj.weight.dtype
+        model_dtype = self._get_model_dtype()
         if model_dtype == torch.bfloat16:
             prefix_embs = prefix_embs.to(torch.bfloat16)
             suffix_embs = suffix_embs.to(torch.bfloat16)
 
         # Interleaved path may hit view/inplace errors when VLM is frozen under
         # FSDP. Use robust two-stage forward in that case.
-        if getattr(self.paligemma_with_expert, "freeze_vlm", False):
+        if self.backbone_variant == "paligemma_800m" or getattr(
+            self.paligemma_with_expert, "freeze_vlm", False
+        ):
             prefix_out, suffix_out = self._forward_expert_two_stage(
                 prefix_embs=prefix_embs,
                 prefix_pad_masks=prefix_pad_masks,

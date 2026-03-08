@@ -1,27 +1,39 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import dataclasses
 import glob
+import json
 import math
 import os
-import json
-import re
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
-from torch import Tensor
-from torch import nn
 import torch.nn.functional as F  # noqa: N812
-from transformers.modeling_outputs import CausalLMOutput, ModelOutput
-from transformers import PreTrainedModel, GenerationMixin
-from transformers.utils import logging as hf_logging
-from torch.utils.checkpoint import checkpoint
 from safetensors import safe_open
 from safetensors.torch import load_file
-from typing import Optional, Tuple, Union
-from dataclasses import dataclass
+from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
+from transformers import GenerationMixin, PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutput, ModelOutput
+
+from rlinf.utils.dist_utils import get_logger
 
 from .configs import get_config
-from .paligemma_with_expert import PaliGemmaWithExpertModel, _requires_uniform_dtype
 from .configuration_pi0 import PI0Config
-from rlinf.utils.dist_utils import get_logger
+from .paligemma_with_expert import PaliGemmaWithExpertModel, _requires_uniform_dtype
 
 logger = get_logger(__name__)
 
@@ -31,12 +43,13 @@ class PI0CausalLMOutputWithPast(ModelOutput):
     """
     Base class for PI0 causal language model (or autoregressive) outputs.
     """
+
     loss: Optional[torch.FloatTensor] = None
     actions: Optional[torch.FloatTensor] = None
     losses: Optional[torch.FloatTensor] = None
-    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    past_key_values: Optional[tuple[tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[tuple[torch.FloatTensor]] = None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -51,7 +64,11 @@ def get_safe_dtype(target_dtype, device_type):
 
 
 def create_sinusoidal_pos_embedding(
-    time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
+    time: torch.tensor,
+    dimension: int,
+    min_period: float,
+    max_period: float,
+    device="cpu",
 ) -> Tensor:
     """Computes sine-cosine positional embedding vectors for scalar positions."""
     if dimension % 2 != 0:
@@ -94,8 +111,8 @@ def make_att_2d_masks(pad_masks, att_masks):
           block can attend all previous blocks and all tokens on the same block.
 
     Args:
-      input_mask: bool[B, N] true if its part of the input, false if padding.
-      mask_ar: int32[B, N] mask that's 1 where previous tokens cannot depend on
+      pad_masks: bool[B, N] true if its part of the input, false if padding.
+      att_masks: int32[B, N] mask that's 1 where previous tokens cannot depend on
         it and 0 where it shares the same attention mask as the previous token.
     """
     if att_masks.ndim != 2:
@@ -114,6 +131,7 @@ class PI0PreTrainedModel(PreTrainedModel):
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
     models.
     """
+
     config_class = PI0Config
     base_model_prefix = "model"
     main_input_name = "input_ids"  # Standard for transformers FLOP calculation
@@ -137,16 +155,18 @@ class PI0PreTrainedModel(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=0.02)
 
-    def _set_gradient_checkpointing(self, enable: bool = True, gradient_checkpointing_func=None):
+    def _set_gradient_checkpointing(
+        self, enable: bool = True, gradient_checkpointing_func=None
+    ):
         """
         Enable or disable gradient checkpointing for the PI0 model.
         This propagates gradient checkpointing to all submodules.
         """
         if gradient_checkpointing_func is None:
             gradient_checkpointing_func = checkpoint
-            
+
         # Set gradient checkpointing on the main PI0FlowMatching module
-        if hasattr(self, 'model'):
+        if hasattr(self, "model"):
             if enable:
                 self.model.gradient_checkpointing_enable()
             else:
@@ -155,18 +175,26 @@ class PI0PreTrainedModel(PreTrainedModel):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         """Override from_pretrained to handle problematic safetensors file.
-        
-        This temporarily moves the problematic model.safetensors file that has 
+
+        This temporarily moves the problematic model.safetensors file that has
         bad metadata, allowing HuggingFace to use the sharded loading instead.
-        
+
         Intelligently handles device_map and meta tensors based on training context.
         """
-        logger.info(f"PI0 from_pretrained: Loading from {pretrained_model_name_or_path}")
-        
+        logger.info(
+            f"PI0 from_pretrained: Loading from {pretrained_model_name_or_path}"
+        )
+
         # Handle problematic safetensors files by attempting manual loading first
-        single_file_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
-        index_file_path = os.path.join(pretrained_model_name_or_path, "model.safetensors.index.json")
-        sharded_pattern = os.path.join(pretrained_model_name_or_path, "model-*.safetensors")
+        single_file_path = os.path.join(
+            pretrained_model_name_or_path, "model.safetensors"
+        )
+        index_file_path = os.path.join(
+            pretrained_model_name_or_path, "model.safetensors.index.json"
+        )
+        sharded_pattern = os.path.join(
+            pretrained_model_name_or_path, "model-*.safetensors"
+        )
         has_single_file = os.path.exists(single_file_path)
         has_index_file = os.path.exists(index_file_path)
         sharded_parts = glob.glob(sharded_pattern)
@@ -174,92 +202,118 @@ class PI0PreTrainedModel(PreTrainedModel):
 
         if has_single_file:
             try:
-                with safe_open(single_file_path, framework='pt') as f:
+                with safe_open(single_file_path, framework="pt") as f:
                     metadata = f.metadata()
-                invalid_metadata = not metadata or 'format' not in metadata or metadata.get('format') is None
-            except Exception as exc:  # Broad except to ensure we still fall back to manual load
+                invalid_metadata = (
+                    not metadata
+                    or "format" not in metadata
+                    or metadata.get("format") is None
+                )
+            except (
+                Exception
+            ) as exc:  # Broad except to ensure we still fall back to manual load
                 logger.warning(
                     "Failed to read single model.safetensors metadata (%s) - attempting manual loading",
                     exc,
                 )
-                return cls._load_from_safetensors(pretrained_model_name_or_path, **kwargs)
+                return cls._load_from_safetensors(
+                    pretrained_model_name_or_path, **kwargs
+                )
 
             if invalid_metadata:
-                logger.warning("Single model.safetensors has invalid metadata - attempting manual loading")
-                return cls._load_from_safetensors(pretrained_model_name_or_path, **kwargs)
+                logger.warning(
+                    "Single model.safetensors has invalid metadata - attempting manual loading"
+                )
+                return cls._load_from_safetensors(
+                    pretrained_model_name_or_path, **kwargs
+                )
         elif has_index_file or has_sharded_files:
-            logger.info("Detected HF-sharded checkpoint - will rely on HuggingFace loader")
+            logger.info(
+                "Detected HF-sharded checkpoint - will rely on HuggingFace loader"
+            )
         else:
             logger.warning(
                 "No model.safetensors file detected; attempting standard HuggingFace loading."
             )
-        
+
         # Smart handling of device_map and memory optimizations
         safe_kwargs = kwargs.copy()
-        original_device_map = kwargs.get('device_map')
-        
+        original_device_map = kwargs.get("device_map")
+
         # Detect distributed training context
         is_distributed = (
-            os.environ.get('WORLD_SIZE') is not None or 
-            os.environ.get('LOCAL_RANK') is not None or
-            os.environ.get('RANK') is not None
+            os.environ.get("WORLD_SIZE") is not None
+            or os.environ.get("LOCAL_RANK") is not None
+            or os.environ.get("RANK") is not None
         )
-        
+
         # For distributed training (FSDP/DDP), let Accelerate handle device placement
         if is_distributed:
-            logger.info("Detected distributed training - letting Accelerate handle device placement")
-            safe_kwargs.update({
-                'device_map': None,
-                'low_cpu_mem_usage': False,  # Disable to avoid meta tensors in distributed setting
-                'torch_dtype': kwargs.get('torch_dtype', torch.float32),
-            })
+            logger.info(
+                "Detected distributed training - letting Accelerate handle device placement"
+            )
+            safe_kwargs.update(
+                {
+                    "device_map": None,
+                    "low_cpu_mem_usage": False,  # Disable to avoid meta tensors in distributed setting
+                    "torch_dtype": kwargs.get("torch_dtype", torch.float32),
+                }
+            )
         else:
             # For single GPU or inference, preserve original device_map behavior
             if original_device_map is not None:
-                logger.info(f"Single GPU/inference mode - using device_map: {original_device_map}")
-                safe_kwargs.update({
-                    'torch_dtype': kwargs.get('torch_dtype', torch.float32),
-                })
+                logger.info(
+                    f"Single GPU/inference mode - using device_map: {original_device_map}"
+                )
+                safe_kwargs.update(
+                    {
+                        "torch_dtype": kwargs.get("torch_dtype", torch.float32),
+                    }
+                )
             else:
                 logger.info("No device_map specified - using default CPU loading")
-                safe_kwargs.update({
-                    'device_map': None,
-                    'low_cpu_mem_usage': False,
-                    'torch_dtype': kwargs.get('torch_dtype', torch.float32),
-                })
+                safe_kwargs.update(
+                    {
+                        "device_map": None,
+                        "low_cpu_mem_usage": False,
+                        "torch_dtype": kwargs.get("torch_dtype", torch.float32),
+                    }
+                )
 
         # Always provide an explicit PI0Config so HF does not attempt to resolve other config classes
-        if 'config' not in safe_kwargs or safe_kwargs['config'] is None:
+        if "config" not in safe_kwargs or safe_kwargs["config"] is None:
             config_path = os.path.join(pretrained_model_name_or_path, "config.json")
             if os.path.exists(config_path):
-                with open(config_path, 'r') as cfg_file:
+                with open(config_path, "r") as cfg_file:
                     config_dict = json.load(cfg_file)
-                safe_kwargs['config'] = cls.config_class.from_dict(config_dict)
+                safe_kwargs["config"] = cls.config_class.from_dict(config_dict)
             else:
                 loaded_config, _ = cls.config_class.from_pretrained(
                     pretrained_model_name_or_path,
                     return_unused_kwargs=True,
-                    trust_remote_code=kwargs.get('trust_remote_code', True),
+                    trust_remote_code=kwargs.get("trust_remote_code", True),
                 )
-                safe_kwargs['config'] = loaded_config
+                safe_kwargs["config"] = loaded_config
 
         model = super().from_pretrained(pretrained_model_name_or_path, **safe_kwargs)
         logger.info("✓ Successfully loaded PI0 model using HuggingFace infrastructure")
-        
+
         # Apply mixed-precision handling when not using parameter sharding
         # FSDP and DeepSpeed Zero-3 require uniform dtype; DDP/Zero-1/2 can use mixed
-        torch_dtype = kwargs.get('torch_dtype', torch.float32)
+        torch_dtype = kwargs.get("torch_dtype", torch.float32)
         if torch_dtype == torch.bfloat16 and not _requires_uniform_dtype():
             cls._apply_mixed_precision(model)
         elif _requires_uniform_dtype():
-            logger.info("Parameter sharding detected (FSDP/Zero-3): using uniform dtype")
-        
+            logger.info(
+                "Parameter sharding detected (FSDP/Zero-3): using uniform dtype"
+            )
+
         return model
 
     @classmethod
     def _apply_mixed_precision(cls, model):
         """Apply mixed precision: keep action projection layers in float32 for flow matching.
-        
+
         This is needed because noise and time in flow matching are float32, and matmul
         requires operands to have the same dtype. The backbone (vision/language) can stay
         in bfloat16 for memory efficiency.
@@ -274,63 +328,79 @@ class PI0PreTrainedModel(PreTrainedModel):
             "action_time_mlp_in",
             "action_time_mlp_out",
         ]
-        
+
         for name, param in model.named_parameters():
             if any(pattern in name for pattern in action_proj_patterns):
                 param.data = param.data.to(dtype=torch.float32)
                 logger.debug(f"Kept {name} in float32 for flow matching compatibility")
-        
+
         logger.info("Applied mixed precision: action projection layers kept in float32")
 
     @classmethod
     def _load_from_safetensors(cls, pretrained_model_name_or_path, **kwargs):
         """Manual loading from a single safetensors file with potentially corrupted metadata."""
         logger.info("Attempting manual loading from single safetensors file")
-        
+
         # Load configuration - prefer kwargs config over config.json
-        config = kwargs.get('config')
+        config = kwargs.get("config")
         if config is None:
             config_path = os.path.join(pretrained_model_name_or_path, "config.json")
             if os.path.exists(config_path):
-                with open(config_path, 'r') as f:
+                with open(config_path, "r") as f:
                     config_dict = json.load(f)
                 config = cls.config_class.from_dict(config_dict)
             else:
-                raise ValueError(f"No config.json found in {pretrained_model_name_or_path} and no config provided in kwargs")
-        
+                raise ValueError(
+                    f"No config.json found in {pretrained_model_name_or_path} and no config provided in kwargs"
+                )
+
         # Create model from config
         logger.info("Creating model from config for manual loading")
         model = cls(config)
-        
+
         # Load state dict manually from safetensors file
-        safetensors_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
+        safetensors_path = os.path.join(
+            pretrained_model_name_or_path, "model.safetensors"
+        )
         logger.info(f"Manually loading state dict from {safetensors_path}")
-        
+
         try:
             # Load the safetensors file ignoring metadata issues
             state_dict = load_file(safetensors_path, device="cpu")
-            logger.info(f"Successfully loaded {len(state_dict)} tensors from safetensors file")
-            
+            logger.info(
+                f"Successfully loaded {len(state_dict)} tensors from safetensors file"
+            )
+
             # Load into model
             # Check if state dict keys start with "model." to determine loading strategy
             sample_key = next(iter(state_dict.keys())) if state_dict else ""
             if sample_key.startswith("model."):
-                logger.info("State dict keys start with 'model.' - loading into model directly")
-                missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+                logger.info(
+                    "State dict keys start with 'model.' - loading into model directly"
+                )
+                missing_keys, unexpected_keys = model.load_state_dict(
+                    state_dict, strict=False
+                )
             else:
-                logger.info("State dict keys don't start with 'model.' - loading into model.model")
-                missing_keys, unexpected_keys = model.model.load_state_dict(state_dict, strict=False)
-            
+                logger.info(
+                    "State dict keys don't start with 'model.' - loading into model.model"
+                )
+                missing_keys, unexpected_keys = model.model.load_state_dict(
+                    state_dict, strict=False
+                )
+
             if missing_keys:
                 logger.warning(f"Missing keys when loading state dict: {missing_keys}")
             if unexpected_keys:
-                logger.warning(f"Unexpected keys when loading state dict: {unexpected_keys}")
-            
+                logger.warning(
+                    f"Unexpected keys when loading state dict: {unexpected_keys}"
+                )
+
             logger.info("✓ Successfully loaded model from single safetensors file")
-            
+
             # Handle dtype - FSDP/Zero-3 require uniform dtype; DDP/Zero-1/2 can use mixed
-            torch_dtype = kwargs.get('torch_dtype', torch.float32)
-            
+            torch_dtype = kwargs.get("torch_dtype", torch.float32)
+
             if _requires_uniform_dtype():
                 if torch_dtype == torch.bfloat16:
                     model.to(dtype=torch.bfloat16)
@@ -341,15 +411,22 @@ class PI0PreTrainedModel(PreTrainedModel):
             else:
                 # Non-sharding methods: use mixed precision (bf16 backbone + fp32 action layers)
                 if torch_dtype == torch.bfloat16:
-                    model.model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+                    model.model.paligemma_with_expert.to_bfloat16_for_selected_params(
+                        "bfloat16"
+                    )
                 elif torch_dtype == torch.float32:
-                    model.model.paligemma_with_expert.to_bfloat16_for_selected_params("float32")
-            
+                    model.model.paligemma_with_expert.to_bfloat16_for_selected_params(
+                        "float32"
+                    )
+
             return model
-            
+
         except Exception as e:
             logger.error(f"Failed to manually load from safetensors file: {e}")
-            raise ValueError(f"Could not load model from {pretrained_model_name_or_path}: {e}")
+            raise ValueError(
+                f"Could not load model from {pretrained_model_name_or_path}: {e}"
+            )
+
 
 class PI0ForConditionalGeneration(PI0PreTrainedModel, GenerationMixin):
     """
@@ -360,10 +437,10 @@ class PI0ForConditionalGeneration(PI0PreTrainedModel, GenerationMixin):
     def __init__(self, config: PI0Config):
         super().__init__(config)
         self.config = config
-        
+
         # Core PI0 model
         self.model = PI0FlowMatching(config)
-        
+
         # Initialize weights
         self.post_init()
 
@@ -384,7 +461,7 @@ class PI0ForConditionalGeneration(PI0PreTrainedModel, GenerationMixin):
     ):
         """
         Forward pass for training and inference.
-        
+
         Args:
             observation: Robot observation (images, language, state)
             actions: Target actions (for training)
@@ -396,28 +473,26 @@ class PI0ForConditionalGeneration(PI0PreTrainedModel, GenerationMixin):
             use_cache: Whether to use cache for generation
             output_attentions: Whether to output attention weights
             output_hidden_states: Whether to output hidden states
-            
+
         Returns:
             PI0CausalLMOutputWithPast containing losses or action predictions
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+
         if observation is None:
             raise ValueError("PI0 model requires 'observation' input")
 
         # Training mode - compute loss
         result = self.model.forward(
-            observation=observation,
-            actions=actions,
-            noise=noise,
-            time=time,
-            **kwargs
+            observation=observation, actions=actions, noise=noise, time=time, **kwargs
         )
-        
+
         if return_dict:
             return PI0CausalLMOutputWithPast(
                 loss=result.loss.mean(),
-                losses=result.loss, # non-reduced loss
+                losses=result.loss,  # non-reduced loss
                 actions=None,
                 past_key_values=None,
                 hidden_states=None,
@@ -447,7 +522,7 @@ class PI0ForConditionalGeneration(PI0PreTrainedModel, GenerationMixin):
 
     def warmup(self, device: torch.device | str | None = None, tokenizer=None) -> None:
         """Run warmup inference to trigger torch.compile JIT compilation.
-        
+
         Call this after model is on device and before serving to avoid
         compilation delay on first query.
         """
@@ -485,30 +560,32 @@ class PI0ForConditionalGeneration(PI0PreTrainedModel, GenerationMixin):
     ) -> nn.Embedding:
         """
         Resize token embeddings to accommodate new vocabulary size.
-        
+
         Follows transformers library patterns for proper initialization of new embeddings.
         When mean_resizing=True, new embeddings are initialized from a multivariate normal
         distribution with old embeddings' mean and covariance (or just mean if covariance
         is not positive definite). See: https://nlp.stanford.edu/~johnhew/vocab-expansion.html
-        
+
         Args:
             new_num_tokens: New vocabulary size
             pad_to_multiple_of: If set, pad vocab to multiple of this value
             mean_resizing: If True, init new embeddings from old embeddings' distribution
-            
+
         Returns:
             The resized input embeddings module
         """
         if pad_to_multiple_of is not None:
-            new_num_tokens = ((new_num_tokens + pad_to_multiple_of - 1) // pad_to_multiple_of) * pad_to_multiple_of
-        
+            new_num_tokens = (
+                (new_num_tokens + pad_to_multiple_of - 1) // pad_to_multiple_of
+            ) * pad_to_multiple_of
+
         old_embeddings = self.get_input_embeddings()
         old_lm_head = self.get_output_embeddings()
         old_num_tokens = old_embeddings.num_embeddings
-        
+
         if old_num_tokens == new_num_tokens:
             return old_embeddings
-        
+
         # Create new embeddings preserving device and dtype
         new_embeddings = nn.Embedding(
             new_num_tokens,
@@ -523,42 +600,56 @@ class PI0ForConditionalGeneration(PI0PreTrainedModel, GenerationMixin):
             device=old_lm_head.weight.device,
             dtype=old_lm_head.weight.dtype,
         )
-        
+
         # Copy old weights
         num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
-        new_embeddings.weight.data[:num_tokens_to_copy] = old_embeddings.weight.data[:num_tokens_to_copy]
-        new_lm_head.weight.data[:num_tokens_to_copy] = old_lm_head.weight.data[:num_tokens_to_copy]
+        new_embeddings.weight.data[:num_tokens_to_copy] = old_embeddings.weight.data[
+            :num_tokens_to_copy
+        ]
+        new_lm_head.weight.data[:num_tokens_to_copy] = old_lm_head.weight.data[
+            :num_tokens_to_copy
+        ]
         if old_lm_head.bias is not None:
-            new_lm_head.bias.data[:num_tokens_to_copy] = old_lm_head.bias.data[:num_tokens_to_copy]
-        
+            new_lm_head.bias.data[:num_tokens_to_copy] = old_lm_head.bias.data[
+                :num_tokens_to_copy
+            ]
+
         # Initialize new embeddings
         if new_num_tokens > old_num_tokens:
             added_num_tokens = new_num_tokens - old_num_tokens
             if mean_resizing:
                 self._init_new_embeddings_with_mean(
-                    old_embeddings.weight.data, new_embeddings.weight.data,
-                    old_num_tokens, added_num_tokens
+                    old_embeddings.weight.data,
+                    new_embeddings.weight.data,
+                    old_num_tokens,
+                    added_num_tokens,
                 )
                 self._init_new_embeddings_with_mean(
-                    old_lm_head.weight.data, new_lm_head.weight.data,
-                    old_num_tokens, added_num_tokens
+                    old_lm_head.weight.data,
+                    new_lm_head.weight.data,
+                    old_num_tokens,
+                    added_num_tokens,
                 )
                 if old_lm_head.bias is not None:
                     bias_mean = old_lm_head.bias.data.mean()
                     new_lm_head.bias.data[old_num_tokens:] = bias_mean
             else:
-                nn.init.normal_(new_embeddings.weight.data[old_num_tokens:], mean=0.0, std=0.02)
-                nn.init.normal_(new_lm_head.weight.data[old_num_tokens:], mean=0.0, std=0.02)
+                nn.init.normal_(
+                    new_embeddings.weight.data[old_num_tokens:], mean=0.0, std=0.02
+                )
+                nn.init.normal_(
+                    new_lm_head.weight.data[old_num_tokens:], mean=0.0, std=0.02
+                )
                 if old_lm_head.bias is not None:
                     new_lm_head.bias.data[old_num_tokens:].zero_()
-        
+
         self.set_input_embeddings(new_embeddings)
         self.set_output_embeddings(new_lm_head)
-        
+
         # Update config
-        if hasattr(self.config, 'vocab_size'):
+        if hasattr(self.config, "vocab_size"):
             self.config.vocab_size = new_num_tokens
-        
+
         return new_embeddings
 
     def _init_new_embeddings_with_mean(
@@ -570,13 +661,13 @@ class PI0ForConditionalGeneration(PI0PreTrainedModel, GenerationMixin):
     ) -> None:
         """
         Initialize new embedding weights using mean of old embeddings.
-        
+
         Attempts to use multivariate normal with old embeddings' covariance.
         Falls back to just the mean if covariance is not positive definite.
         """
         old_weights_f32 = old_weights[:old_num_tokens].to(torch.float32)
         mean_embedding = old_weights_f32.mean(dim=0)
-        
+
         # Try to compute covariance and sample from multivariate normal
         try:
             centered = old_weights_f32 - mean_embedding
@@ -585,7 +676,9 @@ class PI0ForConditionalGeneration(PI0PreTrainedModel, GenerationMixin):
             dist = torch.distributions.MultivariateNormal(
                 mean_embedding, covariance_matrix=epsilon * covariance
             )
-            new_weights[old_num_tokens:] = dist.sample((added_num_tokens,)).to(new_weights.dtype)
+            new_weights[old_num_tokens:] = dist.sample((added_num_tokens,)).to(
+                new_weights.dtype
+            )
         except (ValueError, RuntimeError):
             # Covariance not positive definite, use mean only
             new_weights[old_num_tokens:] = mean_embedding.to(new_weights.dtype)
@@ -594,6 +687,7 @@ class PI0ForConditionalGeneration(PI0PreTrainedModel, GenerationMixin):
 @dataclasses.dataclass
 class PI0FlowMatchingOutput(CausalLMOutput):
     loss: torch.Tensor
+
 
 class PI0FlowMatching(nn.Module):
     def __init__(self, config):
@@ -605,15 +699,15 @@ class PI0FlowMatching(nn.Module):
 
         paligemma_config = get_config(config.paligemma_variant)
         action_expert_config = get_config(config.action_expert_variant)
-        
+
         logger.info(f"Creating PaliGemmaWithExpertModel with precision={config.dtype}")
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
-            freeze_vision_encoder=getattr(config, 'freeze_vision_encoder', False),
-            train_expert_only=getattr(config, 'train_expert_only', False),
+            freeze_vision_encoder=getattr(config, "freeze_vision_encoder", False),
+            train_expert_only=getattr(config, "train_expert_only", False),
         )
 
         # Projection layers - no explicit dtype, inherits from default (matching OpenPI)
@@ -621,32 +715,44 @@ class PI0FlowMatching(nn.Module):
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
 
         if self.pi05:
-            self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
-            self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+            self.time_mlp_in = nn.Linear(
+                action_expert_config.width, action_expert_config.width
+            )
+            self.time_mlp_out = nn.Linear(
+                action_expert_config.width, action_expert_config.width
+            )
         else:
             self.state_proj = nn.Linear(32, action_expert_config.width)
-            self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
-            self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+            self.action_time_mlp_in = nn.Linear(
+                2 * action_expert_config.width, action_expert_config.width
+            )
+            self.action_time_mlp_out = nn.Linear(
+                action_expert_config.width, action_expert_config.width
+            )
 
         torch.set_float32_matmul_precision("high")
-        
+
         # Allow disabling torch.compile via environment variable for faster debugging/evaluation
         self._compile_enabled = os.environ.get("TORCH_COMPILE_DISABLE", "0") != "1"
         if self._compile_enabled:
-            self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+            self.sample_actions = torch.compile(
+                self.sample_actions, mode="max-autotune"
+            )
         else:
             logger.info("torch.compile disabled via TORCH_COMPILE_DISABLE=1")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
-        
+
         # Apply parameter freezing configuration
         self.set_requires_grad()
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
+        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = (
+            True
+        )
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
 
@@ -655,7 +761,9 @@ class PI0FlowMatching(nn.Module):
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
+        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = (
+            False
+        )
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
 
@@ -673,31 +781,49 @@ class PI0FlowMatching(nn.Module):
             )
         return func(*args, **kwargs)
 
+    def _get_language_model_dtype(self) -> torch.dtype:
+        """Return the active backbone language-model dtype.
+
+        The shared multi-expert wrapper exposes different attributes for the 2B
+        and 800m backbones. This helper keeps inherited utilities backbone-agnostic.
+        """
+        if hasattr(self.paligemma_with_expert, "paligemma"):
+            language_model = self.paligemma_with_expert.paligemma.language_model
+        else:
+            language_model = self.paligemma_with_expert.gemma3.model
+        return language_model.layers[0].self_attn.q_proj.weight.dtype
+
     def _prepare_attention_masks_4d(self, att_2d_masks):
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         # Use model weight dtype to avoid attention bias dtype mismatch errors
         # This matches the pattern used elsewhere in the codebase (line 791)
-        dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-        return torch.where(att_2d_masks_4d, torch.tensor(0.0, dtype=dtype, device=att_2d_masks.device), 
-                          torch.tensor(-2.3819763e38, dtype=dtype, device=att_2d_masks.device))
+        dtype = self._get_language_model_dtype()
+        return torch.where(
+            att_2d_masks_4d,
+            torch.tensor(0.0, dtype=dtype, device=att_2d_masks.device),
+            torch.tensor(-2.3819763e38, dtype=dtype, device=att_2d_masks.device),
+        )
 
     def _preprocess_observation(self, observation):
         """Helper method to extract observation components (preprocessing done externally)."""
         # Handle both dict and object-style observations
-        images = observation['images']
-        image_masks = observation.get('image_masks', {})
-        tokenized_prompt = observation['tokenized_prompt']
-        tokenized_prompt_mask = observation['tokenized_prompt_mask']
-        state = observation['state']
-        
+        images = observation["images"]
+        image_masks = observation.get("image_masks", {})
+        tokenized_prompt = observation["tokenized_prompt"]
+        tokenized_prompt_mask = observation["tokenized_prompt_mask"]
+        state = observation["state"]
+
         # CRITICAL: Use sorted keys for consistent ordering between train and eval.
         # dict.values() order depends on insertion order, which may differ between
         # training datasets and inference environments.
         sorted_keys = sorted(images.keys())
         img_list = [images[k] for k in sorted_keys]
-        img_mask_list = [image_masks.get(k, torch.tensor(True, dtype=torch.bool)) for k in sorted_keys]
-        
+        img_mask_list = [
+            image_masks.get(k, torch.tensor(True, dtype=torch.bool))
+            for k in sorted_keys
+        ]
+
         return (
             img_list,
             img_mask_list,
@@ -803,7 +929,11 @@ class PI0FlowMatching(nn.Module):
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
-            timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0, device=timestep.device
+            timestep,
+            self.action_in_proj.out_features,
+            min_period=4e-3,
+            max_period=4.0,
+            device=timestep.device,
         )
         time_emb = time_emb.type(dtype=timestep.dtype)
 
@@ -841,7 +971,9 @@ class PI0FlowMatching(nn.Module):
         embs.append(action_time_emb)
 
         bsize, action_time_dim = action_time_emb.shape[:2]
-        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
+        action_time_mask = torch.ones(
+            bsize, action_time_dim, dtype=torch.bool, device=timestep.device
+        )
         pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
@@ -858,7 +990,9 @@ class PI0FlowMatching(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None, **kwargs) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation)
+        )
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -873,12 +1007,13 @@ class PI0FlowMatching(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
+            self.embed_suffix(state, x_t, time)
+        )
+        if self._get_language_model_dtype() == torch.bfloat16:
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
@@ -891,7 +1026,9 @@ class PI0FlowMatching(nn.Module):
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         # Apply gradient checkpointing if enabled
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+        def forward_func(
+            prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        ):
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
@@ -903,7 +1040,12 @@ class PI0FlowMatching(nn.Module):
             return suffix_out
 
         suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+            forward_func,
+            prefix_embs,
+            suffix_embs,
+            att_2d_masks_4d,
+            position_ids,
+            adarms_cond,
         )
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
@@ -929,19 +1071,23 @@ class PI0FlowMatching(nn.Module):
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         # Handle both dict and object-style observation access
-        if hasattr(observation, 'state'):
+        if hasattr(observation, "state"):
             bsize = observation.state.shape[0]
-        elif isinstance(observation, dict) and 'state' in observation:
-            bsize = observation['state'].shape[0]
+        elif isinstance(observation, dict) and "state" in observation:
+            bsize = observation["state"].shape[0]
         else:
             raise ValueError("observation must have 'state' attribute or key")
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation)
+        )
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -987,13 +1133,17 @@ class PI0FlowMatching(nn.Module):
         timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
+            self.embed_suffix(state, x_t, timestep)
+        )
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
 
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
+            batch_size, suffix_len, prefix_len
+        )
 
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
 
@@ -1004,7 +1154,9 @@ class PI0FlowMatching(nn.Module):
 
         # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = (
+            "eager"  # noqa: SLF001
+        )
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
@@ -1020,22 +1172,22 @@ class PI0FlowMatching(nn.Module):
         # suffix_out = suffix_out.to(dtype=torch.float32)
         suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
         return self.action_out_proj(suffix_out)
-    
+
     def set_requires_grad(self):
         """Set requires_grad for parameters based on configuration."""
         # Handle state projection freezing (only for PI0, not PI0.5)
-        if not self.pi05 and hasattr(self, 'state_proj'):
-            train_state_proj = getattr(self.config, 'train_state_proj', True)
+        if not self.pi05 and hasattr(self, "state_proj"):
+            train_state_proj = getattr(self.config, "train_state_proj", True)
             for param in self.state_proj.parameters():
                 param.requires_grad = train_state_proj
 
     @torch.no_grad()
     def warmup(self, device: torch.device | str, tokenizer=None) -> None:
         """Run a warmup inference to trigger torch.compile JIT compilation.
-        
+
         This should be called after model is moved to device and before serving,
         to avoid the first query taking a long time for compilation.
-        
+
         Args:
             device: Device to run warmup on
             tokenizer: Optional tokenizer for creating dummy prompt tokens.
@@ -1044,39 +1196,52 @@ class PI0FlowMatching(nn.Module):
         if not self._compile_enabled:
             logger.info("Skipping warmup (torch.compile disabled)")
             return
-        
+
         logger.info("Running warmup inference to trigger torch.compile...")
-        
+
         # Create dummy observation matching expected shapes
         batch_size = 1
-        state_dim = getattr(self.config, 'state_dim', 32)
-        max_token_len = getattr(self.config, 'max_token_len', 200)
-        
+        state_dim = getattr(self.config, "state_dim", 32)
+        max_token_len = getattr(self.config, "max_token_len", 200)
+
         # Dummy state
         state = torch.zeros(batch_size, state_dim, dtype=torch.bfloat16, device=device)
-        
+
         # Dummy image (224x224 RGB, normalized to [-1, 1])
-        dummy_image = torch.zeros(batch_size, 3, 224, 224, dtype=torch.bfloat16, device=device)
-        
+        dummy_image = torch.zeros(
+            batch_size, 3, 224, 224, dtype=torch.bfloat16, device=device
+        )
+
         # Dummy tokenized prompt
         if tokenizer is not None:
-            tokenized = tokenizer("warmup", return_tensors="pt", padding="max_length", 
-                                  truncation=True, max_length=max_token_len)
+            tokenized = tokenizer(
+                "warmup",
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=max_token_len,
+            )
             tokenized_prompt = tokenized["input_ids"].to(device)
             tokenized_prompt_mask = tokenized["attention_mask"].bool().to(device)
         else:
-            tokenized_prompt = torch.ones(batch_size, max_token_len, dtype=torch.long, device=device)
-            tokenized_prompt_mask = torch.ones(batch_size, max_token_len, dtype=torch.bool, device=device)
-        
+            tokenized_prompt = torch.ones(
+                batch_size, max_token_len, dtype=torch.long, device=device
+            )
+            tokenized_prompt_mask = torch.ones(
+                batch_size, max_token_len, dtype=torch.bool, device=device
+            )
+
         dummy_observation = {
             "images": {"cam": dummy_image},
-            "image_masks": {"cam": torch.tensor([True], dtype=torch.bool, device=device)},
+            "image_masks": {
+                "cam": torch.tensor([True], dtype=torch.bool, device=device)
+            },
             "state": state,
             "tokenized_prompt": tokenized_prompt,
             "tokenized_prompt_mask": tokenized_prompt_mask,
         }
-        
+
         # Run sample_actions to trigger compilation
         _ = self.sample_actions(device=device, observation=dummy_observation)
-        
+
         logger.info("Warmup complete - torch.compile JIT compilation finished")

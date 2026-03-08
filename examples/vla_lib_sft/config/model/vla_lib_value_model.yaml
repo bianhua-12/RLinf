@@ -54,6 +54,18 @@ max_token_len: 200
 #   "gemma_2b" (default)
 paligemma_variant: "gemma_2b"
 
+# backbone_variant: selects the shared VLM backbone implementation
+#   "paligemma_2b"   -> PaliGemma + Gemma expert
+#                        ignores siglip_path / gemma3_path
+#   "paligemma_800m" -> SigLIP2 + Gemma3 + Gemma expert
+#                        requires both siglip_path and gemma3_path
+backbone_variant: "paligemma_2b"
+
+# Required when backbone_variant = "paligemma_800m".
+# Leave null for "paligemma_2b".
+siglip_path: null
+gemma3_path: null
+
 action_expert_variant: "gemma_300m"
 freeze_vision_encoder: false
 train_expert_only: false
