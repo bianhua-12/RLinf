@@ -218,6 +218,22 @@ loss 曲线：
 ----------------------------
 
 当前 SFT 使用 FSDP 训练后保存的是 FSDP 权重（例如 ``full_weights.pt``）。
+
+Value Model Backbone 说明
+----------------------------
+
+RLinf 的 ``vla_lib_value_model`` 现在支持三种 backbone 形式，共用同一个
+value-model 接口：
+
+- ``backbone_variant: "paligemma"``
+- ``backbone_variant: "siglip_gemma3"``
+- ``backbone_variant: "smolvlm"``
+
+如果要走 SmolVLA 风格的路径，需要设置本地
+``actor.model.smolvlm_path`` 指向 ``SmolVLM2`` 权重目录。对应的轻量 expert
+结构可以通过 ``smolvlm_num_expert_layers``、``smolvlm_num_vlm_layers``、
+``smolvlm_self_attn_every_n_layers`` 和
+``smolvlm_expert_width_multiplier`` 调整。
 如果需要转成 HuggingFace 权重，建议使用仓库内置脚本：
 
 - 脚本：``toolkits/ckpt_convertor/fsdp_convertor/convert_pt_to_hf.sh``

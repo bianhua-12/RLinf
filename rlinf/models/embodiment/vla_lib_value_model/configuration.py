@@ -252,6 +252,13 @@ class ValueCriticConfig(VLMBaseConfig):
         backbone_variant: str = "paligemma",
         siglip_path: str | None = None,
         gemma3_path: str | None = None,
+        smolvlm_path: str | None = None,
+        smolvlm_load_vlm_weights: bool = True,
+        smolvlm_attention_mode: str = "cross_attn",
+        smolvlm_num_expert_layers: int = -1,
+        smolvlm_num_vlm_layers: int = 16,
+        smolvlm_self_attn_every_n_layers: int = 2,
+        smolvlm_expert_width_multiplier: float = 0.75,
         **kwargs,
     ):
         # Accept and ignore legacy parameters for checkpoint compatibility
@@ -267,3 +274,10 @@ class ValueCriticConfig(VLMBaseConfig):
         self.backbone_variant = backbone_variant
         self.siglip_path = siglip_path or ""
         self.gemma3_path = gemma3_path or ""
+        self.smolvlm_path = smolvlm_path or ""
+        self.smolvlm_load_vlm_weights = smolvlm_load_vlm_weights
+        self.smolvlm_attention_mode = smolvlm_attention_mode
+        self.smolvlm_num_expert_layers = smolvlm_num_expert_layers
+        self.smolvlm_num_vlm_layers = smolvlm_num_vlm_layers
+        self.smolvlm_self_attn_every_n_layers = smolvlm_self_attn_every_n_layers
+        self.smolvlm_expert_width_multiplier = smolvlm_expert_width_multiplier

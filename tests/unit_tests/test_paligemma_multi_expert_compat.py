@@ -35,3 +35,11 @@ def test_siglip_gemma3_module_defines_independent_backbone() -> None:
         "self.multi_modal_proj = nn.Linear(siglip_hidden, gemma3_hidden, bias=True)"
         in content
     )
+
+
+def test_smolvlm_module_defines_independent_backbone() -> None:
+    """SmolVLM path should exist as its own implementation."""
+    content = (VALUE_MODEL_DIR / "smolvlm_with_multi_expert.py").read_text()
+    assert "class SmolVLMWithMultiExpert(nn.Module):" in content
+    assert 'attention_mode: str = "cross_attn"' in content
+    assert "self.experts = nn.ModuleDict()" in content

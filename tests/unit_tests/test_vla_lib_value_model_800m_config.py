@@ -27,6 +27,8 @@ def test_factory_forwards_siglip_gemma3_backbone_fields() -> None:
     assert '_set("backbone_variant", "paligemma")' in content
     assert '_set("siglip_path", None)' in content
     assert '_set("gemma3_path", None)' in content
+    assert '_set("smolvlm_path", None)' in content
+    assert '_set("smolvlm_attention_mode", "cross_attn")' in content
 
 
 def test_value_critic_routes_siglip_gemma3_backbone() -> None:
@@ -37,6 +39,9 @@ def test_value_critic_routes_siglip_gemma3_backbone() -> None:
     assert "SiglipGemma3WithMultiExpert(" in content
     assert "siglip_path=siglip_path" in content
     assert "gemma3_path=gemma3_path" in content
+    assert 'self.backbone_variant == "smolvlm"' in content
+    assert "SmolVLMWithMultiExpert(" in content
+    assert 'smolvlm_path = getattr(config, "smolvlm_path", "")' in content
 
 
 def test_validation_config_defines_local_siglip_gemma3_paths() -> None:
@@ -56,6 +61,7 @@ def test_gradient_checkpointing_helpers_are_backbone_aware() -> None:
     assert "def _get_vision_tower(self) -> nn.Module:" in content
     assert "def _set_gradient_checkpointing_flag(" in content
     assert 'if self.backbone_variant == "siglip_gemma3":' in content
+    assert 'if self.backbone_variant == "smolvlm":' in content
 
 
 def test_siglip_gemma3_multi_expert_uses_uniform_bf16_under_fsdp() -> None:
@@ -73,3 +79,11 @@ def test_siglip_gemma3_freeze_vlm_freezes_full_vlm_stack() -> None:
     """freeze_vlm should freeze SigLIP, projector, and Gemma3 together."""
     content = (VALUE_MODEL_DIR / "siglip_gemma3_with_multi_expert.py").read_text()
     assert "vlm_modules = [self.vision_tower, self.multi_modal_proj, self.gemma3]" in content
+
+
+def test_processor_factory_supports_smolvlm() -> None:
+    """Processor factory should route SmolVLM backbones to the adapter."""
+    content = (VALUE_MODEL_DIR / "processing_smolvlm.py").read_text()
+    assert "class SmolVLMProcessor(PI05Processor):" in content
+    assert 'if backbone_variant == "smolvlm":' in content
+    assert "return SmolVLMProcessor(" in content

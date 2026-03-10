@@ -45,11 +45,20 @@ exclude_cot_from_kv_cache: false
 # Backbone implementation:
 #   "paligemma"     -> PaliGemma + Gemma expert
 #   "siglip_gemma3" -> SigLIP2 + Gemma3 + Gemma expert
+#   "smolvlm"       -> SmolVLM2 + lightweight expert (SmolVLA-style)
 # =====================================================================
 backbone_variant: "paligemma"
 # Required only when backbone_variant = "siglip_gemma3".
 siglip_path: null
 gemma3_path: null
+# Required only when backbone_variant = "smolvlm".
+smolvlm_path: null
+smolvlm_load_vlm_weights: true
+smolvlm_attention_mode: "cross_attn"
+smolvlm_num_expert_layers: -1
+smolvlm_num_vlm_layers: 16
+smolvlm_self_attn_every_n_layers: 2
+smolvlm_expert_width_multiplier: 0.75
 
 # =====================================================================
 # Checkpoint (set to load pretrained weights)

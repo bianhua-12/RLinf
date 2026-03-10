@@ -7,7 +7,7 @@ with support for RL-specific fields (returns, target values, etc.).
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 _COLLATOR_VERIFIED = False
 
 
-def stack_tensors(list_of_dicts: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+def stack_tensors(list_of_dicts: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
     """Stack a list of dictionaries of tensors/values.
 
     Handles numpy booleans and other non-tensor types by converting to tensors first.
@@ -83,7 +83,7 @@ class PI05DataCollator(DataCollatorMixin):
     return_tensors: str = "pt"
     train: bool = True
 
-    def torch_call(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         """Collate examples for PI0.5 training."""
         images_batch = []
         image_masks_batch = []
@@ -174,6 +174,8 @@ class PI05DataCollator(DataCollatorMixin):
             "token_ar_mask": ar_masks,
             "action_mask": action_mask,
         }
+        if "pixel_attention_mask" in processed_img:
+            observation["pixel_attention_mask"] = processed_img["pixel_attention_mask"]
 
         batch = {
             "input_ids": lang_tokens,

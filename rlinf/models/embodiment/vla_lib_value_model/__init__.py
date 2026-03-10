@@ -69,6 +69,13 @@ def get_vla_lib_value_model(cfg: DictConfig, torch_dtype=None) -> ValueCriticMod
     _set("backbone_variant", "paligemma")
     _set("siglip_path", None)
     _set("gemma3_path", None)
+    _set("smolvlm_path", None)
+    _set("smolvlm_load_vlm_weights", True)
+    _set("smolvlm_attention_mode", "cross_attn")
+    _set("smolvlm_num_expert_layers", -1)
+    _set("smolvlm_num_vlm_layers", 16)
+    _set("smolvlm_self_attn_every_n_layers", 2)
+    _set("smolvlm_expert_width_multiplier", 0.75)
 
     # Handle precision / dtype
     precision = getattr(cfg, "precision", "bf16")

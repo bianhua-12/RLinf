@@ -128,10 +128,13 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
         except (ImportError, AttributeError):
             pass
 
-        from rlinf.models.embodiment.vla_lib_value_model.data_collator import PI05DataCollator
-        from rlinf.models.embodiment.vla_lib_value_model.processing import PI05Processor
-
         from rlinf.datasets import ValueDataset
+        from rlinf.models.embodiment.vla_lib_value_model.data_collator import (
+            PI05DataCollator,
+        )
+        from rlinf.models.embodiment.vla_lib_value_model.processing_smolvlm import (
+            get_value_model_processor,
+        )
 
         data_cfg = self.cfg.get("data", {})
         model_cfg = self.cfg.actor.model
@@ -153,10 +156,12 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
             return kwargs
 
         # ---- processor & collator ----
-        processor = PI05Processor(
+        processor = get_value_model_processor(
+            backbone_variant=getattr(model_cfg, "backbone_variant", "paligemma"),
             max_token_len=getattr(model_cfg, "max_token_len", 200),
             tokenizer_name_or_path=getattr(model_cfg, "tokenizer_path", None)
             or model_cfg.model_path,
+            smolvlm_path=getattr(model_cfg, "smolvlm_path", None),
             discrete_state_input=getattr(model_cfg, "discrete_state_input", False),
             exclude_cot_from_kv_cache=getattr(
                 model_cfg, "exclude_cot_from_kv_cache", False

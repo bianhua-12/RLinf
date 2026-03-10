@@ -218,6 +218,23 @@ Final eval accuracy: ``0.8995802998542786`` (about ``89.96%``).
 Checkpoint Notes
 ----------------
 
+Value-Model Backbone Note
+-------------------------
+
+RLinf's ``vla_lib_value_model`` now supports three backbone families behind the
+same value-model interface:
+
+- ``backbone_variant: "paligemma"``
+- ``backbone_variant: "siglip_gemma3"``
+- ``backbone_variant: "smolvlm"``
+
+For the SmolVLA-style path, set ``actor.model.smolvlm_path`` to a local
+``SmolVLM2`` checkpoint and keep the value head in ``vla_lib_value_model``.
+The SmolVLM branch uses a lightweight expert with configurable depth / width via
+``smolvlm_num_expert_layers``, ``smolvlm_num_vlm_layers``,
+``smolvlm_self_attn_every_n_layers``, and
+``smolvlm_expert_width_multiplier``.
+
 SFT with FSDP saves checkpoints in FSDP format (for example, ``full_weights.pt``).
 
 If you need HuggingFace format, use the built-in converter:

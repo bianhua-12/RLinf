@@ -91,6 +91,9 @@ actor:
     backbone_variant: "siglip_gemma3"
     siglip_path: "/mnt/public/shchen/models/siglip2-so400m-patch14-224"
     gemma3_path: "/mnt/public/shchen/models/gemma-3-270m"
+    # SmolVLA-style alternative:
+    # backbone_variant: "smolvlm"
+    # smolvlm_path: "/path/to/SmolVLM2-500M-Video-Instruct"
 
   optim:
     lr: 5.0e-5
