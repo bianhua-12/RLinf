@@ -1,7 +1,7 @@
 论文
 ====
 
-本页列出与 **RLinf** 相关的论文与技术报告。带详细结果与快速开始链接的页面见下方。
+本页列出与 **RLinf** 相关的论文与技术报告，并补充展示其他代表性成果。带详细结果与快速开始链接的页面见下方。
 
 详细论文页
 ----------
@@ -17,6 +17,7 @@
    pi_rl
    wovr
    wideseek_r1
+   group_publications
 
 - :doc:`RLinf-USER <rlinf_user>` — 统一真机在线策略学习系统 `arXiv:2602.07837 <https://arxiv.org/abs/2602.07837>`__
 - :doc:`RLinf-VLA <rlinf_vla>` — VLA+RL 统一框架 `arXiv:2510.06710 <https://arxiv.org/abs/2510.06710>`__
@@ -25,3 +26,9 @@
 - :doc:`πRL <pi_rl>` — 基于流的 VLA 模型在线 RL 微调 `arXiv:2510.25889 <https://arxiv.org/abs/2510.25889>`__
 - :doc:`WoVR <wovr>` — 基于世界模型的 VLA 模型强化学习微调 `arXiv:2602.13977 <https://arxiv.org/abs/2602.13977>`__
 - :doc:`WideSeek-R1 <wideseek_r1>` — 通过多智能体强化学习探索用于广泛信息检索的宽度扩展方法 `arXiv:2602.04634 <https://arxiv.org/abs/2602.04634>`__
+- :doc:`课题组相关成果 <group_publications>` — 与 RLinf 无直接关系的代表性论文成果，相关工作由中关村学院支持
+
+其他成果
+--------
+
+- `课题组网站 <https://rleai.github.io/>`__ / `开源代码 <https://github.com/rleai/rleai.github.io>`__ — 由中关村学院支持
