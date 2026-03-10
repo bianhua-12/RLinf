@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-VLA-Lib ValueCriticModel factory for RLinf.
+ValueCriticModel factory for RLinf.
 """
 
 import glob
@@ -30,7 +30,7 @@ from .modeling_critic import CriticOutput, ValueCritic, ValueCriticModel
 logger = logging.getLogger(__name__)
 
 
-def get_vla_lib_value_model(cfg: DictConfig, torch_dtype=None) -> ValueCriticModel:
+def get_value_model(cfg: DictConfig, torch_dtype=None) -> ValueCriticModel:
     """Build a ValueCriticModel.
 
     Args:
@@ -132,7 +132,7 @@ def _load_state_dict(path: str) -> dict:
 
 
 __all__ = [
-    "get_vla_lib_value_model",
+    "get_value_model",
     "ValueCriticModel",
     "ValueCritic",
     "ValueCriticConfig",

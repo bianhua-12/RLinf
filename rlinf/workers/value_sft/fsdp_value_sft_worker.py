@@ -15,7 +15,7 @@
 """
 FSDP Value Model SFT Worker.
 
-Standalone worker for training vla_lib ValueCriticModel
+Standalone worker for training ValueCriticModel
 via supervised fine-tuning with FSDP.
 
 This module is self-contained and does NOT share code with fsdp_sft_worker.py.
@@ -105,7 +105,7 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
             self.offload_optimizer()
 
     def model_provider_func(self) -> torch.nn.Module:
-        """Load the vla_lib value model."""
+        """Load the value model."""
         return get_model(self.cfg.actor.model)
 
     # -----------------------------------------------------------------------
@@ -128,8 +128,8 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
         except (ImportError, AttributeError):
             pass
 
-        from rlinf.models.embodiment.vla_lib_value_model.data_collator import PI05DataCollator
-        from rlinf.models.embodiment.vla_lib_value_model.processing import PI05Processor
+        from rlinf.models.embodiment.value_model.data_collator import PI05DataCollator
+        from rlinf.models.embodiment.value_model.processing import PI05Processor
 
         from rlinf.datasets import ValueDataset
 
@@ -382,7 +382,7 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
             f"pin_memory={pin_memory}"
         )
 
-        data_config = {"model_type": "vla_lib_value_model"}
+        data_config = {"model_type": "value_model"}
         train_data_loader = ValueDataLoaderImpl(data_config, torch_loader)
 
         # ---- optional eval DataLoader(s) ----

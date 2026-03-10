@@ -1,4 +1,4 @@
-model_type: "vla_lib_value_model"
+model_type: "value_model"
 
 # Model precision
 precision: bf16
