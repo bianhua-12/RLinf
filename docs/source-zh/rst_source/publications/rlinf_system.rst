@@ -20,6 +20,7 @@ RLinf: Flexible and Efficient Large-scale Reinforcement Learning via Macro-to-Mi
 
 
 RLinf 是面向基础模型后训练的灵活可扩展开源强化学习基础设施。它支持 **推理 RL** （如使用 GRPO 的数学推理）、**具身 RL** （如在仿真器中训练 VLA）等多种场景。RLinf 基于宏到微流转换（M2Flow）范式，将逻辑工作流编程与执行规划解耦，并利用弹性流水线、上下文切换和基于性能分析的调度来最大化吞吐量。评测表明，RLinf 实现了 **1.07×–2.43×** 的端到端训练加速：推理 RL 场景最高可达 **1.7×**，具身 RL 场景最高可达 **2.43×**。
+**本工作由中关村学院支持**
 
 结果
 ----

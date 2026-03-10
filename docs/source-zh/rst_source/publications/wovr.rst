@@ -11,6 +11,7 @@ WoVR: World Models as Reliable Simulators for Post-Training VLA Policies with RL
    :align: center
 
 WoVR 是基于世界模型构建的、面向 VLA 模型强化学习微调的可靠训练框架。它首先将世界模型强化为一个可控、稳定的生成式仿真器，实现动作响应与长时滚动稳定生成；在此基础上，通过 Keyframe-Initialized Rollouts（KIR）与掩码 GRPO 构建可靠的想象交互机制，降低有效误差深度并避免在幻觉成功上优化；最后，通过 PACE 策略实现策略与世界模型的协同进化，对齐不断演化的策略分布，缓解分布偏移并维持仿真器可靠性。
+**本工作由中关村学院支持**
 
 LIBERO（四类任务）
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~

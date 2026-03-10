@@ -12,6 +12,7 @@ RLinf-USER: Unified System for Real-world Online Policy Learning
    :align: center
 
 RLinf-USER 是面向真机在线策略学习的统一可扩展系统，提供奖励、算法与策略的可扩展抽象，支持 CNN/MLP、生成式（流）策略与大规模 VLA 模型在统一流程中进行在线模仿或强化学习。
+**本工作由中关村学院支持**
 
 任务
 ----

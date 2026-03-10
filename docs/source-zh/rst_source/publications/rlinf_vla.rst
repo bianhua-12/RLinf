@@ -16,6 +16,7 @@ RLinf-VLA: A Unified and Efficient Framework for VLA+RL Training
    :align: center
 
 RLinf-VLA 是面向 VLA 模型可扩展 RL 训练的统一高效框架，通过统一接口整合多种 VLA 架构、多种 RL 算法与异构仿真器；采用灵活的资源分配架构，针对 GPU 并行仿真器引入混合细粒度流水线策略，带来约 1.61×–1.88× 训练加速。在 LIBERO、ManiSkill、RoboTwin 等基准上，RLinf-VLA 训练得到的模型均有约 20–85% 的性能提升。
+**本工作由中关村学院支持**
 
 结果
 ----

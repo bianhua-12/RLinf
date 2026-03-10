@@ -12,6 +12,7 @@ Beyond Imitation: Reinforcement Learning-Based Sim-Real Co-Training for VLA Mode
    :align: center
 
 所提出的两阶段仿真-真实协同训练框架概览。我们建立数字孪生设置，尽管存在视觉差异，:math:`T_{\text{sim}}` 仍可作为 :math:`T_{\text{real}}` 的数字近亲。在 **阶段 I** 中，我们将真实与仿真数据按比例 :math:`\alpha` 混合进行监督训练以初始化 VLA 策略。这一步可快速注入真实世界知识，并为后续仿真交互做好准备。在 **阶段 II** 中，我们在仿真器中进行 RL 微调以探索并提升性能，同时引入真实世界 SFT 损失作为正则项，防止模型遗忘真实世界行为。
+**本工作由中关村学院支持**
 
 结果
 ----
