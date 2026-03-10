@@ -55,10 +55,6 @@ advantage:
   # Allows computing advantages with different value models on the same data
   # tag: null
 
-  # Value inference mode
-  # Options: "expert_categorical", "expert_mse", "expert_distributional", "continuous", "discrete"
-  value_mode: "expert_categorical"
-
   # Model configuration (should match the trained model)
   model:
     num_bins: 201
@@ -70,7 +66,7 @@ advantage:
 # Data configuration
 # =============================================================================
 data:
-  # Model type for ValuePolicy (pi0, pi05)
+  # Model type for ValueCritic (pi0, pi05)
   model_type: "pi05"
 
   # Robot type for input transforms
