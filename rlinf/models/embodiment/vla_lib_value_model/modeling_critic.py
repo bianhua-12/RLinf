@@ -1,8 +1,18 @@
-"""
-Value Critic Models for Value Prediction.
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-Uses expert forward mode: Gemma expert + [CLS] -> categorical value prediction.
-"""
+"""Value critic models for value prediction."""
 
 import glob
 import json
@@ -390,23 +400,26 @@ class VLMObservationEncoder(nn.Module):
         if token_kv_cache_mask is None:
             token_kv_cache_mask = tokenized_prompt_mask.clone()
 
-        sorted_keys = sorted(images.keys())
-        img_list = [images[k] for k in sorted_keys]
-        img_mask_list = [
-            image_masks.get(k, torch.ones(batch_size, dtype=torch.bool, device=device))
-            for k in sorted_keys
-        ]
-
         if getattr(self, "backbone_variant", "paligemma") == "smolvlm":
             return (
                 observation["images"],
-                observation.get("pixel_attention_mask"),
+                {
+                    "pixel_attention_mask": observation.get("pixel_attention_mask"),
+                    "image_masks": observation.get("image_masks"),
+                },
                 tokenized_prompt,
                 tokenized_prompt_mask,
                 token_ar_mask,
                 token_loss_mask,
                 token_kv_cache_mask,
             )
+
+        sorted_keys = sorted(images.keys())
+        img_list = [images[k] for k in sorted_keys]
+        img_mask_list = [
+            image_masks.get(k, torch.ones(batch_size, dtype=torch.bool, device=device))
+            for k in sorted_keys
+        ]
 
         return (
             img_list,
@@ -427,16 +440,36 @@ class VLMObservationEncoder(nn.Module):
         device = lang_tokens.device
 
         if self.backbone_variant == "smolvlm":
+            pixel_attention_mask = None
+            if isinstance(img_masks, dict):
+                pixel_attention_mask = img_masks.get("pixel_attention_mask")
+            else:
+                pixel_attention_mask = img_masks
             img_emb = self._apply_checkpoint(
                 self.paligemma_with_expert.embed_image,
                 images,
-                img_masks,
+                pixel_attention_mask,
             )
             num_img_embs = img_emb.shape[1]
-            embs.append(img_emb)
-            pad_masks.append(
-                torch.ones(bsize, num_img_embs, dtype=torch.bool, device=device)
+            num_image_slots = images.shape[1]
+            if num_image_slots <= 0:
+                raise ValueError("SmolVLM image batch must include at least one slot")
+            if num_img_embs % num_image_slots != 0:
+                raise ValueError(
+                    "SmolVLM image embeddings must divide evenly across split-image slots. "
+                    f"Got num_img_embs={num_img_embs}, num_image_slots={num_image_slots}."
+                )
+            tokens_per_image = num_img_embs // num_image_slots
+            real_image_slots = (
+                images.reshape(bsize, num_image_slots, -1).ne(0.0).any(dim=-1)
             )
+            img_pad_mask = (
+                real_image_slots[:, :, None]
+                .expand(bsize, num_image_slots, tokens_per_image)
+                .reshape(bsize, num_img_embs)
+            )
+            embs.append(img_emb)
+            pad_masks.append(img_pad_mask)
             ar_masks.append(
                 torch.zeros(bsize, num_img_embs, dtype=torch.long, device=device)
             )
@@ -570,6 +603,7 @@ class ValueCriticModel(VLMObservationEncoder):
             self.paligemma_with_expert = SmolVLMWithMultiExpert(
                 expert_names=["value"],
                 smolvlm_path=smolvlm_path,
+                precision=config.dtype,
                 load_vlm_weights=getattr(config, "smolvlm_load_vlm_weights", True),
                 freeze_vision_encoder=getattr(config, "freeze_vision_encoder", False),
                 freeze_vlm=getattr(config, "freeze_vlm", False),
@@ -771,10 +805,11 @@ class ValueCriticModel(VLMObservationEncoder):
 
         # Use two-stage forward when VLM is frozen under FSDP to avoid
         # view/inplace errors in interleaved attention.
-        # 800m always uses two-stage (no interleaved support for Gemma3).
-        use_two_stage = self.backbone_variant in ("siglip_gemma3", "smolvlm") or getattr(
-            self.paligemma_with_expert, "freeze_vlm", False
-        )
+        # SigLIP/Gemma3 and SmolVLM paths currently always use two-stage.
+        use_two_stage = self.backbone_variant in (
+            "siglip_gemma3",
+            "smolvlm",
+        ) or getattr(self.paligemma_with_expert, "freeze_vlm", False)
         if use_two_stage:
             prefix_out, suffix_out = self._forward_expert_two_stage(
                 prefix_embs=prefix_embs,
@@ -1258,9 +1293,7 @@ class ValueCritic(CriticPreTrainedModel):
                     new_key = f"model.{k}"
                     remapped[new_key if new_key in model_keys else k] = v
 
-                if len(set(remapped.keys()) & model_keys) > len(
-                    ckpt_keys & model_keys
-                ):
+                if len(set(remapped.keys()) & model_keys) > len(ckpt_keys & model_keys):
                     logger.info("  Remapped checkpoint keys: added 'model.' prefix")
                     state_dict = remapped
 
@@ -1373,17 +1406,13 @@ class ValueCritic(CriticPreTrainedModel):
             if cam_name in input_masks:
                 mask = input_masks[cam_name]
                 if isinstance(mask, (bool, np.bool_)):
-                    image_masks_batch[cam_name] = torch.tensor(
-                        [mask], dtype=torch.bool
-                    )
+                    image_masks_batch[cam_name] = torch.tensor([mask], dtype=torch.bool)
                 elif isinstance(mask, torch.Tensor):
                     image_masks_batch[cam_name] = (
                         mask.unsqueeze(0) if mask.dim() == 0 else mask
                     )
                 else:
-                    image_masks_batch[cam_name] = torch.tensor(
-                        [True], dtype=torch.bool
-                    )
+                    image_masks_batch[cam_name] = torch.tensor([True], dtype=torch.bool)
             else:
                 image_masks_batch[cam_name] = torch.tensor([True], dtype=torch.bool)
 
@@ -1431,15 +1460,11 @@ class ValueCritic(CriticPreTrainedModel):
         return {
             "images": images_on_device,
             "image_masks": masks_on_device,
-            "tokenized_prompt": torch.tensor(
-                [tokens], dtype=torch.long, device=device
-            ),
+            "tokenized_prompt": torch.tensor([tokens], dtype=torch.long, device=device),
             "tokenized_prompt_mask": torch.tensor(
                 [mask], dtype=torch.bool, device=device
             ),
-            "token_ar_mask": torch.tensor(
-                [ar_mask], dtype=torch.long, device=device
-            ),
+            "token_ar_mask": torch.tensor([ar_mask], dtype=torch.long, device=device),
             **(
                 {
                     "pixel_attention_mask": processed_img["pixel_attention_mask"].to(

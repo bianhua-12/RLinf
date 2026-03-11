@@ -1,3 +1,17 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """SmolVLM-specific processor shim for value-model training and inference."""
 
 from typing import Any, Optional
@@ -44,28 +58,9 @@ class SmolVLMImageProcessorAdapter:
                     else:
                         is_present = bool(mask_value)
                 sample_presence.append(is_present)
-                if not is_present:
-                    continue
-
-                if image.dim() == 3 and image.shape[0] in (1, 3):
-                    image = image.permute(1, 2, 0)
-                image = image.detach().cpu()
-                if image.dtype != torch.uint8:
-                    if image.max() <= 1.0 and image.min() >= -1.0:
-                        image = (image.clamp(-1.0, 1.0) + 1.0) * 127.5
-                    image = image.clamp(0, 255).to(torch.uint8)
-                sample_images.append(image.numpy())
-
-            if not sample_images:
-                image = images[sorted_keys[0]][batch_idx]
-                if image.dim() == 3 and image.shape[0] in (1, 3):
-                    image = image.permute(1, 2, 0)
-                image = image.detach().cpu()
-                if image.dtype != torch.uint8:
-                    if image.max() <= 1.0 and image.min() >= -1.0:
-                        image = (image.clamp(-1.0, 1.0) + 1.0) * 127.5
-                    image = image.clamp(0, 255).to(torch.uint8)
-                sample_images = [np.zeros_like(image.numpy())]
+                sample_images.append(
+                    _image_to_uint8_numpy(image, zero_fill=not is_present)
+                )
             nested_images.append(sample_images)
             image_presence.append(sample_presence)
 
@@ -75,6 +70,23 @@ class SmolVLMImageProcessorAdapter:
         )
         encoding["image_masks"] = torch.tensor(image_presence, dtype=torch.bool)
         return encoding
+
+
+def _image_to_uint8_numpy(
+    image: torch.Tensor, *, zero_fill: bool = False
+) -> np.ndarray:
+    """Convert one camera image to HWC uint8 while preserving fixed camera slots."""
+    if image.dim() == 3 and image.shape[0] in (1, 3):
+        image = image.permute(1, 2, 0)
+    image = image.detach().cpu()
+    if image.dtype != torch.uint8:
+        if image.max() <= 1.0 and image.min() >= -1.0:
+            image = (image.clamp(-1.0, 1.0) + 1.0) * 127.5
+        image = image.clamp(0, 255).to(torch.uint8)
+    image_np = image.numpy()
+    if zero_fill:
+        return np.zeros_like(image_np)
+    return image_np
 
 
 class SmolVLMProcessor(PI05Processor):
