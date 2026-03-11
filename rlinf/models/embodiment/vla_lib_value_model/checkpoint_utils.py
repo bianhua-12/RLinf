@@ -80,9 +80,7 @@ def has_tokenizer_files(checkpoint_dir: pathlib.Path) -> bool:
     return any((checkpoint_dir / f).exists() for f in tokenizer_files)
 
 
-def load_norm_stats(
-    checkpoint_dir: pathlib.Path, asset_id: str = "libero"
-) -> dict:
+def load_norm_stats(checkpoint_dir: pathlib.Path, asset_id: str = "libero") -> dict:
     """Load normalization statistics from checkpoint assets.
 
     Args:

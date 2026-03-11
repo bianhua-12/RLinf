@@ -48,9 +48,9 @@ from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
 from rlinf.models import get_model
 from rlinf.scheduler import Cluster, Worker
 from rlinf.utils.distributed import all_reduce_dict
-from rlinf.utils.utils import clear_memory
 from rlinf.utils.metric_utils import append_to_dict
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.utils import clear_memory
 from rlinf.workers.cfg.utils import (
     CFGDataLoaderImpl,
     DatasetWithAdvantage,
@@ -458,7 +458,9 @@ class DebugCFGFSDPActor(FSDPModelManager, Worker):
             observation, actions, advantage = next(self.cfg_data_iter)
 
             observation = jax.tree.map(
-                lambda x: torch.as_tensor(x).contiguous().to(self.device, non_blocking=True),
+                lambda x: torch.as_tensor(x)
+                .contiguous()
+                .to(self.device, non_blocking=True),
                 observation,
             )
             actions = actions.to(torch.float32).to(self.device, non_blocking=True)
