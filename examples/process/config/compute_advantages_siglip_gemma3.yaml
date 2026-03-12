@@ -1,18 +1,27 @@
-# Advantage computation configuration for CFG-RL training
+# Advantage computation configuration for CFG-RL training (SigLIP-Gemma3 backbone)
 #
 # Usage (single GPU):
-#   python compute_advantages.py --config-name compute_advantages \
-#       advantage.value_checkpoint=/path/to/checkpoint
+#   python compute_advantages.py --config-name compute_advantages_siglip_gemma3 \
+#       advantage.value_checkpoint=/path/to/checkpoint \
+#       advantage.model.siglip_path=/path/to/siglip \
+#       advantage.model.gemma3_path=/path/to/gemma3 \
+#       advantage.model.tokenizer_path=/path/to/tokenizer
 #
 # Usage (multi-GPU via torchrun):
-#   torchrun --nproc_per_node=4 compute_advantages.py --config-name compute_advantages \
-#       advantage.value_checkpoint=/path/to/checkpoint
+#   torchrun --nproc_per_node=4 compute_advantages.py --config-name compute_advantages_siglip_gemma3 \
+#       advantage.value_checkpoint=/path/to/checkpoint \
+#       advantage.model.siglip_path=/path/to/siglip \
+#       advantage.model.gemma3_path=/path/to/gemma3 \
+#       advantage.model.tokenizer_path=/path/to/tokenizer
 #
 # This script:
 # 1. Computes advantages: A = normalize(r_{t:t+N}) + gamma^N * V(o_{t+N}) - V(o_t)
 # 2. Creates independent output datasets with is_success = (advantage >= threshold)
 # 3. Supports multiple datasets with unified threshold across all data
 # 4. Supports multi-GPU parallel processing for faster computation
+
+defaults:
+  - model/value_siglip_gemma3@advantage.model
 
 # =============================================================================
 # Advantage computation settings
@@ -65,15 +74,12 @@ advantage:
   #   - "discrete": VLM token logits, argmax bin
   value_mode: "expert_categorical"
 
-  # Model configuration (should match the trained model)
+  # Model configuration (loaded from defaults, override here if needed)
   model:
-    # Value head settings
-    num_bins: 201
-    v_min: -1.0
-    v_max: 0.0
-
-    # Critic expert variant (for expert_* modes)
-    critic_expert_variant: "gemma_50m"
+    critic_expert_variant: "gemma_1m"
+    siglip_path: null   # REQUIRED: set via CLI or override
+    gemma3_path: null    # REQUIRED: set via CLI or override
+    tokenizer_path: null # REQUIRED: set via CLI or override
 
 # =============================================================================
 # Data configuration
