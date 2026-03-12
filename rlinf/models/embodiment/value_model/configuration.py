@@ -1,18 +1,11 @@
-# Copyright 2026 The RLinf Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""
+Value model configuration.
 
-"""Value model configuration."""
+Provides:
+- Config: Gemma action expert configuration (variant configs)
+- VLMBaseConfig: Base configuration for VLM-based model architecture
+- ValueCriticConfig: Extended configuration for value critic models
+"""
 
 import dataclasses
 from typing import Literal, Optional
@@ -182,8 +175,6 @@ class VLMBaseConfig(PretrainedConfig):
         action_loss_weight: float = 1.0,
         eos_token_id: int = 1,
         stop_gradient_to_vlm: bool = False,
-        discrete_state_input: bool = False,
-        exclude_cot_from_kv_cache: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -211,8 +202,6 @@ class VLMBaseConfig(PretrainedConfig):
         self.action_loss_weight = action_loss_weight
         self.eos_token_id = eos_token_id
         self.stop_gradient_to_vlm = stop_gradient_to_vlm
-        self.discrete_state_input = discrete_state_input
-        self.exclude_cot_from_kv_cache = exclude_cot_from_kv_cache
 
     @classmethod
     def from_dict(cls, config_dict, **kwargs):
@@ -240,8 +229,6 @@ class VLMBaseConfig(PretrainedConfig):
                 "action_loss_weight": self.action_loss_weight,
                 "eos_token_id": self.eos_token_id,
                 "stop_gradient_to_vlm": self.stop_gradient_to_vlm,
-                "discrete_state_input": self.discrete_state_input,
-                "exclude_cot_from_kv_cache": self.exclude_cot_from_kv_cache,
             }
         )
         return output
@@ -259,20 +246,10 @@ class ValueCriticConfig(VLMBaseConfig):
         backbone_variant: str = "paligemma",
         siglip_path: str | None = None,
         gemma3_path: str | None = None,
-        smolvlm_path: str | None = None,
-        smolvlm_load_vlm_weights: bool = True,
-        smolvlm_attention_mode: str = "cross_attn",
-        smolvlm_num_expert_layers: int = -1,
-        smolvlm_num_vlm_layers: int = 16,
-        smolvlm_self_attn_every_n_layers: int = 2,
-        smolvlm_expert_width_multiplier: float = 0.75,
+        value_dropout: float = 0.0,
         **kwargs,
     ):
         # Accept and ignore legacy parameters for checkpoint compatibility
-        kwargs.pop("critic_forward_mode", None)
-        kwargs.pop("expert_loss_type", None)
-        kwargs.pop("expert_loss_weight", None)
-        kwargs.pop("vlm_loss_weight", None)
         super().__init__(**kwargs)
         self.critic_expert_variant = critic_expert_variant
         self.num_bins = num_bins
@@ -281,10 +258,4 @@ class ValueCriticConfig(VLMBaseConfig):
         self.backbone_variant = backbone_variant
         self.siglip_path = siglip_path or ""
         self.gemma3_path = gemma3_path or ""
-        self.smolvlm_path = smolvlm_path or ""
-        self.smolvlm_load_vlm_weights = smolvlm_load_vlm_weights
-        self.smolvlm_attention_mode = smolvlm_attention_mode
-        self.smolvlm_num_expert_layers = smolvlm_num_expert_layers
-        self.smolvlm_num_vlm_layers = smolvlm_num_vlm_layers
-        self.smolvlm_self_attn_every_n_layers = smolvlm_self_attn_every_n_layers
-        self.smolvlm_expert_width_multiplier = smolvlm_expert_width_multiplier
+        self.value_dropout = value_dropout

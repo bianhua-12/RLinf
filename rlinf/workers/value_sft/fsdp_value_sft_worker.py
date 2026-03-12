@@ -15,7 +15,7 @@
 """
 FSDP Value Model SFT Worker.
 
-Standalone worker for training vla_lib ValueCriticModel
+Standalone worker for training ValueCriticModel
 via supervised fine-tuning with FSDP.
 
 This module is self-contained and does NOT share code with fsdp_sft_worker.py.
@@ -75,7 +75,7 @@ def _load_return_stats_from_dataset(
 class FSDPValueSftWorker(FSDPModelManager, Worker):
     """FSDP worker for value model SFT training.
 
-    Reads ``data.datasets`` list from config (single dataset = list of one).
+    Reads ``data.train_data_paths`` list from config (single dataset = list of one).
     Uses global return_min/return_max for normalization across all datasets.
     """
 
@@ -105,7 +105,7 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
             self.offload_optimizer()
 
     def model_provider_func(self) -> torch.nn.Module:
-        """Load the vla_lib value model."""
+        """Load the value model."""
         return get_model(self.cfg.actor.model)
 
     # -----------------------------------------------------------------------
@@ -113,7 +113,7 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
     # -----------------------------------------------------------------------
 
     def build_dataloader(self):
-        """Build dataloader from ``data.datasets`` list.
+        """Build dataloader from ``data.train_data_paths`` list.
 
         Uses ValueDataset which includes:
         - DataConfig transforms (repack, normalize, model-specific like LiberoInputs)
@@ -128,13 +128,10 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
         except (ImportError, AttributeError):
             pass
 
+        from rlinf.models.embodiment.value_model.data_collator import ValueDataCollator
+        from rlinf.models.embodiment.value_model.processing import ValueProcessor
+
         from rlinf.datasets import ValueDataset
-        from rlinf.models.embodiment.vla_lib_value_model.data_collator import (
-            PI05DataCollator,
-        )
-        from rlinf.models.embodiment.vla_lib_value_model.processing_smolvlm import (
-            get_value_model_processor,
-        )
 
         data_cfg = self.cfg.get("data", {})
         model_cfg = self.cfg.actor.model
@@ -156,31 +153,42 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
             return kwargs
 
         # ---- processor & collator ----
-        processor = get_value_model_processor(
-            backbone_variant=getattr(model_cfg, "backbone_variant", "paligemma"),
-            max_token_len=getattr(model_cfg, "max_token_len", 200),
-            tokenizer_name_or_path=getattr(model_cfg, "tokenizer_path", None)
-            or model_cfg.model_path,
-            smolvlm_path=getattr(model_cfg, "smolvlm_path", None),
-            discrete_state_input=getattr(model_cfg, "discrete_state_input", False),
-            exclude_cot_from_kv_cache=getattr(
-                model_cfg, "exclude_cot_from_kv_cache", False
-            ),
+        # Tokenizer resolution: explicit tokenizer_path > backbone path > error
+        from rlinf.models.embodiment.value_model.checkpoint_utils import (
+            has_tokenizer_files,
         )
-        train_collator = PI05DataCollator(
+
+        backbone_variant = getattr(model_cfg, "backbone_variant", "paligemma")
+        tokenizer_path = getattr(model_cfg, "tokenizer_path", None)
+        if tokenizer_path is None:
+            # Infer from backbone variant
+            if backbone_variant == "siglip_gemma3":
+                tokenizer_path = getattr(model_cfg, "gemma3_path", None)
+            else:
+                tokenizer_path = getattr(model_cfg, "model_path", None)
+        if tokenizer_path is None or not has_tokenizer_files(Path(tokenizer_path)):
+            raise ValueError(
+                f"No tokenizer found for backbone_variant='{backbone_variant}'. "
+                f"Set model.tokenizer_path explicitly or ensure the backbone path "
+                f"contains tokenizer files. Tried: {tokenizer_path}"
+            )
+        processor = ValueProcessor(
+            max_token_len=getattr(model_cfg, "max_token_len", 200),
+            tokenizer_name_or_path=tokenizer_path,
+        )
+        train_collator = ValueDataCollator(
             processor=processor,
             max_length=getattr(model_cfg, "max_token_len", 200),
             train=True,
         )
         # Use deterministic preprocessing for eval (no image augmentation).
-        eval_collator = PI05DataCollator(
+        eval_collator = ValueDataCollator(
             processor=processor,
             max_length=getattr(model_cfg, "max_token_len", 200),
             train=False,
         )
         # ---- shared defaults ----
         data_root = data_cfg.get("data_root", None)
-        auto_skip_vlm = True  # Expert mode always skips VLM response
 
         # Transform-related shared config (required parameters)
         robot_type = data_cfg.get("robot_type")
@@ -192,9 +200,6 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
         norm_stats_dir = data_cfg.get("norm_stats_dir", None)
 
         shared = {
-            "value_prefix": data_cfg.get("value_prefix", "Value: "),
-            "include_state": data_cfg.get("include_state", True),
-            "skip_vlm_response": data_cfg.get("skip_vlm_response", auto_skip_vlm),
             "action_horizon": data_cfg.get(
                 "action_horizon", getattr(model_cfg, "action_horizon", 10)
             ),
@@ -212,10 +217,10 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
         }
 
         # ---- build datasets ----
-        datasets_list = data_cfg.get("datasets", [])
+        datasets_list = data_cfg.get("train_data_paths", [])
         if not datasets_list:
             raise ValueError(
-                "data.datasets must be a non-empty list. "
+                "data.train_data_paths must be a non-empty list. "
                 "Each entry needs: dataset_path."
             )
         train_entries = [
@@ -228,7 +233,7 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
         ]
         if not train_entries:
             raise ValueError(
-                "data.datasets must contain at least one training entry with 'dataset_path'."
+                "data.train_data_paths must contain at least one training entry with 'dataset_path'."
             )
 
         # ---- Compute global return_min/return_max ----
@@ -291,9 +296,6 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
             "return_min": global_return_min,
             "return_max": global_return_max,
             "normalize_to_minus_one_zero": shared["normalize_to_minus_one_zero"],
-            "skip_vlm_response": shared["skip_vlm_response"],
-            "value_prefix": shared["value_prefix"],
-            "include_state": shared["include_state"],
             "action_dim": shared["action_dim"],
         }
 
@@ -326,11 +328,6 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
                 "normalize_to_minus_one_zero": entry.get(
                     "normalize_to_minus_one_zero", shared["normalize_to_minus_one_zero"]
                 ),
-                "skip_vlm_response": entry.get(
-                    "skip_vlm_response", shared["skip_vlm_response"]
-                ),
-                "value_prefix": entry.get("value_prefix", shared["value_prefix"]),
-                "include_state": entry.get("include_state", shared["include_state"]),
                 "action_dim": entry.get("action_dim", shared["action_dim"]),
                 "split": "train",
                 "default_prompt": entry.get("default_prompt", None),
@@ -387,7 +384,7 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
             f"pin_memory={pin_memory}"
         )
 
-        data_config = {"model_type": "vla_lib_value_model"}
+        data_config = {"model_type": "value_model"}
         train_data_loader = ValueDataLoaderImpl(data_config, torch_loader)
 
         # ---- optional eval DataLoader(s) ----
@@ -449,11 +446,6 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
                 normalize_to_minus_one_zero=eval_entry.get(
                     "normalize_to_minus_one_zero", shared["normalize_to_minus_one_zero"]
                 ),
-                skip_vlm_response=eval_entry.get(
-                    "skip_vlm_response", shared["skip_vlm_response"]
-                ),
-                value_prefix=eval_entry.get("value_prefix", shared["value_prefix"]),
-                include_state=eval_entry.get("include_state", shared["include_state"]),
                 split="val",
                 action_dim=eval_entry.get("action_dim", shared["action_dim"]),
                 default_prompt=eval_entry.get("default_prompt", None),

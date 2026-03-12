@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-VLA-Lib ValueCriticModel factory for RLinf.
+ValueCriticModel factory for RLinf.
 """
 
 import glob
@@ -30,7 +30,7 @@ from .modeling_critic import CriticOutput, ValueCritic, ValueCriticModel
 logger = logging.getLogger(__name__)
 
 
-def get_vla_lib_value_model(cfg: DictConfig, torch_dtype=None) -> ValueCriticModel:
+def get_value_model(cfg: DictConfig, torch_dtype=None) -> ValueCriticModel:
     """Build a ValueCriticModel.
 
     Args:
@@ -64,8 +64,6 @@ def get_vla_lib_value_model(cfg: DictConfig, torch_dtype=None) -> ValueCriticMod
     _set("forward_mode", "vla")
     _set("max_language_len", 50)
     _set("stop_gradient_to_vlm", False)
-    _set("discrete_state_input", False)
-    _set("exclude_cot_from_kv_cache", False)
     _set("backbone_variant", "paligemma")
     _set("siglip_path", None)
     _set("gemma3_path", None)
@@ -92,6 +90,7 @@ def get_vla_lib_value_model(cfg: DictConfig, torch_dtype=None) -> ValueCriticMod
         "num_bins": getattr(cfg, "num_bins", 201),
         "v_min": getattr(cfg, "v_min", -1.0),
         "v_max": getattr(cfg, "v_max", 0.0),
+        "value_dropout": getattr(cfg, "value_dropout", 0.0),
     }
 
     config = ValueCriticConfig(**critic_kwargs, **vlm_kwargs)
@@ -102,18 +101,42 @@ def get_vla_lib_value_model(cfg: DictConfig, torch_dtype=None) -> ValueCriticMod
 
     # Load checkpoint if provided
     model_path = getattr(cfg, "model_path", None)
-    if model_path is None or not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model path does not exist: {model_path}")
+    backbone_variant = getattr(cfg, "backbone_variant", "paligemma")
 
-    state_dict = _load_state_dict(model_path)
-    if state_dict:
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        logger.info(
-            "Loaded checkpoint from %s (missing=%d, unexpected=%d)",
-            model_path,
-            len(missing),
-            len(unexpected),
-        )
+    if backbone_variant == "paligemma":
+        # PaliGemma: all weights come from a single checkpoint (e.g. PI05)
+        if model_path is None or not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model path does not exist: {model_path}")
+        state_dict = _load_state_dict(model_path)
+        if state_dict:
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            logger.info(
+                "Loaded checkpoint from %s (missing=%d, unexpected=%d)",
+                model_path,
+                len(missing),
+                len(unexpected),
+            )
+    else:
+        # SigLIP-Gemma3: backbone weights already loaded via from_pretrained().
+        # model_path is only used for resuming from a fine-tuned checkpoint.
+        if model_path and os.path.exists(model_path):
+            state_dict = _load_state_dict(model_path)
+            if state_dict:
+                missing, unexpected = model.load_state_dict(
+                    state_dict, strict=False
+                )
+                logger.info(
+                    "Loaded fine-tuned checkpoint from %s (missing=%d, unexpected=%d)",
+                    model_path,
+                    len(missing),
+                    len(unexpected),
+                )
+        else:
+            logger.info(
+                "No model_path provided for %s backbone; "
+                "using from_pretrained() weights.",
+                backbone_variant,
+            )
 
     return model
 
@@ -139,7 +162,7 @@ def _load_state_dict(path: str) -> dict:
 
 
 __all__ = [
-    "get_vla_lib_value_model",
+    "get_value_model",
     "ValueCriticModel",
     "ValueCritic",
     "ValueCriticConfig",

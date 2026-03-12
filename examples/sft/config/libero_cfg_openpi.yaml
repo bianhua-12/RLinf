@@ -29,6 +29,7 @@ runner:
   save_interval: 5000
 
 data:
+  num_workers: 8
   # Advantage tag: loads meta/advantages_{tag}.parquet from each dataset
   # If null, loads meta/advantages.parquet (legacy format)
   advantage_tag: null
@@ -39,7 +40,7 @@ data:
   # Random seed for mixture sampling
   seed: 42
 
-  datasets:
+  train_data_paths:
     - path: "/path/to/sft_dataset"
       type: "sft"
       weight: 1.0             # sampling weight

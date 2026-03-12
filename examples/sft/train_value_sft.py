@@ -13,10 +13,10 @@
 # limitations under the License.
 
 """
-Entry point for vla_lib Value Model SFT training.
+Entry point for Value Model SFT training.
 
 Usage:
-    python train_vla_lib_sft.py --config-path config --config-name libero_sft_value
+    python train_value_sft.py --config-path config --config-name libero_sft_value
 """
 
 import json
@@ -37,7 +37,7 @@ from rlinf.config import validate_cfg  # noqa: E402
 from rlinf.runners.sft_runner import SFTRunner  # noqa: E402
 from rlinf.scheduler import Cluster  # noqa: E402
 from rlinf.utils.placement import HybridComponentPlacement  # noqa: E402
-from rlinf.workers.vla_lib_sft.fsdp_value_sft_worker import (  # noqa: E402
+from rlinf.workers.value_sft.fsdp_value_sft_worker import (  # noqa: E402
     FSDPValueSftWorker,
 )
 

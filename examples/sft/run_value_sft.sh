@@ -1,12 +1,12 @@
 #! /bin/bash
 
-# Run vla_lib Value Model SFT training
-# Usage: bash run_vla_lib_sft.sh [CONFIG_NAME] [EVAL_DATASET_PATH]
-# Example: bash run_vla_lib_sft.sh libero_sft_value /path/to/eval_dataset
+# Run Value Model SFT training
+# Usage: bash run_value_sft.sh [CONFIG_NAME] [EVAL_DATASET_PATH]
+# Example: bash run_value_sft.sh libero_sft_value /path/to/eval_dataset
 
 export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
-export SRC_FILE="${EMBODIED_PATH}/train_vla_lib_sft.py"
+export SRC_FILE="${EMBODIED_PATH}/train_value_sft.py"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HOME}/.cache/huggingface/datasets}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HOME}/.cache/transformers}"
 
@@ -36,8 +36,8 @@ else
 fi
 
 echo "Using Python at $(which python)"
-LOG_DIR="${REPO_PATH}/logs/vla_lib_sft/${CONFIG_NAME}-$(date +'%Y%m%d-%H:%M:%S')"
-MEGA_LOG_FILE="${LOG_DIR}/run_vla_lib_sft.log"
+LOG_DIR="${REPO_PATH}/logs/value_sft/${CONFIG_NAME}-$(date +'%Y%m%d-%H:%M:%S')"
+MEGA_LOG_FILE="${LOG_DIR}/run_value_sft.log"
 mkdir -p "${LOG_DIR}"
 HYDRA_OVERRIDES="runner.logger.log_path=${LOG_DIR}"
 if [ -n "${EVAL_DATASET_PATH}" ]; then

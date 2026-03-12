@@ -1,22 +1,13 @@
-# Copyright 2026 The RLinf Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""
+Data Collator for value model training.
 
-"""PI0.5 data collator for value model training."""
+Handles batching and preprocessing of multimodal robot control data
+with support for RL-specific fields (returns, target values, etc.).
+"""
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -28,7 +19,7 @@ logger = logging.getLogger(__name__)
 _COLLATOR_VERIFIED = False
 
 
-def stack_tensors(list_of_dicts: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+def stack_tensors(list_of_dicts: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     """Stack a list of dictionaries of tensors/values.
 
     Handles numpy booleans and other non-tensor types by converting to tensors first.
@@ -84,22 +75,19 @@ def stack_tensors(list_of_dicts: list[dict[str, Any]]) -> dict[str, torch.Tensor
 
 
 @dataclass
-class PI05DataCollator(DataCollatorMixin):
-    """Data collator for PI0.5 value model training."""
+class ValueDataCollator(DataCollatorMixin):
+    """Data collator for value model training."""
 
-    processor: Any  # PI05Processor
+    processor: Any  # ValueProcessor
     max_length: int = 200
     return_tensors: str = "pt"
     train: bool = True
 
-    def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        """Collate examples for PI0.5 training."""
+    def torch_call(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """Collate examples for value model training."""
         images_batch = []
         image_masks_batch = []
         prompts = []
-        prefixes = []
-        responses = []
-        states = []
         actions_list = []
         action_mask_list = []
 
@@ -119,13 +107,6 @@ class PI05DataCollator(DataCollatorMixin):
             images_batch.append(ex[image_key])
             image_masks_batch.append(ex.get(mask_key, {}))
             prompts.append(ex["prompt"])
-            prefixes.append(ex.get("prefix"))
-            responses.append(ex.get("response"))
-
-            state = ex.get("state")
-            if state is not None and isinstance(state, torch.Tensor):
-                state = state.cpu().numpy()
-            states.append(state)
 
             actions = ex.get("actions")
             actions_list.append(actions)
@@ -152,12 +133,6 @@ class PI05DataCollator(DataCollatorMixin):
 
         processed_txt = self.processor.process_text(
             prompts=prompts,
-            prefixes=prefixes,
-            responses=responses,
-            states=states,
-            actions=actions_list,
-            padding=True,
-            truncation=True,
             max_length=self.max_length,
             return_tensors="pt",
         )
@@ -171,9 +146,7 @@ class PI05DataCollator(DataCollatorMixin):
             _COLLATOR_VERIFIED = True
             logger.info("[Collator Verification] First batch prompts:")
             for i in range(min(len(prompts), 4)):
-                logger.info(
-                    "  [%d] prompt: %s", i, prompts[i] if prompts[i] else "None"
-                )
+                logger.info("  [%d] prompt: %s", i, prompts[i] if prompts[i] else "None")
 
         action_mask = torch.tensor(action_mask_list, dtype=torch.float32)
 
@@ -185,8 +158,6 @@ class PI05DataCollator(DataCollatorMixin):
             "token_ar_mask": ar_masks,
             "action_mask": action_mask,
         }
-        if "pixel_attention_mask" in processed_img:
-            observation["pixel_attention_mask"] = processed_img["pixel_attention_mask"]
 
         batch = {
             "input_ids": lang_tokens,
@@ -261,4 +232,4 @@ class PI05DataCollator(DataCollatorMixin):
         return batch
 
 
-__all__ = ["PI05DataCollator", "stack_tensors"]
+__all__ = ["ValueDataCollator", "stack_tensors"]

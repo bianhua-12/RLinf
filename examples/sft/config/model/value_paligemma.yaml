@@ -1,10 +1,19 @@
-model_type: "vla_lib_value_model"
+model_type: "value_model"
 
 # Model precision
 precision: bf16
 
 # LoRA settings (not supported for this model)
 is_lora: false
+
+# =====================================================================
+# Backbone: PaliGemma (default)
+# =====================================================================
+backbone_variant: "paligemma"
+
+# paligemma_variant: VLM backbone size
+#   "gemma_2b" (default)
+paligemma_variant: "gemma_2b"
 
 # =====================================================================
 # Critic architecture
@@ -20,6 +29,7 @@ critic_expert_variant: "gemma_100m"
 num_bins: 201           # number of discretization bins
 v_min: -1.0             # minimum value for atom support
 v_max: 0.0              # maximum value for atom support
+value_dropout: 0.0      # dropout before value projection (e.g. 0.1)
 
 # =====================================================================
 # PI05 base model params
@@ -28,39 +38,15 @@ action_dim: 32
 action_horizon: 50
 max_token_len: 200
 
-# paligemma_variant: VLM backbone size
-#   "gemma_2b" (default)
-paligemma_variant: "gemma_2b"
-
 action_expert_variant: "gemma_300m"
 freeze_vision_encoder: false
 train_expert_only: false
 forward_mode: "vla"
 max_language_len: 50
 stop_gradient_to_vlm: false
-discrete_state_input: false
-exclude_cot_from_kv_cache: false
 
 # =====================================================================
-# Backbone implementation:
-#   "paligemma"     -> PaliGemma + Gemma expert
-#   "siglip_gemma3" -> SigLIP2 + Gemma3 + Gemma expert
-#   "smolvlm"       -> SmolVLM2 + lightweight expert (SmolVLA-style)
+# Checkpoint
 # =====================================================================
-backbone_variant: "paligemma"
-# Required only when backbone_variant = "siglip_gemma3".
-siglip_path: null
-gemma3_path: null
-# Required only when backbone_variant = "smolvlm".
-smolvlm_path: null
-smolvlm_load_vlm_weights: true
-smolvlm_attention_mode: "cross_attn"
-smolvlm_num_expert_layers: -1
-smolvlm_num_vlm_layers: 16
-smolvlm_self_attn_every_n_layers: 2
-smolvlm_expert_width_multiplier: 0.75
-
-# =====================================================================
-# Checkpoint (set to load pretrained weights)
-# =====================================================================
+# For paligemma: required. Points to PI05 checkpoint containing all weights.
 # model_path: "/path/to/checkpoint"
