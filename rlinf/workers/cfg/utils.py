@@ -21,6 +21,7 @@ and DebugCFGFSDPActor to avoid code duplication.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -30,6 +31,65 @@ from rlinf.models.embodiment.openpi_cfg.openpi_cfg_action_model import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def load_advantages_lookup(
+    data_path: str,
+    advantage_tag: str | None = None,
+    advantage_path: str | None = None,
+) -> tuple[dict[tuple[int, int], bool], Path]:
+    """Load boolean advantages from an external or dataset-local parquet file.
+
+    Args:
+        data_path: Path to the LeRobot dataset root.
+        advantage_tag: Optional tag used to resolve
+            ``meta/advantages_{tag}.parquet`` under ``data_path``.
+        advantage_path: Optional explicit parquet path. When provided, it takes
+            precedence over ``advantage_tag`` and the dataset-local default.
+
+    Returns:
+        A tuple of:
+        - lookup dict mapping ``(episode_index, frame_index) -> advantage``
+        - resolved parquet path used for loading
+
+    Raises:
+        FileNotFoundError: If the resolved parquet path does not exist.
+        KeyError: If required columns are missing from the parquet file.
+    """
+    import pandas as pd
+
+    if advantage_path is not None:
+        meta_path = Path(advantage_path)
+    elif advantage_tag:
+        meta_path = Path(data_path) / "meta" / f"advantages_{advantage_tag}.parquet"
+    else:
+        meta_path = Path(data_path) / "meta" / "advantages.parquet"
+
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"Advantage file not found: {meta_path}. "
+            "Run compute_advantages.py first or provide a valid advantage_path."
+        )
+
+    adv_df = pd.read_parquet(meta_path)
+    required_cols = {"episode_index", "frame_index", "advantage"}
+    missing_cols = required_cols.difference(adv_df.columns)
+    if missing_cols:
+        raise KeyError(
+            f"Advantage parquet missing required columns {sorted(missing_cols)}: "
+            f"{meta_path}"
+        )
+
+    lookup = dict(
+        zip(
+            zip(
+                adv_df["episode_index"].values.astype(int).tolist(),
+                adv_df["frame_index"].values.astype(int).tolist(),
+            ),
+            adv_df["advantage"].values.astype(bool).tolist(),
+        )
+    )
+    return lookup, meta_path
 
 
 def cast_image_features(hf_dataset):

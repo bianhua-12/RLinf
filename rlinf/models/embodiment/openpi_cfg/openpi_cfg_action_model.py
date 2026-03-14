@@ -239,9 +239,7 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
             # convert from [3,256,256] -> [256,256,3]
             if transpose:
                 sample = jax.tree.map(
-                    lambda x: x.transpose(1, 2, 0)
-                    if len(x.shape) == 3
-                    else x,
+                    lambda x: x.transpose(1, 2, 0) if len(x.shape) == 3 else x,
                     sample,
                 )
             if first_process:
@@ -382,10 +380,16 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
 
         # ========== 4. Sample-level unconditional dropout ==========
         batch_size = guidance_lang_tokens.shape[0]
-        guidance_mask = torch.rand(batch_size, device=device) > self.config.unconditional_prob
+        guidance_mask = (
+            torch.rand(batch_size, device=device) > self.config.unconditional_prob
+        )
         guidance_mask_expanded = guidance_mask.unsqueeze(-1)  # [batch_size, 1]
-        final_lang_tokens = torch.where(guidance_mask_expanded, guidance_lang_tokens, lang_tokens)
-        final_lang_masks = torch.where(guidance_mask_expanded, guidance_lang_masks, lang_masks)
+        final_lang_tokens = torch.where(
+            guidance_mask_expanded, guidance_lang_tokens, lang_tokens
+        )
+        final_lang_masks = torch.where(
+            guidance_mask_expanded, guidance_lang_masks, lang_masks
+        )
 
         # ========== 5. Align device ==========
         images = [img.to(device) for img in images]
@@ -486,12 +490,10 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
             "prompt": env_obs["task_descriptions"],
         }
         positive_guidance_prompt = [
-            f"{desc}\nAdvantage: positive"
-            for desc in env_obs["task_descriptions"]
+            f"{desc}\nAdvantage: positive" for desc in env_obs["task_descriptions"]
         ]
         negative_guidance_prompt = [
-            f"{desc}\nAdvantage: negative"
-            for desc in env_obs["task_descriptions"]
+            f"{desc}\nAdvantage: negative" for desc in env_obs["task_descriptions"]
         ]
         processed_obs["positive_guidance_prompt"] = positive_guidance_prompt
         processed_obs["negative_guidance_prompt"] = negative_guidance_prompt

@@ -535,7 +535,9 @@ def main() -> None:
         f"Found {len(dataset_paths)} datasets: {[p.name for p in dataset_paths]}"
     )
     logger.info(f"Global return range: [{global_return_min}, {global_return_max}]")
-    logger.info(f"Advantage lookahead step: {args.advantage_lookahead_step}, gamma: {args.gamma}")
+    logger.info(
+        f"Advantage lookahead step: {args.advantage_lookahead_step}, gamma: {args.gamma}"
+    )
     logger.info(f"Positive quantile: {args.positive_quantile}")
 
     all_advantages: list[np.ndarray] = []

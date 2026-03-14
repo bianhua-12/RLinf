@@ -564,7 +564,10 @@ class AdvantageDataset(torch.utils.data.Dataset):
         # Apply CPU transforms in worker (input_transform + prepare_observation_cpu)
         if self.input_transform is not None:
             obs = self.input_transform(
-                {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in obs.items()}
+                {
+                    k: v.copy() if isinstance(v, np.ndarray) else v
+                    for k, v in obs.items()
+                }
             )
         if self.prepare_observation_cpu is not None:
             obs = self.prepare_observation_cpu(obs)
@@ -903,13 +906,15 @@ def compute_advantages_for_dataset(
             _t_infer_total += _t_infer
 
             # Progress reflects output shard only (not extended tail)
-            n_samples = sum(1 for item in batch[1] if int(item["global_idx"]) < shard_end)
+            n_samples = sum(
+                1 for item in batch[1] if int(item["global_idx"]) < shard_end
+            )
             pbar.update(n_samples)
             if rank == 0:
                 pbar.set_postfix(
-                    fetch=f"{_t_fetch*1000:.0f}ms",
-                    infer=f"{_t_infer*1000:.0f}ms",
-                    GPU=f"{_t_infer*100/((_t_fetch+_t_infer) or 1e-9):.0f}%",
+                    fetch=f"{_t_fetch * 1000:.0f}ms",
+                    infer=f"{_t_infer * 1000:.0f}ms",
+                    GPU=f"{_t_infer * 100 / ((_t_fetch + _t_infer) or 1e-9):.0f}%",
                 )
 
             del batch
@@ -922,7 +927,7 @@ def compute_advantages_for_dataset(
         avg_infer = _t_infer_total / batch_count * 1000
         logger.info(
             f"[Timing] avg_fetch={avg_fetch:.0f}ms  avg_infer={avg_infer:.0f}ms  "
-            f"GPU_busy≈{avg_infer*100/((avg_fetch+avg_infer) or 1e-9):.0f}%  "
+            f"GPU_busy≈{avg_infer * 100 / ((avg_fetch + avg_infer) or 1e-9):.0f}%  "
             f"batches={batch_count}"
         )
 

@@ -38,7 +38,6 @@ Example config:
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any
 
 import jax
@@ -53,11 +52,11 @@ from rlinf.scheduler import Cluster, Worker
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import append_to_dict
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.utils.utils import clear_memory
 from rlinf.workers.cfg.utils import (
     CFGDataLoaderImpl,
     DatasetWithAdvantage,
     cast_image_features,
+    load_advantages_lookup,
 )
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 
@@ -107,6 +106,10 @@ class FSDPCfgWorker(FSDPSftWorker):
         self.device = torch.cuda.current_device()
 
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
+        self.enable_offload = self.cfg.actor.get("enable_offload", False)
+        self._rollout_group_name = (
+            cfg.rollout.group_name if hasattr(cfg, "rollout") else None
+        )
 
         self.global_batch_size = self.cfg.actor.global_batch_size
         self.micro_batch_size = self.cfg.actor.micro_batch_size
@@ -128,49 +131,19 @@ class FSDPCfgWorker(FSDPSftWorker):
         self._data_epoch = 0
         self._data_iter_offset = 0
 
+    def init_worker(self):
+        """Initialize the worker and rollout sync metadata."""
+        self.setup_model_and_optimizer()
+
+        if self.cfg.actor.get("enable_offload", False):
+            self.offload_param_and_grad()
+            self.offload_optimizer()
+
+        self._setup_rollout_weight_dst_ranks()
+
     # -------------------------------------------------------------------------
     # DataLoader Building
     # -------------------------------------------------------------------------
-
-    @staticmethod
-    def _load_advantages_lookup(
-        data_path: str,
-        advantage_tag: str | None = None,
-    ) -> dict[tuple[int, int], bool]:
-        """Load advantage lookup from meta/advantages_{tag}.parquet or meta/advantages.parquet.
-
-        Args:
-            data_path: Path to LeRobot dataset.
-            advantage_tag: Advantage tag name. If None, loads meta/advantages.parquet.
-
-        Returns:
-            Dict mapping (episode_index, frame_index) -> bool.
-        """
-        import pandas as pd
-
-        if advantage_tag:
-            meta_path = Path(data_path) / "meta" / f"advantages_{advantage_tag}.parquet"
-        else:
-            meta_path = Path(data_path) / "meta" / "advantages.parquet"
-
-        if not meta_path.exists():
-            raise FileNotFoundError(
-                f"Advantage file not found: {meta_path}. "
-                f"Run compute_advantages.py first."
-            )
-
-        adv_df = pd.read_parquet(meta_path)
-
-        lookup = dict(
-            zip(
-                zip(
-                    adv_df["episode_index"].values.astype(int).tolist(),
-                    adv_df["frame_index"].values.astype(int).tolist(),
-                ),
-                adv_df["advantage"].values.astype(bool).tolist(),
-            )
-        )
-        return lookup
 
     def build_dataloader(self):
         """Build CFG dataloader with advantage support.
@@ -222,6 +195,7 @@ class FSDPCfgWorker(FSDPSftWorker):
             data_path = ds_config["path"]
             episodes = ds_config.get("episodes")
             weight = ds_config.get("weight", 1.0)
+            advantage_path = ds_config.get("advantage_path")
 
             # 1. Create LeRobotDataset
             dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(data_path)
@@ -266,16 +240,15 @@ class FSDPCfgWorker(FSDPSftWorker):
             )
 
             # 3. Load advantage lookup from meta parquet (required)
-            advantages_lookup = self._load_advantages_lookup(data_path, advantage_tag)
+            advantages_lookup, resolved_advantage_path = load_advantages_lookup(
+                data_path=data_path,
+                advantage_tag=advantage_tag,
+                advantage_path=advantage_path,
+            )
             if self._rank == 0:
-                adv_filename = (
-                    f"advantages_{advantage_tag}.parquet"
-                    if advantage_tag
-                    else "advantages.parquet"
-                )
                 self.log_info(
-                    f"Loaded advantages from "
-                    f"meta/{adv_filename} ({len(advantages_lookup)} entries)"
+                    "Loaded advantages from "
+                    f"{resolved_advantage_path} ({len(advantages_lookup)} entries)"
                 )
 
             # 4. Wrap with DatasetWithAdvantage (restores advantage after transforms)
@@ -420,6 +393,46 @@ class FSDPCfgWorker(FSDPSftWorker):
             persistent_workers=num_workers > 0,
         )
 
+    def _setup_rollout_weight_dst_ranks(self) -> None:
+        """Setup destination ranks for weight communication to rollout workers."""
+        if self._rollout_group_name is None:
+            self._weight_dst_rank_in_rollout = []
+            return
+
+        rollout_world_size = self._component_placement.get_world_size("rollout")
+        actor_world_size = self._world_size
+        rank = self._rank
+        self._weight_dst_rank_in_rollout = []
+        rollout_ranks_per_actor = (
+            rollout_world_size + actor_world_size - 1
+        ) // actor_world_size
+        for i in range(rollout_ranks_per_actor):
+            if i * actor_world_size + rank < rollout_world_size:
+                self._weight_dst_rank_in_rollout.append(i * actor_world_size + rank)
+
+    def sync_model_to_rollout(self) -> None:
+        """Sync the model state to the rollout worker for environment eval."""
+        if self._rollout_group_name is None:
+            return
+
+        if self.enable_offload and not self.is_optimizer_offloaded:
+            self.offload_optimizer()
+
+        if self.enable_offload and self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+
+        state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=True)
+        for rank in self._weight_dst_rank_in_rollout:
+            self.send(
+                state_dict,
+                self._rollout_group_name,
+                rank,
+                async_op=True,
+            )
+
+        if self.enable_offload and not self.is_weight_offloaded:
+            self.offload_param_and_grad()
+
     # -------------------------------------------------------------------------
     # Training
     # -------------------------------------------------------------------------
@@ -462,8 +475,22 @@ class FSDPCfgWorker(FSDPSftWorker):
                     is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
                 )
 
-                # CFG: unpack advantage (replaces is_success)
-                observation, actions, advantage = next(self.data_iter)
+                try:
+                    observation, actions, advantage = next(self.data_iter)
+                    self._data_iter_offset += 1
+                except StopIteration:
+                    self._data_epoch += 1
+                    self.log_info(
+                        "[INFO] data_iter exhausted, reset iterator "
+                        f"self._data_epoch {self._data_epoch}"
+                    )
+                    if hasattr(self.data_loader, "sampler") and hasattr(
+                        self.data_loader.sampler, "set_epoch"
+                    ):
+                        self.data_loader.sampler.set_epoch(self._data_epoch)
+                    self.data_iter = iter(self.data_loader)
+                    observation, actions, advantage = next(self.data_iter)
+                    self._data_iter_offset = 1
 
                 observation = jax.tree.map(
                     lambda x: torch.as_tensor(x)

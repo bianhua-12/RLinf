@@ -1,8 +1,10 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # CFG SFT Training Launch Script
 # Usage: bash run_cfg_sft.sh [CONFIG_NAME] [ADDITIONAL_ARGS]
-# Example: bash run_cfg_sft.sh libero_cfg_openpi runner.max_epochs=10
+# Example: bash run_cfg_sft.sh libero_cfg_openpi runner.max_epochs=10 runner.val_check_interval=2000
 
 export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
@@ -18,10 +20,16 @@ export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
 export AV_LOG_FORCE_NOCOLOR=1
 export LIBAV_LOG_LEVEL=quiet
 
+export LIBERO_REPO_PATH="${LIBERO_REPO_PATH:-/opt/libero}"
 export PYTHONPATH=${REPO_PATH}:${LIBERO_REPO_PATH}:$PYTHONPATH
 
-# Activate the openpi environment
-source switch_env openpi 2>/dev/null || true
+# Activate the default project environment when available.
+if [ -f /opt/venv/openpi/bin/activate ]; then
+    # shellcheck disable=SC1091
+    source /opt/venv/openpi/bin/activate
+elif command -v switch_env >/dev/null 2>&1; then
+    source switch_env openpi 2>/dev/null || true
+fi
 
 if [ -z "$1" ]; then
     CONFIG_NAME="libero_cfg_openpi"
@@ -37,6 +45,17 @@ LOG_DIR="${REPO_PATH}/logs/cfg_sft/${CONFIG_NAME}-$(date +'%Y%m%d-%H:%M:%S')"
 MEGA_LOG_FILE="${LOG_DIR}/run_cfg_sft.log"
 mkdir -p "${LOG_DIR}"
 
-CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR} $@"
-echo ${CMD} > ${MEGA_LOG_FILE}
-${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}
+CMD=(
+    python
+    "${SRC_FILE}"
+    --config-path
+    "${EMBODIED_PATH}/config/"
+    --config-name
+    "${CONFIG_NAME}"
+    "runner.logger.log_path=${LOG_DIR}"
+    "$@"
+)
+
+printf '%q ' "${CMD[@]}" > "${MEGA_LOG_FILE}"
+printf '\n' >> "${MEGA_LOG_FILE}"
+"${CMD[@]}" 2>&1 | tee -a "${MEGA_LOG_FILE}"

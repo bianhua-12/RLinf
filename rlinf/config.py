@@ -852,8 +852,15 @@ def validate_sft_cfg(cfg: DictConfig) -> DictConfig:
             if cfg.runner.get("val_check_interval", None) is None:
                 cfg.runner.val_check_interval = cfg.runner.max_epochs
         else:
-            # set the val_check_interval to -1 if there is no eval data
-            cfg.runner.val_check_interval = -1
+            # Offline CFG SFT can evaluate in env via rollout+env workers
+            # without eval_data_paths. Preserve the user setting in that case.
+            has_env_eval = (
+                cfg.get("env", None) is not None
+                and cfg.get("rollout", None) is not None
+            )
+            if not has_env_eval:
+                # set the val_check_interval to -1 if there is no eval path
+                cfg.runner.val_check_interval = -1
     return cfg
 
 

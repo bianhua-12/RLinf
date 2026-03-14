@@ -314,6 +314,17 @@ actor:
 bash examples/sft/run_cfg_sft.sh libero_cfg_openpi_test
 ```
 
+如果希望像 `examples/embodiment/run_debug_one_iter.sh` 一样在离线训练过程中周期性触发 LIBERO 环境评测，需要同时满足两点：
+1. 配置 `runner.val_check_interval > 0`
+2. 配置里保留 `env.eval` 和 `rollout` 段
+
+例如：
+```bash
+bash examples/sft/run_cfg_sft.sh libero_cfg_openpi_test \
+    runner.val_check_interval=1000 \
+    env.eval.task_id_filter=[0]
+```
+
 **转换 checkpoint**：
 ```bash
 LATEST_LOG=$(ls -td logs/cfg_sft/libero_cfg_openpi_test-* | head -1)

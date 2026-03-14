@@ -87,7 +87,9 @@ class MultiStepRolloutWorker(Worker):
             // cfg.actor.model.num_action_chunks
         )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
-        self.collect_versions = self.cfg.algorithm.loss_type == "decoupled_actor_critic"
+        self.collect_versions = (
+            self.cfg.algorithm.get("loss_type", None) == "decoupled_actor_critic"
+        )
         self.version = 0
         self.finished_episodes = None
 

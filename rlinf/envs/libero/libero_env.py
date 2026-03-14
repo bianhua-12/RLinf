@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import logging
 import os
 from typing import Optional, Union
 
@@ -36,6 +37,8 @@ from rlinf.envs.utils import (
     list_of_dict_to_dict_of_list,
     to_tensor,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class LiberoEnv(gym.Env):
@@ -217,6 +220,14 @@ class LiberoEnv(gym.Env):
     def _init_task_and_trial_ids(self):
         self.task_ids, self.trial_ids = (
             self._get_task_and_trial_ids_from_reset_state_ids(self.reset_state_ids)
+        )
+        unique_task_ids = sorted({int(task_id) for task_id in self.task_ids.tolist()})
+        logger.info(
+            "LiberoEnv active task ids=%s task_id_filter=%s seed_offset=%s is_eval=%s",
+            unique_task_ids,
+            self.task_id_filter,
+            self.seed_offset,
+            self.cfg.is_eval,
         )
 
     def _get_random_reset_state_ids(self, num_reset_states):

@@ -50,11 +50,11 @@ from rlinf.scheduler import Cluster, Worker
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import append_to_dict
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.utils.utils import clear_memory
 from rlinf.workers.cfg.utils import (
     CFGDataLoaderImpl,
     DatasetWithAdvantage,
     cast_image_features,
+    load_advantages_lookup,
 )
 
 # =============================================================================
@@ -146,46 +146,6 @@ class DebugCFGFSDPActor(FSDPModelManager, Worker):
     # CFG DataLoader Methods
     # =========================================================================
 
-    @staticmethod
-    def _load_advantages_lookup(
-        data_path: str,
-        advantage_tag: str | None = None,
-    ) -> dict[tuple[int, int], bool]:
-        """Load advantage lookup from meta/advantages_{tag}.parquet or meta/advantages.parquet.
-
-        Args:
-            data_path: Path to LeRobot dataset.
-            advantage_tag: Advantage tag name. If None, loads meta/advantages.parquet.
-
-        Returns:
-            Dict mapping (episode_index, frame_index) -> bool.
-        """
-        import pandas as pd
-
-        if advantage_tag:
-            meta_path = Path(data_path) / "meta" / f"advantages_{advantage_tag}.parquet"
-        else:
-            meta_path = Path(data_path) / "meta" / "advantages.parquet"
-
-        if not meta_path.exists():
-            raise FileNotFoundError(
-                f"Advantage file not found: {meta_path}. "
-                f"Run compute_advantages.py first."
-            )
-
-        adv_df = pd.read_parquet(meta_path)
-
-        lookup = dict(
-            zip(
-                zip(
-                    adv_df["episode_index"].values.astype(int).tolist(),
-                    adv_df["frame_index"].values.astype(int).tolist(),
-                ),
-                adv_df["advantage"].values.astype(bool).tolist(),
-            )
-        )
-        return lookup
-
     def build_cfg_dataloader(self, cfg: DictConfig):
         """Build CFG dataloader using AdvantageMixtureDataset.
 
@@ -232,6 +192,7 @@ class DebugCFGFSDPActor(FSDPModelManager, Worker):
             data_path = ds_config["path"]
             episodes = ds_config.get("episodes")
             weight = ds_config.get("weight", 1.0)
+            advantage_path = ds_config.get("advantage_path")
 
             # 1. Create LeRobotDataset
             dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(data_path)
@@ -297,16 +258,15 @@ class DebugCFGFSDPActor(FSDPModelManager, Worker):
             )
 
             # 3. Load advantage lookup from meta parquet (required)
-            advantages_lookup = self._load_advantages_lookup(data_path, advantage_tag)
+            advantages_lookup, resolved_advantage_path = load_advantages_lookup(
+                data_path=data_path,
+                advantage_tag=advantage_tag,
+                advantage_path=advantage_path,
+            )
             if self._rank == 0:
-                adv_filename = (
-                    f"advantages_{advantage_tag}.parquet"
-                    if advantage_tag
-                    else "advantages.parquet"
-                )
                 self.log_info(
-                    f"Loaded advantages from "
-                    f"meta/{adv_filename} ({len(advantages_lookup)} entries)"
+                    "Loaded advantages from "
+                    f"{resolved_advantage_path} ({len(advantages_lookup)} entries)"
                 )
 
             # 4. Wrap with DatasetWithAdvantage (restores advantage after transforms)

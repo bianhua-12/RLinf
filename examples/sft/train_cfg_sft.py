@@ -26,10 +26,12 @@ import torch.multiprocessing as mp
 from omegaconf.omegaconf import OmegaConf
 
 from rlinf.config import validate_cfg
-from rlinf.runners.sft_runner import SFTRunner
+from rlinf.runners.cfg_sft_runner import CfgSFTRunner
 from rlinf.scheduler import Cluster
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.cfg.fsdp_cfg_worker import FSDPCfgWorker
+from rlinf.workers.env.env_worker import EnvWorker
+from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 mp.set_start_method("spawn", force=True)
 
@@ -60,9 +62,25 @@ def main(cfg) -> None:
         cluster, name=cfg.actor.group_name, placement_strategy=actor_placement
     )
 
-    runner = SFTRunner(
+    rollout_group = None
+    if hasattr(cfg, "rollout") and cfg.runner.val_check_interval > 0:
+        rollout_placement = component_placement.get_strategy("rollout")
+        rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
+            cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
+        )
+
+    env_group = None
+    if hasattr(cfg, "env") and cfg.runner.val_check_interval > 0:
+        env_placement = component_placement.get_strategy("env")
+        env_group = EnvWorker.create_group(cfg).launch(
+            cluster, name=cfg.env.group_name, placement_strategy=env_placement
+        )
+
+    runner = CfgSFTRunner(
         cfg=cfg,
         actor=actor_group,
+        rollout=rollout_group,
+        env=env_group,
     )
 
     runner.init_workers()
