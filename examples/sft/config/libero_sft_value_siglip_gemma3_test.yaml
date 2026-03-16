@@ -79,7 +79,7 @@ actor:
 
   model:
     precision: bf16
-    siglip_path: "/path/to/siglip2-so400m-patch14-224"
+    vision_encoder_path: "/path/to/siglip2-so400m-patch14-224"
     gemma3_path: "/path/to/gemma-3-270m"
     tokenizer_path: "/path/to/gemma-3-270m"
     freeze_vlm: false

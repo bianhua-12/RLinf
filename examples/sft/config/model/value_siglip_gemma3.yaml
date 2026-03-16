@@ -10,9 +10,10 @@ is_lora: false
 # Backbone: SigLIP-Gemma3
 # =====================================================================
 backbone_variant: "siglip_gemma3"
+expert_loss_type: "categorical"
 
 # Paths to SigLIP and Gemma3 pretrained weights
-siglip_path: /path/to/siglip2-so400m-patch14-224
+vision_encoder_path: /path/to/siglip2-so400m-patch14-224
 gemma3_path: /path/to/gemma-3-270m
 tokenizer_path: /path/to/gemma-3-270m
 
@@ -49,8 +50,8 @@ stop_gradient_to_vlm: false
 # =====================================================================
 # Checkpoint
 # =====================================================================
-# For siglip_gemma3: optional. Points to a previously trained ValueCriticModel
+# For Gemma3 backbones: optional. Points to a previously trained ValueCriticModel
 #   checkpoint to resume training. Backbone weights are loaded via
-#   from_pretrained() from siglip_path/gemma3_path; leave unset to train
+#   from_pretrained() from vision_encoder_path/gemma3_path; leave unset to train
 #   from scratch.
 # model_path: "/path/to/checkpoint"

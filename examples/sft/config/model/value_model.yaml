@@ -13,9 +13,10 @@ is_lora: false
 # critic_expert_variant: Gemma expert model size
 #   "gemma_50m" | "gemma_100m" | "gemma_150m" | "gemma_300m" | "gemma_2b"
 critic_expert_variant: "gemma_100m"
+expert_loss_type: "categorical"
 
 # =====================================================================
-# Value head (categorical loss)
+# Value head / regression loss
 # =====================================================================
 num_bins: 201           # number of discretization bins
 v_min: -1.0             # minimum value for atom support
@@ -41,19 +42,23 @@ max_language_len: 50
 stop_gradient_to_vlm: false
 
 # =====================================================================
-# Backbone: "paligemma" (default) | "siglip_gemma3"
+# Backbone: "paligemma" (default) | "siglip_gemma3" | "dinov3_gemma3" | "dinov3_pure_visual"
 # =====================================================================
 backbone_variant: "paligemma"
-# Required for siglip_gemma3 only
-siglip_path: /path/to/siglip2-so400m-patch14-224
+# Required for DINO/SigLIP backbones
+vision_encoder_path: /path/to/vision-encoder
 gemma3_path: /path/to/gemma-3-270m
+aggregator_hidden_size: 256
+aggregator_depth: 2
+aggregator_num_heads: 4
+aggregator_mlp_ratio: 4.0
 
 # =====================================================================
 # Checkpoint
 # =====================================================================
 # For paligemma: required. Points to PI05 checkpoint containing all weights.
-# For siglip_gemma3: optional. Points to a previously trained ValueCriticModel
+# For Gemma3 backbones: optional. Points to a previously trained ValueCriticModel
 #   checkpoint to resume training. Backbone weights are loaded via
-#   from_pretrained() from siglip_path/gemma3_path; leave unset to train
+#   from_pretrained() from vision_encoder_path/gemma3_path; leave unset to train
 #   from scratch.
 # model_path: "/path/to/checkpoint"
