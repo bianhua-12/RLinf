@@ -65,8 +65,13 @@ def get_value_model(cfg: DictConfig, torch_dtype=None) -> ValueCriticModel:
     _set("max_language_len", 50)
     _set("stop_gradient_to_vlm", False)
     _set("backbone_variant", "paligemma")
+    _set("vision_encoder_path", None)
     _set("siglip_path", None)
     _set("gemma3_path", None)
+    _set("aggregator_hidden_size", 256)
+    _set("aggregator_depth", 2)
+    _set("aggregator_num_heads", 4)
+    _set("aggregator_mlp_ratio", 4.0)
     _set("smolvlm_path", None)
     _set("smolvlm_load_vlm_weights", True)
     _set("smolvlm_attention_mode", "cross_attn")
@@ -86,12 +91,29 @@ def get_value_model(cfg: DictConfig, torch_dtype=None) -> ValueCriticModel:
 
     # Critic-specific kwargs
     critic_kwargs = {
-        "critic_expert_variant": getattr(cfg, "critic_expert_variant", "gemma_100m"),
+        "critic_expert_variant": getattr(
+            cfg,
+            "critic_expert_variant",
+            "gemma_50m"
+            if getattr(cfg, "backbone_variant", "paligemma") == "dinov3_gemma3"
+            else "dummy"
+            if getattr(cfg, "backbone_variant", "paligemma") == "dinov3_pure_visual"
+            else "gemma_100m",
+        ),
+        "expert_loss_type": getattr(cfg, "expert_loss_type", "categorical"),
+        "huber_delta": getattr(cfg, "huber_delta", 0.1),
         "num_bins": getattr(cfg, "num_bins", 201),
         "v_min": getattr(cfg, "v_min", -1.0),
         "v_max": getattr(cfg, "v_max", 0.0),
         "value_dropout": getattr(cfg, "value_dropout", 0.0),
     }
+
+    if (
+        not vlm_kwargs.get("vision_encoder_path")
+        and vlm_kwargs.get("backbone_variant") == "siglip_gemma3"
+        and vlm_kwargs.get("siglip_path")
+    ):
+        vlm_kwargs["vision_encoder_path"] = vlm_kwargs["siglip_path"]
 
     config = ValueCriticConfig(**critic_kwargs, **vlm_kwargs)
 

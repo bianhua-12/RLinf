@@ -254,22 +254,60 @@ class ValueCriticConfig(VLMBaseConfig):
     def __init__(
         self,
         critic_expert_variant: str = "gemma_100m",
+        expert_loss_type: str = "categorical",
+        huber_delta: float = 0.1,
         num_bins: int = 201,
         v_min: float = -1.0,
         v_max: float = 0.0,
         backbone_variant: str = "paligemma",
+        vision_encoder_path: str | None = None,
         siglip_path: str | None = None,
         gemma3_path: str | None = None,
+        aggregator_hidden_size: int = 256,
+        aggregator_depth: int = 2,
+        aggregator_num_heads: int = 4,
+        aggregator_mlp_ratio: float = 4.0,
         value_dropout: float = 0.0,
         **kwargs,
     ):
         # Accept and ignore legacy parameters for checkpoint compatibility
         super().__init__(**kwargs)
         self.critic_expert_variant = critic_expert_variant
+        self.expert_loss_type = expert_loss_type
+        self.huber_delta = huber_delta
         self.num_bins = num_bins
         self.v_min = v_min
         self.v_max = v_max
         self.backbone_variant = backbone_variant
+        self.vision_encoder_path = vision_encoder_path or siglip_path or ""
         self.siglip_path = siglip_path or ""
         self.gemma3_path = gemma3_path or ""
+        self.aggregator_hidden_size = aggregator_hidden_size
+        self.aggregator_depth = aggregator_depth
+        self.aggregator_num_heads = aggregator_num_heads
+        self.aggregator_mlp_ratio = aggregator_mlp_ratio
         self.value_dropout = value_dropout
+
+    def to_dict(self):
+        """Serialize config for checkpoint compatibility."""
+        output = super().to_dict()
+        output.update(
+            {
+                "critic_expert_variant": self.critic_expert_variant,
+                "expert_loss_type": self.expert_loss_type,
+                "huber_delta": self.huber_delta,
+                "num_bins": self.num_bins,
+                "v_min": self.v_min,
+                "v_max": self.v_max,
+                "backbone_variant": self.backbone_variant,
+                "vision_encoder_path": self.vision_encoder_path,
+                "siglip_path": self.siglip_path,
+                "gemma3_path": self.gemma3_path,
+                "aggregator_hidden_size": self.aggregator_hidden_size,
+                "aggregator_depth": self.aggregator_depth,
+                "aggregator_num_heads": self.aggregator_num_heads,
+                "aggregator_mlp_ratio": self.aggregator_mlp_ratio,
+                "value_dropout": self.value_dropout,
+            }
+        )
+        return output

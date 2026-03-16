@@ -144,16 +144,19 @@ class ValueDataCollator(DataCollatorMixin):
             return_tensors="pt",
             train=self.train,
         )
+        lang_tokens = None
+        lang_masks = None
+        ar_masks = None
+        if getattr(self.processor, "enable_text", True):
+            processed_txt = self.processor.process_text(
+                prompts=prompts,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
 
-        processed_txt = self.processor.process_text(
-            prompts=prompts,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-
-        lang_tokens = processed_txt["input_ids"]
-        lang_masks = processed_txt["attention_mask"].bool()
-        ar_masks = processed_txt["token_ar_mask"]
+            lang_tokens = processed_txt["input_ids"]
+            lang_masks = processed_txt["attention_mask"].bool()
+            ar_masks = processed_txt["token_ar_mask"]
 
         global _COLLATOR_VERIFIED
         if not _COLLATOR_VERIFIED:
@@ -169,17 +172,19 @@ class ValueDataCollator(DataCollatorMixin):
         observation = {
             "images": processed_img["pixel_values"],
             "image_masks": processed_img["image_masks"],
-            "tokenized_prompt": lang_tokens,
-            "tokenized_prompt_mask": lang_masks,
-            "token_ar_mask": ar_masks,
             "action_mask": action_mask,
         }
+        if lang_tokens is not None:
+            observation["tokenized_prompt"] = lang_tokens
+            observation["tokenized_prompt_mask"] = lang_masks
+            observation["token_ar_mask"] = ar_masks
 
         batch = {
-            "input_ids": lang_tokens,
-            "attention_mask": lang_masks,
             "observation": observation,
         }
+        if lang_tokens is not None:
+            batch["input_ids"] = lang_tokens
+            batch["attention_mask"] = lang_masks
 
         has_any_actions = any(a is not None for a in actions_list)
         if has_any_actions:

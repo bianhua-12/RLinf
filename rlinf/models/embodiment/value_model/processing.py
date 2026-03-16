@@ -505,6 +505,7 @@ class ValueProcessor(ProcessorMixin):
         max_token_len: int = 200,
         tokenizer_name_or_path: Optional[str] = None,
         image_keys: Optional[tuple] = None,
+        enable_text: bool = True,
         **kwargs,
     ):
         if image_processor is None:
@@ -515,7 +516,7 @@ class ValueProcessor(ProcessorMixin):
                 else ValueImageProcessor()
             )
 
-        if tokenizer is None:
+        if tokenizer is None and enable_text:
             tokenizer_path = (
                 tokenizer_name_or_path
                 or os.environ.get("VLA_TOKENIZER_PATH")
@@ -533,7 +534,8 @@ class ValueProcessor(ProcessorMixin):
             )
 
         self.image_processor = image_processor
-        self.tokenizer: PreTrainedTokenizerBase = tokenizer
+        self.enable_text = enable_text
+        self.tokenizer: Optional[PreTrainedTokenizerBase] = tokenizer
         self.max_token_len = max_token_len
         self.tokenizer_name_or_path = tokenizer_name_or_path
         # Required for save_pretrained compatibility with transformers ProcessorMixin
@@ -566,6 +568,8 @@ class ValueProcessor(ProcessorMixin):
         Returns:
             (tokens, mask, ar_mask) as numpy arrays of shape (max_length,).
         """
+        if not self.enable_text or self.tokenizer is None:
+            raise RuntimeError("Text processing is disabled for this processor.")
         if max_length is None:
             max_length = self.max_token_len
 
@@ -621,6 +625,8 @@ class ValueProcessor(ProcessorMixin):
         Returns:
             Dict with ``input_ids``, ``attention_mask``, ``token_ar_mask``.
         """
+        if not self.enable_text or self.tokenizer is None:
+            raise RuntimeError("Text processing is disabled for this processor.")
         if max_length is None:
             max_length = self.max_token_len
 
@@ -676,6 +682,8 @@ class ValueProcessor(ProcessorMixin):
         result_data = {}
 
         if text is not None:
+            if not self.enable_text or self.tokenizer is None:
+                raise ValueError("This processor is configured for image-only inputs.")
             is_batched = isinstance(text, list)
             texts = text if is_batched else [text]
 
@@ -703,6 +711,8 @@ class ValueProcessor(ProcessorMixin):
 
     def decode(self, token_ids: Union[list[int], torch.Tensor], **kwargs) -> str:
         """Decode tokens to text."""
+        if self.tokenizer is None:
+            raise RuntimeError("Text decoding is disabled for this processor.")
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.tolist()
         token_ids = [t for t in token_ids if t != 0]
@@ -718,6 +728,8 @@ class ValueProcessor(ProcessorMixin):
 
     @property
     def model_input_names(self):
+        if not self.enable_text:
+            return ["pixel_values", "image_masks"]
         return [
             "pixel_values",
             "image_masks",

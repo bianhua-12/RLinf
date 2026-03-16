@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Value Critic Models for Value Prediction.
-
-Uses expert forward mode: Gemma expert + [CLS] -> categorical value prediction.
-"""
+"""Value Critic Models for Value Prediction."""
 
 import glob
 import json
@@ -35,6 +31,8 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from .configuration import ValueCriticConfig, VLMBaseConfig, get_config
+from .dinov3_gemma3_with_multi_expert import Dinov3Gemma3WithMultiExpert
+from .dinov3_pure_visual import Dinov3PureVisualModel
 from .paligemma_with_multi_expert import (
     PaliGemmaWithMultiExpertModel,
     _requires_uniform_dtype,
@@ -340,6 +338,8 @@ class CriticOutput(ModelOutput):
     cat_acc_best: Optional[torch.FloatTensor] = None
     cat_acc_neighbor: Optional[torch.FloatTensor] = None
     cat_mae: Optional[torch.FloatTensor] = None
+    mse: Optional[torch.FloatTensor] = None
+    regression_mae: Optional[torch.FloatTensor] = None
 
 
 # =============================================================================
@@ -365,10 +365,13 @@ class VLMObservationEncoder(nn.Module):
 
     def _get_model_dtype(self) -> torch.dtype:
         """Get the dtype of the backbone model's attention weights."""
-        if getattr(self, "backbone_variant", "paligemma") == "siglip_gemma3":
+        backbone_variant = getattr(self, "backbone_variant", "paligemma")
+        if backbone_variant in {"siglip_gemma3", "dinov3_gemma3"}:
             return self.paligemma_with_expert.gemma3.model.layers[
                 0
             ].self_attn.q_proj.weight.dtype
+        if backbone_variant == "dinov3_pure_visual":
+            return self.paligemma_with_expert.vision_proj.weight.dtype
         return self.paligemma_with_expert.paligemma.language_model.layers[
             0
         ].self_attn.q_proj.weight.dtype
@@ -387,6 +390,19 @@ class VLMObservationEncoder(nn.Module):
         """Extract observation components with unified masks (no state)."""
         images = observation["images"]
         image_masks = observation.get("image_masks", {})
+        if "tokenized_prompt" not in observation:
+            sorted_keys = sorted(images.keys())
+            img_list = [images[k] for k in sorted_keys]
+            batch_size = img_list[0].shape[0]
+            device = img_list[0].device
+            img_mask_list = [
+                image_masks.get(
+                    k, torch.ones(batch_size, dtype=torch.bool, device=device)
+                )
+                for k in sorted_keys
+            ]
+            return img_list, img_mask_list, None, None, None, None, None
+
         tokenized_prompt = observation["tokenized_prompt"]
         tokenized_prompt_mask = observation["tokenized_prompt_mask"]
 
@@ -472,31 +488,41 @@ class VLMObservationEncoder(nn.Module):
 
 
 class ValueHead(nn.Module):
-    """Value prediction head with learnable CLS embedding and categorical projection."""
+    """Value prediction head with learnable CLS embedding."""
 
     def __init__(
         self,
         hidden_size: int,
-        num_bins: int,
-        v_min: float,
-        v_max: float,
+        loss_type: str,
+        num_bins: int = 201,
+        v_min: float = -1.0,
+        v_max: float = 0.0,
         dropout: float = 0.0,
     ):
         super().__init__()
         self.hidden_size = hidden_size
+        self.loss_type = loss_type
 
         self.cls_embedding = nn.Embedding(1, hidden_size)
         nn.init.normal_(self.cls_embedding.weight, std=0.02)
 
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
-        self.value_proj = nn.Linear(hidden_size, num_bins)
-        self.register_buffer(
-            "atoms", torch.linspace(v_min, v_max, num_bins), persistent=False
-        )
-        self.num_bins = num_bins
-        self.v_min = v_min
-        self.v_max = v_max
-        self.delta_z = (v_max - v_min) / (num_bins - 1)
+        out_dim = num_bins if loss_type == "categorical" else 1
+        self.value_proj = nn.Linear(hidden_size, out_dim)
+        if loss_type == "categorical":
+            self.register_buffer(
+                "atoms", torch.linspace(v_min, v_max, num_bins), persistent=False
+            )
+            self.num_bins = num_bins
+            self.v_min = v_min
+            self.v_max = v_max
+            self.delta_z = (v_max - v_min) / (num_bins - 1)
+        else:
+            self.register_buffer("atoms", None, persistent=False)
+            self.num_bins = 1
+            self.v_min = None
+            self.v_max = None
+            self.delta_z = None
 
     def get_cls_embedding(self, batch_size: int) -> Tensor:
         """Get CLS embedding expanded to batch size. Returns [B, 1, hidden_size]."""
@@ -523,7 +549,7 @@ class ValueHead(nn.Module):
 class ValueCriticModel(VLMObservationEncoder):
     """Value function V(s) with VLM observation encoding.
 
-    Uses expert mode: Gemma expert + [CLS] -> categorical value prediction.
+    Uses expert mode: Gemma expert + [CLS] -> value prediction.
     """
 
     def __init__(self, config: ValueCriticConfig):
@@ -531,33 +557,79 @@ class ValueCriticModel(VLMObservationEncoder):
         self.config = config
         self.pi05 = True
         self.backbone_variant = getattr(config, "backbone_variant", "paligemma")
+        self.expert_loss_type = getattr(config, "expert_loss_type", "categorical")
+        self.huber_delta = getattr(config, "huber_delta", 0.1)
+        self.is_pure_visual = self.backbone_variant == "dinov3_pure_visual"
 
-        expert_config = get_config(config.critic_expert_variant)
+        if self.expert_loss_type not in {"categorical", "mse", "huber"}:
+            raise ValueError(
+                "expert_loss_type must be 'categorical', 'mse', or 'huber', got "
+                f"{self.expert_loss_type!r}"
+            )
 
-        logger.info(
-            f"Creating ValueCritic: expert={config.critic_expert_variant}, "
-            f"backbone={self.backbone_variant}"
+        expert_config = (
+            None if self.is_pure_visual else get_config(config.critic_expert_variant)
         )
 
-        expert_configs = {"value": expert_config}
+        logger.info(
+            "Creating ValueCritic: expert=%s, backbone=%s",
+            getattr(config, "critic_expert_variant", None),
+            self.backbone_variant,
+        )
 
-        if self.backbone_variant == "siglip_gemma3":
-            siglip_path = getattr(config, "siglip_path", "")
-            gemma3_path = getattr(config, "gemma3_path", "")
-            if not siglip_path or not gemma3_path:
+        expert_configs = {"value": expert_config} if expert_config is not None else {}
+
+        if self.backbone_variant == "dinov3_pure_visual":
+            vision_encoder_path = getattr(config, "vision_encoder_path", "")
+            if not vision_encoder_path:
                 raise ValueError(
-                    "backbone_variant='siglip_gemma3' requires both "
-                    f"siglip_path and gemma3_path. Got siglip_path='{siglip_path}', "
+                    "backbone_variant='dinov3_pure_visual' requires vision_encoder_path"
+                )
+            self.paligemma_with_expert = Dinov3PureVisualModel(
+                vision_encoder_path=vision_encoder_path,
+                hidden_size=getattr(config, "aggregator_hidden_size", 256),
+                depth=getattr(config, "aggregator_depth", 2),
+                num_heads=getattr(config, "aggregator_num_heads", 4),
+                mlp_ratio=getattr(config, "aggregator_mlp_ratio", 4.0),
+                dropout=getattr(config, "value_dropout", 0.0),
+                precision=config.dtype,
+                freeze_vision_encoder=getattr(config, "freeze_vision_encoder", True),
+                freeze_vlm=getattr(config, "freeze_vlm", True),
+            )
+        elif self.backbone_variant in {"siglip_gemma3", "dinov3_gemma3"}:
+            vision_encoder_path = getattr(config, "vision_encoder_path", "") or getattr(
+                config, "siglip_path", ""
+            )
+            gemma3_path = getattr(config, "gemma3_path", "")
+            if not vision_encoder_path or not gemma3_path:
+                raise ValueError(
+                    f"backbone_variant={self.backbone_variant!r} requires both "
+                    "vision_encoder_path and gemma3_path. Got "
+                    f"vision_encoder_path='{vision_encoder_path}', "
                     f"gemma3_path='{gemma3_path}'"
                 )
-            self.paligemma_with_expert = SiglipGemma3WithMultiExpert(
-                expert_configs=expert_configs,
-                siglip_path=siglip_path,
-                gemma3_path=gemma3_path,
-                precision=config.dtype,
-                freeze_vision_encoder=getattr(config, "freeze_vision_encoder", False),
-                freeze_vlm=getattr(config, "freeze_vlm", False),
-            )
+            if self.backbone_variant == "siglip_gemma3":
+                self.paligemma_with_expert = SiglipGemma3WithMultiExpert(
+                    expert_configs=expert_configs,
+                    siglip_path=vision_encoder_path,
+                    gemma3_path=gemma3_path,
+                    precision=config.dtype,
+                    freeze_vision_encoder=getattr(
+                        config, "freeze_vision_encoder", False
+                    ),
+                    freeze_vlm=getattr(config, "freeze_vlm", False),
+                )
+            else:
+                self.paligemma_with_expert = Dinov3Gemma3WithMultiExpert(
+                    expert_configs=expert_configs,
+                    vision_encoder_path=vision_encoder_path,
+                    gemma3_path=gemma3_path,
+                    precision=config.dtype,
+                    freeze_vision_encoder=getattr(
+                        config, "freeze_vision_encoder", False
+                    ),
+                    freeze_vlm=getattr(config, "freeze_vlm", False),
+                )
         else:
             paligemma_config = get_config(config.paligemma_variant)
             use_adarms = [False, {"value": False}]
@@ -573,18 +645,27 @@ class ValueCriticModel(VLMObservationEncoder):
         self.gradient_checkpointing_enabled = False
         self._expert_config = expert_config
 
-        self.expert_width = expert_config.width
+        self.expert_width = (
+            getattr(config, "aggregator_hidden_size", 256)
+            if self.is_pure_visual
+            else expert_config.width
+        )
         self.value_head = ValueHead(
-            hidden_size=expert_config.width,
+            hidden_size=self.expert_width,
+            loss_type=self.expert_loss_type,
             num_bins=config.num_bins,
             v_min=config.v_min,
             v_max=config.v_max,
             dropout=getattr(config, "value_dropout", 0.0),
         )
-        self.num_bins = config.num_bins
-        self.v_min = config.v_min
-        self.v_max = config.v_max
-        self.delta_z = (config.v_max - config.v_min) / (config.num_bins - 1)
+        self.num_bins = config.num_bins if self.expert_loss_type == "categorical" else 1
+        self.v_min = config.v_min if self.expert_loss_type == "categorical" else None
+        self.v_max = config.v_max if self.expert_loss_type == "categorical" else None
+        self.delta_z = (
+            (config.v_max - config.v_min) / (config.num_bins - 1)
+            if self.expert_loss_type == "categorical"
+            else None
+        )
 
         for name, module in self.named_modules():
             path_parts = name.split(".")
@@ -592,7 +673,13 @@ class ValueCriticModel(VLMObservationEncoder):
 
     @property
     def _no_split_modules(self) -> list[str]:
-        if self.paligemma_with_expert.freeze_vlm:
+        if self.backbone_variant == "dinov3_pure_visual":
+            no_split_modules = [
+                "TransformerEncoderLayer",
+                "LayerNorm",
+                "ValueHead",
+            ]
+        elif self.paligemma_with_expert.freeze_vlm:
             no_split_modules = [
                 "GemmaDecoderLayer",
                 "SiglipVisionEmbeddings",
@@ -608,7 +695,7 @@ class ValueCriticModel(VLMObservationEncoder):
                 "GemmaRotaryEmbedding",
                 "ValueHead",
             ]
-        if self.backbone_variant == "siglip_gemma3":
+        if self.backbone_variant in {"siglip_gemma3", "dinov3_gemma3"}:
             no_split_modules.extend(["Gemma3RMSNorm", "Gemma3DecoderLayer"])
         return no_split_modules
 
@@ -618,7 +705,12 @@ class ValueCriticModel(VLMObservationEncoder):
 
     def gradient_checkpointing_enable(self):
         self.gradient_checkpointing_enabled = True
-        if self.backbone_variant == "siglip_gemma3":
+        if self.backbone_variant == "dinov3_pure_visual":
+            if hasattr(
+                self.paligemma_with_expert.vision_tower, "gradient_checkpointing"
+            ):
+                self.paligemma_with_expert.vision_tower.gradient_checkpointing = True
+        elif self.backbone_variant in {"siglip_gemma3", "dinov3_gemma3"}:
             self.paligemma_with_expert.gemma3.model.gradient_checkpointing = True
             self.paligemma_with_expert.vision_tower.gradient_checkpointing = True
         else:
@@ -626,13 +718,18 @@ class ValueCriticModel(VLMObservationEncoder):
             self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = (
                 True
             )
-        for expert in self.paligemma_with_expert.experts.values():
+        for expert in getattr(self.paligemma_with_expert, "experts", {}).values():
             expert.model.gradient_checkpointing = True
         logger.info("Enabled gradient checkpointing for ValueCritic")
 
     def gradient_checkpointing_disable(self):
         self.gradient_checkpointing_enabled = False
-        if self.backbone_variant == "siglip_gemma3":
+        if self.backbone_variant == "dinov3_pure_visual":
+            if hasattr(
+                self.paligemma_with_expert.vision_tower, "gradient_checkpointing"
+            ):
+                self.paligemma_with_expert.vision_tower.gradient_checkpointing = False
+        elif self.backbone_variant in {"siglip_gemma3", "dinov3_gemma3"}:
             self.paligemma_with_expert.gemma3.model.gradient_checkpointing = False
             self.paligemma_with_expert.vision_tower.gradient_checkpointing = False
         else:
@@ -640,7 +737,7 @@ class ValueCriticModel(VLMObservationEncoder):
             self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = (
                 False
             )
-        for expert in self.paligemma_with_expert.experts.values():
+        for expert in getattr(self.paligemma_with_expert, "experts", {}).values():
             expert.model.gradient_checkpointing = False
         logger.info("Disabled gradient checkpointing for ValueCritic")
 
@@ -656,6 +753,9 @@ class ValueCriticModel(VLMObservationEncoder):
 
     def forward(self, observation, target_values=None, **kwargs) -> CriticOutput:
         """Forward pass through expert mode."""
+        if self.is_pure_visual:
+            return self._forward_pure_visual(observation, target_values=target_values)
+
         (
             images,
             img_masks,
@@ -686,10 +786,20 @@ class ValueCriticModel(VLMObservationEncoder):
 
         expert_loss = None
         cat_metrics = None
+        regression_metrics = None
         if target_values is not None:
-            expert_loss, cat_metrics = self._compute_categorical_loss(
-                logits, target_values
-            )
+            if self.expert_loss_type == "categorical":
+                expert_loss, cat_metrics = self._compute_categorical_loss(
+                    logits, target_values
+                )
+            elif self.expert_loss_type == "huber":
+                expert_loss, regression_metrics = self._compute_huber_loss(
+                    values, target_values
+                )
+            else:
+                expert_loss, regression_metrics = self._compute_mse_loss(
+                    values, target_values
+                )
             if backward_anchor is not None:
                 expert_loss = expert_loss + backward_anchor
 
@@ -706,6 +816,52 @@ class ValueCriticModel(VLMObservationEncoder):
             cat_acc_best=cat_metrics["acc_best"] if cat_metrics else None,
             cat_acc_neighbor=cat_metrics["acc_neighbor"] if cat_metrics else None,
             cat_mae=cat_metrics["mae"] if cat_metrics else None,
+            mse=regression_metrics["mse"] if regression_metrics else None,
+            regression_mae=regression_metrics["mae"] if regression_metrics else None,
+        )
+
+    def _forward_pure_visual(self, observation, target_values=None) -> CriticOutput:
+        """Forward pass for the pure-visual DINOv3 value branch."""
+        images, img_masks, _, _, _, _, _ = self._preprocess_observation(observation)
+        batch_size = images[0].shape[0]
+        cls_emb = self.get_cls_embedding(batch_size).to(self._get_model_dtype())
+        cls_hidden = self.paligemma_with_expert(
+            images=images,
+            img_masks=img_masks,
+            cls_emb=cls_emb,
+        ).to(self.value_head.value_proj.weight.dtype)
+        values, logits, probs = self._compute_value_from_hidden(cls_hidden)
+
+        expert_loss = None
+        regression_metrics = None
+        cat_metrics = None
+        if target_values is not None:
+            if self.expert_loss_type == "categorical":
+                expert_loss, cat_metrics = self._compute_categorical_loss(
+                    logits, target_values
+                )
+            elif self.expert_loss_type == "huber":
+                expert_loss, regression_metrics = self._compute_huber_loss(
+                    values, target_values
+                )
+            else:
+                expert_loss, regression_metrics = self._compute_mse_loss(
+                    values, target_values
+                )
+        expert_loss_mean = expert_loss.mean() if expert_loss is not None else None
+        return CriticOutput(
+            loss=expert_loss_mean,
+            predicted_values=values,
+            logits=logits,
+            probs=probs,
+            atoms=self.value_head.atoms,
+            expert_loss=expert_loss_mean,
+            hidden_states=cls_hidden,
+            cat_acc_best=cat_metrics["acc_best"] if cat_metrics else None,
+            cat_acc_neighbor=cat_metrics["acc_neighbor"] if cat_metrics else None,
+            cat_mae=cat_metrics["mae"] if cat_metrics else None,
+            mse=regression_metrics["mse"] if regression_metrics else None,
+            regression_mae=regression_metrics["mae"] if regression_metrics else None,
         )
 
     def _forward_expert(
@@ -727,9 +883,10 @@ class ValueCriticModel(VLMObservationEncoder):
         # Use two-stage forward when VLM is frozen under FSDP to avoid
         # view/inplace errors in interleaved attention.
         # 800m always uses two-stage (no interleaved support for Gemma3).
-        use_two_stage = self.backbone_variant == "siglip_gemma3" or getattr(
-            self.paligemma_with_expert, "freeze_vlm", False
-        )
+        use_two_stage = self.backbone_variant in {
+            "siglip_gemma3",
+            "dinov3_gemma3",
+        } or getattr(self.paligemma_with_expert, "freeze_vlm", False)
         if use_two_stage:
             prefix_out, suffix_out = self._forward_expert_two_stage(
                 prefix_embs=prefix_embs,
@@ -792,7 +949,7 @@ class ValueCriticModel(VLMObservationEncoder):
         """Build a zero-weight anchor so FSDP tracks two-stage Gemma3 backward."""
         if (
             not self.training
-            or self.backbone_variant != "siglip_gemma3"
+            or self.backbone_variant not in {"siglip_gemma3", "dinov3_gemma3"}
             or stop_gradient_to_vlm
             or prefix_out is None
             or not prefix_out.requires_grad
@@ -871,11 +1028,14 @@ class ValueCriticModel(VLMObservationEncoder):
         return prefix_out, suffix_out
 
     def _compute_value_from_hidden(self, cls_hidden):
-        """Compute value from [CLS] hidden state using categorical distribution."""
-        logits = self.value_head(cls_hidden)
-        probs = F.softmax(logits, dim=-1)
-        values = (probs * self.value_head.atoms).sum(dim=-1)
-        return values, logits, probs
+        """Compute value from [CLS] hidden state."""
+        head_out = self.value_head(cls_hidden)
+        if self.expert_loss_type == "categorical":
+            probs = F.softmax(head_out, dim=-1)
+            values = (probs * self.value_head.atoms).sum(dim=-1)
+            return values, head_out, probs
+        values = head_out.squeeze(-1)
+        return values, None, None
 
     def _compute_categorical_loss(self, logits, target_values):
         """Compute categorical loss (Dirac delta projection onto bins).
@@ -920,9 +1080,52 @@ class ValueCriticModel(VLMObservationEncoder):
         }
         return loss, metrics
 
+    def _compute_mse_loss(self, values, target_values):
+        """Compute per-sample MSE loss for scalar regression."""
+        target_values = target_values.to(values.dtype)
+        loss = F.mse_loss(values, target_values, reduction="none")
+        metrics = {
+            "mse": loss.mean(),
+            "mae": (values - target_values).abs().mean(),
+        }
+        return loss, metrics
+
+    def _compute_huber_loss(self, values, target_values):
+        """Compute per-sample Huber loss for scalar regression."""
+        target_values = target_values.to(values.dtype)
+        loss = F.huber_loss(
+            values,
+            target_values,
+            reduction="none",
+            delta=self.huber_delta,
+        )
+        metrics = {
+            "mse": F.mse_loss(values, target_values, reduction="mean"),
+            "mae": (values - target_values).abs().mean(),
+        }
+        return loss, metrics
+
     @torch.no_grad()
     def predict(self, observation) -> CriticOutput:
         """Inference with KV cache."""
+        if self.is_pure_visual:
+            images, img_masks, _, _, _, _, _ = self._preprocess_observation(observation)
+            batch_size = images[0].shape[0]
+            cls_emb = self.get_cls_embedding(batch_size).to(self._get_model_dtype())
+            cls_hidden = self.paligemma_with_expert(
+                images=images,
+                img_masks=img_masks,
+                cls_emb=cls_emb,
+            ).to(self.value_head.value_proj.weight.dtype)
+            values, logits, probs = self._compute_value_from_hidden(cls_hidden)
+            return CriticOutput(
+                predicted_values=values,
+                logits=logits,
+                probs=probs,
+                atoms=self.value_head.atoms,
+                hidden_states=cls_hidden,
+            )
+
         (images, img_masks, lang_tokens, lang_masks, token_ar_mask, _, _) = (
             self._preprocess_observation(observation)
         )
@@ -998,16 +1201,25 @@ class ValueCritic(CriticPreTrainedModel):
         config.critic_expert_variant = getattr(
             config, "critic_expert_variant", "gemma_100m"
         )
+        config.expert_loss_type = getattr(config, "expert_loss_type", "categorical")
         self.model = ValueCriticModel(config)
         self.post_init()
 
     def get_input_embeddings(self):
-        if self.model.backbone_variant == "siglip_gemma3":
+        if self.model.backbone_variant == "dinov3_pure_visual":
+            raise NotImplementedError(
+                "Pure-visual DINO value model does not expose token embeddings."
+            )
+        if self.model.backbone_variant in {"siglip_gemma3", "dinov3_gemma3"}:
             return self.model.paligemma_with_expert.gemma3.get_input_embeddings()
         return self.model.paligemma_with_expert.paligemma.language_model.get_input_embeddings()
 
     def set_input_embeddings(self, value):
-        if self.model.backbone_variant == "siglip_gemma3":
+        if self.model.backbone_variant == "dinov3_pure_visual":
+            raise NotImplementedError(
+                "Pure-visual DINO value model does not expose token embeddings."
+            )
+        if self.model.backbone_variant in {"siglip_gemma3", "dinov3_gemma3"}:
             self.model.paligemma_with_expert.gemma3.set_input_embeddings(value)
         else:
             self.model.paligemma_with_expert.paligemma.language_model.set_input_embeddings(
@@ -1015,12 +1227,20 @@ class ValueCritic(CriticPreTrainedModel):
             )
 
     def get_output_embeddings(self):
-        if self.model.backbone_variant == "siglip_gemma3":
+        if self.model.backbone_variant == "dinov3_pure_visual":
+            raise NotImplementedError(
+                "Pure-visual DINO value model does not expose token embeddings."
+            )
+        if self.model.backbone_variant in {"siglip_gemma3", "dinov3_gemma3"}:
             return self.model.paligemma_with_expert.gemma3.lm_head
         return self.model.paligemma_with_expert.paligemma.lm_head
 
     def set_output_embeddings(self, new_embeddings):
-        if self.model.backbone_variant == "siglip_gemma3":
+        if self.model.backbone_variant == "dinov3_pure_visual":
+            raise NotImplementedError(
+                "Pure-visual DINO value model does not expose token embeddings."
+            )
+        if self.model.backbone_variant in {"siglip_gemma3", "dinov3_gemma3"}:
             self.model.paligemma_with_expert.gemma3.lm_head = new_embeddings
         else:
             self.model.paligemma_with_expert.paligemma.lm_head = new_embeddings
@@ -1028,12 +1248,16 @@ class ValueCritic(CriticPreTrainedModel):
     def resize_token_embeddings(
         self, new_num_tokens, pad_to_multiple_of=None, mean_resizing=True
     ):
+        if self.model.backbone_variant == "dinov3_pure_visual":
+            raise NotImplementedError(
+                "Pure-visual DINO value model does not use token embeddings."
+            )
         if pad_to_multiple_of is not None:
             new_num_tokens = (
                 (new_num_tokens + pad_to_multiple_of - 1) // pad_to_multiple_of
             ) * pad_to_multiple_of
 
-        if self.model.backbone_variant == "siglip_gemma3":
+        if self.model.backbone_variant in {"siglip_gemma3", "dinov3_gemma3"}:
             self.model.paligemma_with_expert.gemma3.resize_token_embeddings(
                 new_num_tokens, pad_to_multiple_of, mean_resizing
             )
@@ -1110,8 +1334,10 @@ class ValueCritic(CriticPreTrainedModel):
         return_max=0.0,
         action_norm_skip_dims=None,
         critic_expert_variant="gemma_100m",
+        expert_loss_type="categorical",
         tokenizer_path=None,
         backbone_variant="paligemma",
+        vision_encoder_path=None,
         siglip_path=None,
         gemma3_path=None,
         **kwargs,
@@ -1132,16 +1358,17 @@ class ValueCritic(CriticPreTrainedModel):
             critic_expert_variant: Gemma variant (e.g., "gemma_100m").
             tokenizer_path: Explicit path to tokenizer. If not set, loads
                 from checkpoint_dir. Raises if neither has tokenizer files.
-            backbone_variant: Backbone type ("paligemma" or "siglip_gemma3").
-            siglip_path: Path to SigLIP pretrained weights (siglip_gemma3 only).
+            backbone_variant: Backbone type ("paligemma", "siglip_gemma3",
+                or "dinov3_gemma3").
+            vision_encoder_path: Path to the vision encoder weights for Gemma3
+                backbones.
+            siglip_path: Legacy alias for vision_encoder_path.
             gemma3_path: Path to Gemma3 pretrained weights (siglip_gemma3 only).
 
         Returns:
             ValueCritic instance with transforms and processor attached.
         """
         import pathlib
-
-        from transformers import AutoTokenizer
 
         from .checkpoint_utils import (
             build_input_transforms,
@@ -1154,33 +1381,47 @@ class ValueCritic(CriticPreTrainedModel):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         logger.info(f"Loading value model from {checkpoint_dir}")
 
-        # Load processor: tokenizer_path > checkpoint tokenizer > error
-        if tokenizer_path:
-            logger.info("  Using explicit tokenizer_path: %s", tokenizer_path)
-            tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_path, add_bos_token=True, local_files_only=True
-            )
-        elif has_tokenizer_files(checkpoint_dir):
-            logger.info("  Found tokenizer files in checkpoint")
-            tokenizer = AutoTokenizer.from_pretrained(
-                str(checkpoint_dir), add_bos_token=True, local_files_only=True
-            )
+        if backbone_variant == "dinov3_pure_visual":
+            processor = ValueProcessor(max_token_len=200, enable_text=False)
         else:
-            raise ValueError(
-                f"No tokenizer found. Set tokenizer_path or ensure checkpoint "
-                f"contains tokenizer files. checkpoint_dir={checkpoint_dir}"
-            )
-        processor = ValueProcessor(tokenizer=tokenizer, max_token_len=200)
+            from transformers import AutoTokenizer
+
+            # Load processor: tokenizer_path > checkpoint tokenizer > error
+            if tokenizer_path:
+                logger.info("  Using explicit tokenizer_path: %s", tokenizer_path)
+                tokenizer = AutoTokenizer.from_pretrained(
+                    tokenizer_path, add_bos_token=True, local_files_only=True
+                )
+            elif has_tokenizer_files(checkpoint_dir):
+                logger.info("  Found tokenizer files in checkpoint")
+                tokenizer = AutoTokenizer.from_pretrained(
+                    str(checkpoint_dir), add_bos_token=True, local_files_only=True
+                )
+            else:
+                raise ValueError(
+                    f"No tokenizer found. Set tokenizer_path or ensure checkpoint "
+                    f"contains tokenizer files. checkpoint_dir={checkpoint_dir}"
+                )
+            processor = ValueProcessor(tokenizer=tokenizer, max_token_len=200)
 
         # Build config and load model
+        if vision_encoder_path is None:
+            vision_encoder_path = siglip_path
+
         critic_config = ValueCriticConfig(
             critic_expert_variant=critic_expert_variant,
+            expert_loss_type=expert_loss_type,
             num_bins=num_return_bins,
             v_min=return_min,
             v_max=return_max,
             backbone_variant=backbone_variant,
+            vision_encoder_path=vision_encoder_path,
             siglip_path=siglip_path,
             gemma3_path=gemma3_path,
+            aggregator_hidden_size=kwargs.get("aggregator_hidden_size", 256),
+            aggregator_depth=kwargs.get("aggregator_depth", 2),
+            aggregator_num_heads=kwargs.get("aggregator_num_heads", 4),
+            aggregator_mlp_ratio=kwargs.get("aggregator_mlp_ratio", 4.0),
         )
 
         try:
@@ -1343,33 +1584,32 @@ class ValueCritic(CriticPreTrainedModel):
             return_tensors="pt",
             train=False,
         )
-
-        # Tokenize prompt (CPU)
-        cleaned_prompt = processor._clean_text(prompt)
-        cleaned_prompt = processor._strip_trailing_punctuation(cleaned_prompt)
-        prefix_text = f"Task: {cleaned_prompt}."
-
-        tokens = processor.tokenizer.encode(prefix_text, add_special_tokens=True)
-        seq_len = len(tokens)
-        max_length = processor.max_token_len
-        if seq_len < max_length:
-            padding_len = max_length - seq_len
-            tok_mask = [True] * seq_len + [False] * padding_len
-            tokens = tokens + [0] * padding_len
-            ar_mask = [0] * max_length
-        else:
-            tokens = tokens[:max_length]
-            tok_mask = [True] * max_length
-            ar_mask = [0] * max_length
-
-        # Return CPU tensors only (no .to(device))
-        return {
+        result = {
             "images": processed_img["pixel_values"],
             "image_masks": processed_img["image_masks"],
-            "tokenized_prompt": torch.tensor([tokens], dtype=torch.long),
-            "tokenized_prompt_mask": torch.tensor([tok_mask], dtype=torch.bool),
-            "token_ar_mask": torch.tensor([ar_mask], dtype=torch.long),
         }
+        if getattr(processor, "enable_text", True):
+            cleaned_prompt = processor._clean_text(prompt)
+            cleaned_prompt = processor._strip_trailing_punctuation(cleaned_prompt)
+            prefix_text = f"Task: {cleaned_prompt}."
+
+            tokens = processor.tokenizer.encode(prefix_text, add_special_tokens=True)
+            seq_len = len(tokens)
+            max_length = processor.max_token_len
+            if seq_len < max_length:
+                padding_len = max_length - seq_len
+                tok_mask = [True] * seq_len + [False] * padding_len
+                tokens = tokens + [0] * padding_len
+                ar_mask = [0] * max_length
+            else:
+                tokens = tokens[:max_length]
+                tok_mask = [True] * max_length
+                ar_mask = [0] * max_length
+
+            result["tokenized_prompt"] = torch.tensor([tokens], dtype=torch.long)
+            result["tokenized_prompt_mask"] = torch.tensor([tok_mask], dtype=torch.bool)
+            result["token_ar_mask"] = torch.tensor([ar_mask], dtype=torch.long)
+        return result
 
     def _prepare_observation(self, inputs: dict) -> dict:
         """Prepare observation dict for model forward.
@@ -1450,25 +1690,6 @@ class ValueCritic(CriticPreTrainedModel):
             train=False,
         )
 
-        # Tokenize prompt
-        cleaned_prompt = processor._clean_text(prompt)
-        cleaned_prompt = processor._strip_trailing_punctuation(cleaned_prompt)
-        prefix_text = f"Task: {cleaned_prompt}."
-
-        tokens = processor.tokenizer.encode(prefix_text, add_special_tokens=True)
-        seq_len = len(tokens)
-
-        max_length = processor.max_token_len
-        if seq_len < max_length:
-            padding_len = max_length - seq_len
-            mask = [True] * seq_len + [False] * padding_len
-            tokens = tokens + [0] * padding_len
-            ar_mask = [0] * max_length
-        else:
-            tokens = tokens[:max_length]
-            mask = [True] * max_length
-            ar_mask = [0] * max_length
-
         # Build observation dict
         pixel_values = processed_img["pixel_values"]
         image_masks = processed_img["image_masks"]
@@ -1483,15 +1704,39 @@ class ValueCritic(CriticPreTrainedModel):
         else:
             masks_on_device = image_masks.to(device)
 
-        return {
+        result = {
             "images": images_on_device,
             "image_masks": masks_on_device,
-            "tokenized_prompt": torch.tensor([tokens], dtype=torch.long, device=device),
-            "tokenized_prompt_mask": torch.tensor(
-                [mask], dtype=torch.bool, device=device
-            ),
-            "token_ar_mask": torch.tensor([ar_mask], dtype=torch.long, device=device),
         }
+        if getattr(processor, "enable_text", True):
+            cleaned_prompt = processor._clean_text(prompt)
+            cleaned_prompt = processor._strip_trailing_punctuation(cleaned_prompt)
+            prefix_text = f"Task: {cleaned_prompt}."
+
+            tokens = processor.tokenizer.encode(prefix_text, add_special_tokens=True)
+            seq_len = len(tokens)
+
+            max_length = processor.max_token_len
+            if seq_len < max_length:
+                padding_len = max_length - seq_len
+                mask = [True] * seq_len + [False] * padding_len
+                tokens = tokens + [0] * padding_len
+                ar_mask = [0] * max_length
+            else:
+                tokens = tokens[:max_length]
+                mask = [True] * max_length
+                ar_mask = [0] * max_length
+
+            result["tokenized_prompt"] = torch.tensor(
+                [tokens], dtype=torch.long, device=device
+            )
+            result["tokenized_prompt_mask"] = torch.tensor(
+                [mask], dtype=torch.bool, device=device
+            )
+            result["token_ar_mask"] = torch.tensor(
+                [ar_mask], dtype=torch.long, device=device
+            )
+        return result
 
     def _prepare_observation_batch(self, inputs_list: list[dict]) -> dict:
         """Prepare batched observation dict from list of inputs."""
@@ -1500,14 +1745,17 @@ class ValueCritic(CriticPreTrainedModel):
         all_tokens = []
         all_masks = []
         all_ar_masks = []
+        uses_text = False
 
         for inputs in inputs_list:
             single_obs = self._prepare_observation(inputs)
             all_images.append(single_obs["images"])
             all_image_masks.append(single_obs["image_masks"])
-            all_tokens.append(single_obs["tokenized_prompt"])
-            all_masks.append(single_obs["tokenized_prompt_mask"])
-            all_ar_masks.append(single_obs["token_ar_mask"])
+            if "tokenized_prompt" in single_obs:
+                uses_text = True
+                all_tokens.append(single_obs["tokenized_prompt"])
+                all_masks.append(single_obs["tokenized_prompt_mask"])
+                all_ar_masks.append(single_obs["token_ar_mask"])
 
         if isinstance(all_images[0], dict):
             batched_images = {
@@ -1522,13 +1770,15 @@ class ValueCritic(CriticPreTrainedModel):
             batched_images = torch.cat(all_images, dim=0)
             batched_masks = torch.cat(all_image_masks, dim=0)
 
-        return {
+        result = {
             "images": batched_images,
             "image_masks": batched_masks,
-            "tokenized_prompt": torch.cat(all_tokens, dim=0),
-            "tokenized_prompt_mask": torch.cat(all_masks, dim=0),
-            "token_ar_mask": torch.cat(all_ar_masks, dim=0),
         }
+        if uses_text:
+            result["tokenized_prompt"] = torch.cat(all_tokens, dim=0)
+            result["tokenized_prompt_mask"] = torch.cat(all_masks, dim=0)
+            result["token_ar_mask"] = torch.cat(all_ar_masks, dim=0)
+        return result
 
     @torch.no_grad()
     def infer(self, obs: dict) -> dict:
@@ -1615,16 +1865,17 @@ class ValueCritic(CriticPreTrainedModel):
                 observation = {
                     "images": batched_images,
                     "image_masks": batched_masks,
-                    "tokenized_prompt": torch.cat(
-                        [obs["tokenized_prompt"] for obs in batch_obs], dim=0
-                    ).to(device),
-                    "tokenized_prompt_mask": torch.cat(
-                        [obs["tokenized_prompt_mask"] for obs in batch_obs], dim=0
-                    ).to(device),
-                    "token_ar_mask": torch.cat(
-                        [obs["token_ar_mask"] for obs in batch_obs], dim=0
-                    ).to(device),
                 }
+                if "tokenized_prompt" in first:
+                    observation["tokenized_prompt"] = torch.cat(
+                        [obs["tokenized_prompt"] for obs in batch_obs], dim=0
+                    ).to(device)
+                    observation["tokenized_prompt_mask"] = torch.cat(
+                        [obs["tokenized_prompt_mask"] for obs in batch_obs], dim=0
+                    ).to(device)
+                    observation["token_ar_mask"] = torch.cat(
+                        [obs["token_ar_mask"] for obs in batch_obs], dim=0
+                    ).to(device)
             else:
                 inputs_list = []
                 for obs in batch_obs:
