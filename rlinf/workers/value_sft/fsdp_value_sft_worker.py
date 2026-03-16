@@ -158,23 +158,29 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
         )
 
         backbone_variant = getattr(model_cfg, "backbone_variant", "paligemma")
-        tokenizer_path = getattr(model_cfg, "tokenizer_path", None)
-        if tokenizer_path is None:
-            # Infer from backbone variant
-            if backbone_variant == "siglip_gemma3":
-                tokenizer_path = getattr(model_cfg, "gemma3_path", None)
-            else:
-                tokenizer_path = getattr(model_cfg, "model_path", None)
-        if tokenizer_path is None or not has_tokenizer_files(Path(tokenizer_path)):
-            raise ValueError(
-                f"No tokenizer found for backbone_variant='{backbone_variant}'. "
-                f"Set model.tokenizer_path explicitly or ensure the backbone path "
-                f"contains tokenizer files. Tried: {tokenizer_path}"
+        if backbone_variant == "dinov3_pure_visual":
+            processor = ValueProcessor(
+                max_token_len=getattr(model_cfg, "max_token_len", 200),
+                enable_text=False,
             )
-        processor = ValueProcessor(
-            max_token_len=getattr(model_cfg, "max_token_len", 200),
-            tokenizer_name_or_path=tokenizer_path,
-        )
+        else:
+            tokenizer_path = getattr(model_cfg, "tokenizer_path", None)
+            if tokenizer_path is None:
+                # Infer from backbone variant
+                if backbone_variant in {"siglip_gemma3", "dinov3_gemma3"}:
+                    tokenizer_path = getattr(model_cfg, "gemma3_path", None)
+                else:
+                    tokenizer_path = getattr(model_cfg, "model_path", None)
+            if tokenizer_path is None or not has_tokenizer_files(Path(tokenizer_path)):
+                raise ValueError(
+                    f"No tokenizer found for backbone_variant='{backbone_variant}'. "
+                    f"Set model.tokenizer_path explicitly or ensure the backbone path "
+                    f"contains tokenizer files. Tried: {tokenizer_path}"
+                )
+            processor = ValueProcessor(
+                max_token_len=getattr(model_cfg, "max_token_len", 200),
+                tokenizer_name_or_path=tokenizer_path,
+            )
         train_collator = ValueDataCollator(
             processor=processor,
             max_length=getattr(model_cfg, "max_token_len", 200),
@@ -564,6 +570,18 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
                         if isinstance(result.cat_mae, torch.Tensor)
                         else result.cat_mae
                     )
+                if result.mse is not None:
+                    metrics["mse"] = (
+                        result.mse.detach().item()
+                        if isinstance(result.mse, torch.Tensor)
+                        else result.mse
+                    )
+                if result.regression_mae is not None:
+                    metrics["regression_mae"] = (
+                        result.regression_mae.detach().item()
+                        if isinstance(result.regression_mae, torch.Tensor)
+                        else result.regression_mae
+                    )
 
                 scaled_loss = loss / grad_accum
                 with backward_ctx:
@@ -667,6 +685,18 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
                                 result.cat_mae.detach().item()
                                 if isinstance(result.cat_mae, torch.Tensor)
                                 else result.cat_mae
+                            )
+                        if result.mse is not None:
+                            metrics["mse"] = (
+                                result.mse.detach().item()
+                                if isinstance(result.mse, torch.Tensor)
+                                else result.mse
+                            )
+                        if result.regression_mae is not None:
+                            metrics["regression_mae"] = (
+                                result.regression_mae.detach().item()
+                                if isinstance(result.regression_mae, torch.Tensor)
+                                else result.regression_mae
                             )
                         metrics["loss"] = loss.detach().item()
                         if target_values is not None:

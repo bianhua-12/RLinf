@@ -372,11 +372,29 @@ def load_value_model(cfg: DictConfig, device: str = "cuda"):
     num_return_bins = model_cfg.get("num_bins", 201)
     return_min = model_cfg.get("v_min", -1.0)
     return_max = model_cfg.get("v_max", 0.0)
-    critic_expert_variant = model_cfg.get("critic_expert_variant", "gemma_100m")
-    tokenizer_path = model_cfg.get("tokenizer_path", None)
     backbone_variant = model_cfg.get("backbone_variant", "paligemma")
-    siglip_path = model_cfg.get("siglip_path", None)
-    gemma3_path = model_cfg.get("gemma3_path", None)
+    critic_expert_variant = model_cfg.get(
+        "critic_expert_variant",
+        "dummy"
+        if backbone_variant == "dinov3_pure_visual"
+        else "gemma_50m"
+        if backbone_variant == "dinov3_gemma3"
+        else "gemma_100m",
+    )
+    expert_loss_type = model_cfg.get("expert_loss_type", "categorical")
+    tokenizer_path = (
+        None
+        if backbone_variant == "dinov3_pure_visual"
+        else model_cfg.get("tokenizer_path", None)
+    )
+    vision_encoder_path = model_cfg.get(
+        "vision_encoder_path", model_cfg.get("siglip_path", None)
+    )
+    gemma3_path = (
+        None
+        if backbone_variant == "dinov3_pure_visual"
+        else model_cfg.get("gemma3_path", None)
+    )
 
     logger.info(f"  env_type (robot_type): {robot_type}")
     logger.info(f"  model_type: {model_type}")
@@ -386,8 +404,9 @@ def load_value_model(cfg: DictConfig, device: str = "cuda"):
     logger.info(f"  critic_expert_variant: {critic_expert_variant}")
     if tokenizer_path:
         logger.info(f"  tokenizer_path: {tokenizer_path}")
-    if siglip_path:
-        logger.info(f"  siglip_path: {siglip_path}")
+    logger.info(f"  expert_loss_type: {expert_loss_type}")
+    if vision_encoder_path:
+        logger.info(f"  vision_encoder_path: {vision_encoder_path}")
     if gemma3_path:
         logger.info(f"  gemma3_path: {gemma3_path}")
 
@@ -400,10 +419,15 @@ def load_value_model(cfg: DictConfig, device: str = "cuda"):
         return_min=return_min,
         return_max=return_max,
         critic_expert_variant=critic_expert_variant,
+        expert_loss_type=expert_loss_type,
         tokenizer_path=tokenizer_path,
         backbone_variant=backbone_variant,
-        siglip_path=siglip_path,
+        vision_encoder_path=vision_encoder_path,
         gemma3_path=gemma3_path,
+        aggregator_hidden_size=model_cfg.get("aggregator_hidden_size", 256),
+        aggregator_depth=model_cfg.get("aggregator_depth", 2),
+        aggregator_num_heads=model_cfg.get("aggregator_num_heads", 4),
+        aggregator_mlp_ratio=model_cfg.get("aggregator_mlp_ratio", 4.0),
     )
 
     logger.info("Loaded ValueCritic for inference")

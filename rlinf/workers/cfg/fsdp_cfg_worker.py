@@ -141,6 +141,15 @@ class FSDPCfgWorker(FSDPSftWorker):
 
         self._setup_rollout_weight_dst_ranks()
 
+    def get_training_steps_per_epoch(self) -> int:
+        """Return the number of optimizer steps in one epoch on each rank.
+
+        The CFG runner uses this to derive ``max_steps`` from dataset size and
+        gradient accumulation rather than assuming a single step per epoch.
+        """
+        loader_len = len(self.data_loader)
+        return max(1, loader_len // max(1, self.gradient_accumulation))
+
     # -------------------------------------------------------------------------
     # DataLoader Building
     # -------------------------------------------------------------------------

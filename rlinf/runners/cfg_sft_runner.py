@@ -71,6 +71,9 @@ class CfgSFTRunner:
         if env_future is not None:
             env_future.wait()
 
+        steps_per_epoch = self.actor.get_training_steps_per_epoch().wait()[0]
+        self.set_max_steps(steps_per_epoch=steps_per_epoch)
+
         resume_dir = self.cfg.runner.get("resume_dir", None)
         if resume_dir is None:
             return
@@ -207,9 +210,14 @@ class CfgSFTRunner:
         os.makedirs(actor_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
 
-    def set_max_steps(self) -> None:
-        """Compute max training steps from runner config."""
-        self.num_steps_per_epoch = 1
+    def set_max_steps(self, steps_per_epoch: int | None = None) -> None:
+        """Compute max training steps from runner config.
+
+        Args:
+            steps_per_epoch: Optional optimizer steps per epoch. When omitted,
+                the runner falls back to ``1`` until workers are initialized.
+        """
+        self.num_steps_per_epoch = max(1, steps_per_epoch or 1)
         self.max_steps = self.num_steps_per_epoch * self.cfg.runner.max_epochs
 
         if (max_steps := self.cfg.runner.get("max_steps", -1)) >= 0:

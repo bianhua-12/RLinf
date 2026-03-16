@@ -14,6 +14,7 @@
 
 import logging
 import os
+import re
 from typing import Optional
 
 from omegaconf.dictconfig import DictConfig
@@ -63,7 +64,7 @@ class SFTRunner:
             f"resume_dir {actor_checkpoint_path} does not exist."
         )
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
-        self.global_step = int(resume_dir.split("global_step_")[-1])
+        self.global_step = self._parse_resume_step(resume_dir)
 
     def run(self) -> None:
         start_step = self.global_step
@@ -166,3 +167,31 @@ class SFTRunner:
     @property
     def epoch(self) -> int:
         return self.global_step // self.num_steps_per_epoch
+
+    @staticmethod
+    def _parse_resume_step(resume_dir: str) -> int:
+        """Parse global step from a checkpoint directory name.
+
+        Supports both standard ``global_step_<N>`` checkpoints and renamed
+        best-checkpoint directories such as ``*_gs<N>``.
+
+        Args:
+            resume_dir: Checkpoint directory path.
+
+        Returns:
+            Parsed integer global step.
+
+        Raises:
+            ValueError: If the directory name does not contain a recognizable
+                global step token.
+        """
+        basename = os.path.basename(os.path.normpath(resume_dir))
+        for pattern in (r"global_step_(\d+)", r"\bgs(\d+)\b", r"_gs(\d+)$"):
+            match = re.search(pattern, basename)
+            if match:
+                return int(match.group(1))
+
+        raise ValueError(
+            "Unable to parse global step from resume_dir. Expected directory "
+            f"name containing 'global_step_<N>' or 'gs<N>', got: {resume_dir}"
+        )

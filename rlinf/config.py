@@ -842,12 +842,22 @@ def validate_sft_cfg(cfg: DictConfig) -> DictConfig:
     )
 
     with open_dict(cfg):
+        train_data_paths = cfg.data.get("train_data_paths", None)
+        has_embedded_eval_paths = False
+        if train_data_paths is not None:
+            has_embedded_eval_paths = any(
+                entry.get("eval_dataset_path", None) is not None
+                for entry in train_data_paths
+            )
+
         if cfg.data.get("train_data_paths", None) is None:
             # if train_data_paths is None, the code will just eval the model
             assert cfg.data.get("eval_data_paths", None) is not None, (
                 "the data.train_data_paths is None, so data.eval_data_paths is required"
             )
-        elif cfg.data.get("eval_data_paths", None) is not None:
+        elif (
+            cfg.data.get("eval_data_paths", None) is not None or has_embedded_eval_paths
+        ):
             # set the val_check_interval to max_epochs
             if cfg.runner.get("val_check_interval", None) is None:
                 cfg.runner.val_check_interval = cfg.runner.max_epochs
