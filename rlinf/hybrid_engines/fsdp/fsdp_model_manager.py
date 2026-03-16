@@ -287,9 +287,23 @@ class FSDPModelManager:
         Args:
             load_path: the directory to load checkpoint.
         """
+        should_restore_offload = bool(self._cfg.get("enable_offload", False))
+
+        # Resume must restore onto GPU-backed FSDP parameters first. If the worker
+        # was already offloaded during init, temporarily bring the state back
+        # before loading and re-apply offload afterwards.
+        if self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+        if self.is_optimizer_offloaded:
+            self.load_optimizer(self.device)
+
         self._strategy.load_checkpoint(
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
+
+        if should_restore_offload:
+            self.offload_param_and_grad()
+            self.offload_optimizer()
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         """
