@@ -44,6 +44,9 @@ from rlinf.datasets import (  # noqa: E402
 )
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager  # noqa: E402
 from rlinf.models import get_model  # noqa: E402
+from rlinf.models.embodiment.value_model.logging_utils import (  # noqa: E402
+    build_value_metric_dict,
+)
 from rlinf.scheduler import Worker  # noqa: E402
 from rlinf.utils.distributed import all_reduce_dict  # noqa: E402
 
@@ -537,61 +540,15 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
                     result = self.model(**fwd_kwargs)
                     loss = result.loss
 
-                metrics = {}
-                if result.expert_loss is not None:
-                    metrics["expert_loss"] = (
-                        result.expert_loss.detach().item()
-                        if isinstance(result.expert_loss, torch.Tensor)
-                        else result.expert_loss
-                    )
-                if result.predicted_values is not None:
-                    metrics["predicted_value_mean"] = (
-                        result.predicted_values.detach().mean().item()
-                    )
-                    metrics["predicted_value_std"] = (
-                        result.predicted_values.detach().std().item()
-                    )
-                # Categorical loss metrics
-                if result.cat_acc_best is not None:
-                    metrics["cat_acc_best"] = (
-                        result.cat_acc_best.detach().item()
-                        if isinstance(result.cat_acc_best, torch.Tensor)
-                        else result.cat_acc_best
-                    )
-                if result.cat_acc_neighbor is not None:
-                    metrics["cat_acc_neighbor"] = (
-                        result.cat_acc_neighbor.detach().item()
-                        if isinstance(result.cat_acc_neighbor, torch.Tensor)
-                        else result.cat_acc_neighbor
-                    )
-                if result.cat_mae is not None:
-                    metrics["cat_mae"] = (
-                        result.cat_mae.detach().item()
-                        if isinstance(result.cat_mae, torch.Tensor)
-                        else result.cat_mae
-                    )
-                if result.mse is not None:
-                    metrics["mse"] = (
-                        result.mse.detach().item()
-                        if isinstance(result.mse, torch.Tensor)
-                        else result.mse
-                    )
-                if result.regression_mae is not None:
-                    metrics["regression_mae"] = (
-                        result.regression_mae.detach().item()
-                        if isinstance(result.regression_mae, torch.Tensor)
-                        else result.regression_mae
-                    )
-
                 scaled_loss = loss / grad_accum
                 with backward_ctx:
                     self.grad_scaler.scale(scaled_loss).backward()
 
-                metrics["loss"] = loss.detach().item()
-                # Add target value statistics for comparison
-                if target_values is not None:
-                    metrics["target_value_mean"] = target_values.detach().mean().item()
-                    metrics["target_value_std"] = target_values.detach().std().item()
+                metrics = build_value_metric_dict(
+                    result=result,
+                    loss=loss,
+                    target_values=target_values,
+                )
                 all_metrics.append(metrics)
 
             # optimizer step
@@ -654,58 +611,11 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
                             result = self.model(**fwd_kwargs)
                             loss = result.loss
 
-                        metrics: dict[str, float] = {}
-                        if result.expert_loss is not None:
-                            metrics["expert_loss"] = (
-                                result.expert_loss.detach().item()
-                                if isinstance(result.expert_loss, torch.Tensor)
-                                else result.expert_loss
-                            )
-                        if result.predicted_values is not None:
-                            metrics["predicted_value_mean"] = (
-                                result.predicted_values.detach().mean().item()
-                            )
-                            metrics["predicted_value_std"] = (
-                                result.predicted_values.detach().std().item()
-                            )
-                        if result.cat_acc_best is not None:
-                            metrics["cat_acc_best"] = (
-                                result.cat_acc_best.detach().item()
-                                if isinstance(result.cat_acc_best, torch.Tensor)
-                                else result.cat_acc_best
-                            )
-                        if result.cat_acc_neighbor is not None:
-                            metrics["cat_acc_neighbor"] = (
-                                result.cat_acc_neighbor.detach().item()
-                                if isinstance(result.cat_acc_neighbor, torch.Tensor)
-                                else result.cat_acc_neighbor
-                            )
-                        if result.cat_mae is not None:
-                            metrics["cat_mae"] = (
-                                result.cat_mae.detach().item()
-                                if isinstance(result.cat_mae, torch.Tensor)
-                                else result.cat_mae
-                            )
-                        if result.mse is not None:
-                            metrics["mse"] = (
-                                result.mse.detach().item()
-                                if isinstance(result.mse, torch.Tensor)
-                                else result.mse
-                            )
-                        if result.regression_mae is not None:
-                            metrics["regression_mae"] = (
-                                result.regression_mae.detach().item()
-                                if isinstance(result.regression_mae, torch.Tensor)
-                                else result.regression_mae
-                            )
-                        metrics["loss"] = loss.detach().item()
-                        if target_values is not None:
-                            metrics["target_value_mean"] = (
-                                target_values.detach().mean().item()
-                            )
-                            metrics["target_value_std"] = (
-                                target_values.detach().std().item()
-                            )
+                        metrics = build_value_metric_dict(
+                            result=result,
+                            loss=loss,
+                            target_values=target_values,
+                        )
                         batch_metrics.append(metrics)
 
                     # Aggregate across batches for this dataset

@@ -14,6 +14,9 @@ is_lora: false
 #   "gemma_50m" | "gemma_100m" | "gemma_150m" | "gemma_300m" | "gemma_2b"
 critic_expert_variant: "gemma_100m"
 expert_loss_type: "categorical"
+# Value SFT logs a fixed metric union for both TensorBoard and W&B:
+# loss, expert_loss, predicted/target value stats, categorical metrics,
+# regression metrics, and the shared alias value_mae.
 
 # =====================================================================
 # Value head / regression loss
