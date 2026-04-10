@@ -17,15 +17,21 @@
 from rlinf.models.embodiment.reward.base_image_reward_model import BaseImageRewardModel
 from rlinf.models.embodiment.reward.base_reward_model import BaseRewardModel
 from rlinf.models.embodiment.reward.resnet_reward_model import ResNetRewardModel
+from rlinf.models.embodiment.reward.vlm_reward_model import VLMRewardModel
+from rlinf.models.embodiment.reward.vlm_reward_model import HistoryVLMRewardModel
 
 __all__ = [
     "BaseRewardModel",
     "BaseImageRewardModel",
     "ResNetRewardModel",
+    "VLMRewardModel",
+    "HistoryVLMRewardModel",
 ]
 
 reward_model_registry = {
     "resnet": ResNetRewardModel,
+    "vlm": VLMRewardModel,
+    "history_vlm": HistoryVLMRewardModel,
 }
 
 

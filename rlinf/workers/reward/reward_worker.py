@@ -14,7 +14,7 @@
 
 import asyncio
 import os
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import numpy as np
 import torch
@@ -35,13 +35,19 @@ from rlinf.scheduler import (
 )
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.distributed import all_reduce_dict
-from rlinf.utils.down_sampling import down_sample_batch
 from rlinf.utils.metric_utils import append_to_dict
 from rlinf.utils.placement import (
     HybridComponentPlacement,
 )
 from rlinf.utils.utils import clear_memory
+from rlinf.utils.logging import get_logger
 
+from rlinf.data.datasets.reward_model import RewardBinaryDataset
+
+from rlinf.models.embodiment.reward import get_reward_model_class
+from rlinf.utils.down_sampling import down_sample_batch
+from rlinf.utils.comm_mapping import CommMapper
+from rlinf.utils.nested_dict_process import cat_list_of_dict_tensor
 
 class RewardWorker(Worker):
     """Reward Worker for inference during reasoning and agentic RL training."""
@@ -49,23 +55,18 @@ class RewardWorker(Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
         self.cfg = cfg
-
         self.placement = HybridComponentPlacement(cfg, Cluster())
 
-    def init_worker(self):
         self.total_batch_size_per_dp = (
             self.cfg.data.rollout_batch_size
             * self.cfg.algorithm.get("group_size", 1)
             // self._world_size
         )
-        self.do_down_sampling = self.cfg.algorithm.get("down_sampling", {}).get(
-            "do_down_sampling", False
-        )
+        self.do_down_sampling = self.cfg.algorithm.get("down_sampling", {}).get("do_down_sampling", False)
         if self.do_down_sampling:
-            self.down_sampling_config = self.cfg.algorithm.get("down_sampling", {}).get(
-                "down_sampling_config", {}
-            )
+            self.down_sampling_config = self.cfg.algorithm.get("down_sampling", {}).get("down_sampling_config", {})
 
+    def init_worker(self):
         if self.cfg.reward.use_reward_model:
             raise NotImplementedError
         else:
@@ -112,9 +113,7 @@ class RewardWorker(Worker):
                         self.tokenizer.decode(ids, skip_special_tokens=True)
                         for ids in rollout_result.response_ids
                     ]
-                rollout_result = down_sample_batch(
-                    rollout_result, self.down_sampling_config
-                )
+                rollout_result = down_sample_batch(rollout_result, self.down_sampling_config)
             # answer is not needed in training
             rollout_result.answers = None
 
@@ -140,9 +139,7 @@ class RewardWorker(Worker):
                     rollout_result.prompt_ids, skip_special_tokens=True
                 )
             kwargs["prompts"] = prompts
-        scores = self.rule_based_reward.get_reward(
-            texts, rollout_result.answers, **kwargs
-        )
+        scores = self.rule_based_reward.get_reward(texts, rollout_result.answers, **kwargs)
         return (
             torch.as_tensor(scores, dtype=torch.float, device=torch.device("cpu"))
             .view(-1, 1)
@@ -229,22 +226,15 @@ class EmbodiedRewardWorker(Worker):
         reward_cls = get_reward_model_class(self.cfg.reward.model.model_type)
 
         model_cfg = self.cfg.reward.model
-        torch_dtype = torch_dtype_from_precision(model_cfg.precision)
-
+        with open_dict(model_cfg):
+            model_cfg.num_envs = self.local_num_train_envs
         model = reward_cls(model_cfg)
-
-        model.to(torch_dtype)
 
         return model
 
     def init_worker(self):
         """Initialize the reward worker for inference."""
         # build model
-        self.model = self.model_provider_func()
-
-        # Move to device and set eval mode
-        self.model = self.model.to(self.device)
-        self.model.eval()
 
         if self._standalone_realworld:
             return
@@ -259,21 +249,33 @@ class EmbodiedRewardWorker(Worker):
                 self.total_num_train_envs // self.num_pipeline_stages
             ),
         }
+        self.local_num_train_envs = sum(size for _, size in self.src_ranks["train"])
 
+        self.model = self.model_provider_func()
+
+        # Move to device and set eval mode
+        self.model = self.model.to(self.device)
+        self.model.eval()
+
+    @Worker.timer("compute_rewards")
     async def compute_rewards(self, input_channel: Channel, output_channel: Channel):
+        # breakpoint()
         if self.enable_offload:
             self.model.to(self.device)
 
-        local_num_train_envs = sum(size for _, size in self.src_ranks["train"])
         total_last_run_count = 0
         while True:
-            merged_images, last_run_count = await self.recv_merged_reward_input(
+            reward_input, last_run_count = await self.recv_merged_reward_input(
                 input_channel, mode="train"
             )
-            rewards = self._compute_image_rewards(images=merged_images)
+            rewards = self.model.compute_reward(reward_input)
+
+            if rewards is not None and rewards.dim() == 1:
+                rewards = rewards.unsqueeze(-1)
+
             self.send_reward_output(output_channel, rewards)
             total_last_run_count += last_run_count
-            if total_last_run_count >= local_num_train_envs:
+            if total_last_run_count >= self.local_num_train_envs:
                 break
 
         if self.enable_offload:
@@ -281,12 +283,18 @@ class EmbodiedRewardWorker(Worker):
 
     async def recv_merged_reward_input(
         self, input_channel: Channel, mode: Literal["train", "eval"] = "train"
-    ) -> tuple[torch.Tensor | np.ndarray, int]:
-        """Receive all mapped reward inputs, merge images on batch dim."""
+    ) -> tuple[dict[str, Any], int]:
+        """Receive all mapped reward inputs and merge on batch dimension.
+
+        The env worker sends reward inputs using stable per-rank keys:
+        `CommMapper.build_channel_key(src_rank, reward_rank, extra=f"{mode}_reward_input")`.
+        This function reassembles shards into one batch-aligned dict.
+        """
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         src_ranks_and_sizes = self.src_ranks[mode]
-        image_batches: list[torch.Tensor | np.ndarray] = []
+        batches: list[dict[str, Any]] = []
         last_run_count = 0
+
         for src_rank, expected_size in src_ranks_and_sizes:
             data = await input_channel.get(
                 key=CommMapper.build_channel_key(
@@ -294,59 +302,36 @@ class EmbodiedRewardWorker(Worker):
                 ),
                 async_op=True,
             ).async_wait()
-            images = data.get("images")
-            actual_size = self._infer_reward_batch_size(images)
+            actual_size = self._infer_reward_batch_size(data)
             assert actual_size == expected_size, (
                 f"Expected reward input batch size {expected_size} from env rank {src_rank}, "
-                f"got {actual_size}."
+                f"got batch size {actual_size}."
             )
-            image_batches.append(images)
             last_run = data.get("last_run", None)
             last_run_count += int(last_run.sum().item()) if last_run is not None else 0
+            batches.append(data)
 
-        merged_images = self._merge_image_batches(image_batches)
-        return merged_images, last_run_count
-
-    @staticmethod
-    def _merge_image_batches(
-        image_batches: list[torch.Tensor | np.ndarray],
-    ) -> torch.Tensor | np.ndarray:
-        if len(image_batches) == 0:
-            raise ValueError("No image batches received for reward inference.")
-        if all(isinstance(images, torch.Tensor) for images in image_batches):
-            return torch.cat(image_batches, dim=0)
-        if all(isinstance(images, np.ndarray) for images in image_batches):
-            return np.concatenate(image_batches, axis=0)
-        # Fallback for mixed types: cast ndarray to tensor and merge as torch.Tensor.
-        tensor_batches = [
-            images if isinstance(images, torch.Tensor) else torch.from_numpy(images)
-            for images in image_batches
-        ]
-        return torch.cat(tensor_batches, dim=0)
+        merged = cat_list_of_dict_tensor(
+            [{k: v for k, v in b.items() if k != "last_run"} for b in batches], dim=0
+        )
+        return merged, last_run_count
 
     @staticmethod
-    def _infer_reward_batch_size(images: torch.Tensor | np.ndarray) -> int:
-        if isinstance(images, torch.Tensor) or isinstance(images, np.ndarray):
-            return images.shape[0]
-        raise ValueError(f"Unsupported reward input image type: {type(images)}")
+    def _infer_reward_batch_size(reward_input: dict[str, Any]) -> int:
+        main_images = reward_input.get("main_images", None)
+        if main_images is None:
+            raise ValueError("Reward input dict missing 'main_images' for batch size inference.")
+        if not isinstance(main_images, (np.ndarray, torch.Tensor)):
+            raise TypeError(f"Unsupported main_images type: {type(main_images)}")
 
-    @Worker.timer("compute_image_rewards")
-    def _compute_image_rewards(self, images: torch.Tensor):
-        if isinstance(images, np.ndarray):
-            images = torch.from_numpy(images)
+        batch_size = int(main_images.shape[0])
 
-        model_dtype = next(self.model.parameters()).dtype
-        images = images.to(device=self.device, dtype=model_dtype)
-
-        with torch.no_grad():
-            outputs = self.model(images)
-            probs = outputs["probabilities"]
-            rewards = (probs > self.reward_threshold).to(probs.dtype)
-
-        if rewards.dim() == 1:
-            rewards = rewards.unsqueeze(-1)
-
-        return rewards
+        for key, value in reward_input.items():
+            if key == "last_run" or value is None:
+                continue
+            elif isinstance(value, (torch.Tensor, np.ndarray, list)):
+                assert len(value) == batch_size, f"{key} batch size {len(value)} != main_images batch size {batch_size}"
+        return batch_size
 
     def compute_image_rewards(
         self, images: torch.Tensor | np.ndarray
@@ -402,11 +387,12 @@ class EmbodiedRewardWorker(Worker):
             output_channel: Channel carrying rollout->env action chunks.
             reward_tensor: Predicted rewards (tensor or ndarray).
         """
-
         dst_ranks_and_sizes = self.dst_ranks["train"]
         split_sizes = [size for _, size in dst_ranks_and_sizes]
-        reward_tensor_split = list(torch.split(reward_tensor, split_sizes, dim=0))
-        for (dst_rank, _), reward_i in zip(dst_ranks_and_sizes, reward_tensor_split):
+        reward_tensor_split = list(torch.split(reward_tensor, split_sizes, dim=0)) if reward_tensor is not None else [None] * len(dst_ranks_and_sizes)
+        for (dst_rank, _), reward_i in zip(
+            dst_ranks_and_sizes, reward_tensor_split
+        ):
             if isinstance(reward_i, torch.Tensor):
                 reward_i = reward_i.cpu().contiguous()
             output_channel.put(
@@ -433,10 +419,14 @@ class EmbodiedRewardWorker(Worker):
 
     async def _compute_rewards(self, input_channel: Channel, output_channel: Channel):
         while True:
-            merged_images, _ = await self.recv_merged_reward_input(
+            observations, _ = await self.recv_merged_reward_input(
                 input_channel, mode="train"
             )
-            rewards = self._compute_image_rewards(images=merged_images)
+            rewards = self.model.compute_reward(observations)
+
+            if rewards is not None and rewards.dim() == 1:
+                rewards = rewards.unsqueeze(-1)
+
             self.send_reward_output(output_channel, rewards)
 
     async def stop(self):
@@ -462,11 +452,8 @@ class FSDPRewardWorker(FSDPModelManager, Worker):
         reward_cls = get_reward_model_class(self.cfg.actor.model.model_type)
 
         model_cfg = self.cfg.actor.model
-        torch_dtype = torch_dtype_from_precision(model_cfg.precision)
 
         model = reward_cls(model_cfg)
-
-        model.to(torch_dtype)
 
         return model
 
