@@ -39,6 +39,7 @@ from rlinf.utils.nested_dict_process import (
     update_nested_cfg,
 )
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.workers.env.history_manager import HistoryManager
 
 
 class EnvWorker(Worker):
@@ -142,6 +143,12 @@ class EnvWorker(Worker):
 
         if not self.only_eval:
             self._init_env()
+            if self.reward_mode == "history_buffer":
+                self.train_history_managers = [
+                    HistoryManager(self.cfg.reward, self.train_num_envs_per_stage)
+                    for _ in range(self.stage_num)
+                ]
+                self.history_lengths = [{} for _ in range(self.stage_num)]
 
     def update_env_cfg(self):
         if not self.only_eval:
@@ -267,7 +274,7 @@ class EnvWorker(Worker):
             dst_rank_map = {
                 "rollout_train": CommMapper.get_dst_ranks(
                     batch_size=self.cfg.env.train.total_num_envs // self.stage_num,
-                    src_world_size=self._component_placement.get_world_size("env"),
+                    src_world_size=self._componesnt_placement.get_world_size("env"),
                     dst_world_size=self._component_placement.get_world_size("rollout"),
                     src_rank=self._rank,
                 ),
@@ -722,7 +729,7 @@ class EnvWorker(Worker):
     def send_reward_input(
         self,
         send_channel: Channel,
-        reward_input: dict[str, torch.Tensor],
+        reward_input: dict[str, Any],
         mode: Literal["train", "eval"] = "train",
     ):
         dst_ranks_and_sizes = self.dst_rank_map[f"reward_{mode}"]
@@ -761,20 +768,35 @@ class EnvWorker(Worker):
         env_output: EnvOutput,
         send_channel: Channel,
         recv_channel: Channel,
+        stage_id: int | None = None,
         last_run: bool = False,
     ):
-        if self.reward_mode == "per_step":
-            reward_input_obs = (
+        if self.reward_mode in {"per_step", "history_buffer"}:
+            observations = (
                 env_output.final_obs
                 if env_output.final_obs is not None
                 else env_output.obs
             )
         elif self.reward_mode == "terminal" and env_output.final_obs is not None:
-            reward_input_obs = env_output.final_obs
+            observations = env_output.final_obs
         else:
             return None
+        reward_input = dict(observations)
 
-        reward_input = {"images": reward_input_obs["main_images"]}
+        dones = env_output.dones
+        if dones is not None and getattr(dones, "ndim", 0) > 1:
+            dones = dones[:, -1]
+            reward_input.update({"dones": dones})
+
+        if self.reward_mode == "history_buffer":
+            if stage_id is None:
+                raise ValueError("stage_id is required for history-buffer reward.")
+            history_manager = self.train_history_managers[stage_id]
+            history_manager.append_to_history_entries(observations)
+            history_input, history_lengths = history_manager.build_history_input(dones=dones)
+            reward_input["history_input"] = history_input
+            self.history_lengths[stage_id] = dict(history_lengths)
+
         if last_run:
             reward_input.update(
                 {
@@ -809,6 +831,21 @@ class EnvWorker(Worker):
             reward_output[done_envs].reshape(-1).to(sparse_rewards.dtype)
         )
         return sparse_rewards
+
+    def assign_history_reward(self, stage_id: int, reward_model_output: torch.Tensor):
+        reward_assign_lengths = [
+            min(history_buffer_length[env_id] for history_buffer_length in self.history_lengths[stage_id].values())
+            for env_id in range(self.train_num_envs_per_stage)
+        ]
+        rollout_rewards = self.rollout_results[stage_id].rewards
+        rollout_rewards_length = len(rollout_rewards)
+        reward_assign_lengths = [min(reward_assign_length, rollout_rewards_length) for reward_assign_length in reward_assign_lengths]
+        if not any(reward_assign_lengths):
+            return
+        reward = (self.reward_weight * reward_model_output).to(rollout_rewards[-1].dtype)
+        for env_id, reward_assign_length in enumerate(reward_assign_lengths):
+            for reward_assign_step in range(2, reward_assign_length + 1):
+                rollout_rewards[-reward_assign_step][env_id] += reward[env_id]
 
     def bootstrap_step(self) -> list[EnvOutput]:
         def get_zero_dones() -> torch.Tensor:
@@ -939,6 +976,7 @@ class EnvWorker(Worker):
                             env_output,
                             send_channel=reward_channel,
                             recv_channel=input_channel,
+                            stage_id=stage_id,
                         )
                         if reward_model_output is not None:
                             env_metrics["reward_model_output"].append(
@@ -967,6 +1005,8 @@ class EnvWorker(Worker):
                         rewards=rewards,
                     )
                     self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                    if self.reward_mode == "history_buffer" and reward_model_output is not None:
+                        self.assign_history_reward(stage_id, reward_model_output)
                     if rollout_result.save_flags is not None:
                         self.rollout_results[stage_id].mark_last_step_with_flags(
                             rollout_result.save_flags
@@ -1011,6 +1051,7 @@ class EnvWorker(Worker):
                         env_output,
                         send_channel=reward_channel,
                         recv_channel=input_channel,
+                        stage_id=stage_id,
                         last_run=last_run,
                     )
                     if reward_model_output is not None:
@@ -1031,6 +1072,8 @@ class EnvWorker(Worker):
                     rewards=rewards,
                 )
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                if self.reward_mode == "history_buffer" and reward_model_output is not None:
+                    self.assign_history_reward(stage_id, reward_model_output)
 
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
