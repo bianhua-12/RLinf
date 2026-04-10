@@ -18,7 +18,7 @@ from typing import Any, Literal, Optional
 
 import numpy as np
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.utils.data import DataLoader, DistributedSampler
 
 from rlinf.config import torch_dtype_from_precision
