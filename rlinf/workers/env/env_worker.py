@@ -277,7 +277,7 @@ class EnvWorker(Worker):
             dst_rank_map = {
                 "rollout_train": CommMapper.get_dst_ranks(
                     batch_size=self.cfg.env.train.total_num_envs // self.stage_num,
-                    src_world_size=self._componesnt_placement.get_world_size("env"),
+                    src_world_size=self._component_placement.get_world_size("env"),
                     dst_world_size=self._component_placement.get_world_size("rollout"),
                     src_rank=self._rank,
                 ),
