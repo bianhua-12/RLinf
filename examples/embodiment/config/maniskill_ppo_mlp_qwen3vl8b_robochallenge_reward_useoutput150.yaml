@@ -213,6 +213,7 @@ reward:
   # - "terminal": Only compute reward at episode end (last frame), prevents reward hacking
   # reward_mode: "terminal"
   reward_mode: "history_buffer"
+  history_reward_assign: True
 
   reward_threshold: 0.5 # Probability threshold for success/fail classification
   

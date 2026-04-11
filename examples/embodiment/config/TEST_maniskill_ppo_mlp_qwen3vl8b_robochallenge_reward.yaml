@@ -187,6 +187,7 @@ reward:
 
   # For PPO reward streaming: request reward every env step/chunk.
   reward_mode: "per_step"
+  history_reward_assign: True
 
   use_output_step: 1
 
@@ -222,4 +223,3 @@ reward:
 
 critic:
   use_critic_model: False
-

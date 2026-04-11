@@ -64,6 +64,7 @@ class EnvWorker(Worker):
         self.stage_num = self.cfg.rollout.pipeline_stage_num
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
+        self.history_reward_assign = self.cfg.get("reward", {}).get("history_reward_assign", True)
         self.use_reward_model = self.cfg.get("reward", {}).get(
             "use_reward_model", False
         )
@@ -1005,7 +1006,7 @@ class EnvWorker(Worker):
                         rewards=rewards,
                     )
                     self.rollout_results[stage_id].append_step_result(chunk_step_result)
-                    if self.reward_mode == "history_buffer" and reward_model_output is not None:
+                    if self.reward_mode == "history_buffer" and self.history_reward_assign and reward_model_output is not None:
                         self.assign_history_reward(stage_id, reward_model_output)
                     if rollout_result.save_flags is not None:
                         self.rollout_results[stage_id].mark_last_step_with_flags(
@@ -1072,7 +1073,7 @@ class EnvWorker(Worker):
                     rewards=rewards,
                 )
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
-                if self.reward_mode == "history_buffer" and reward_model_output is not None:
+                if self.reward_mode == "history_buffer" and self.history_reward_assign and reward_model_output is not None:
                     self.assign_history_reward(stage_id, reward_model_output)
 
             self.store_last_obs_and_intervened_info(env_outputs)
