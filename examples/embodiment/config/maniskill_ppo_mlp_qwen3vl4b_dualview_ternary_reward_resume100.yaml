@@ -25,7 +25,7 @@ runner:
   logger:
     log_path: ../results
     project_name: rlinf
-    experiment_name: maniskill_ppo_mlp_qwen3vl4b_dualview_ternary_reward_resume100
+    experiment_name: maniskill_ppo_mlp_qwen3vl4b_dualview_ternary_reward_resume50
     logger_backends: ["tensorboard"]
 
   max_epochs: 200
@@ -36,8 +36,8 @@ runner:
   val_check_interval: 20
   save_interval: 20
 
-  resume_dir: /mnt/project_rlinf/ztx/RLinf/logs/20260411-20:03:49-maniskill_ppo_mlp/maniskill_ppo_mlp/checkpoints/global_step_100
-  ckpt_path: null
+  resume_dir: null
+  ckpt_path: /mnt/project_rlinf/ztx/RLinf/logs/20260326-19:12:04-maniskill_ppo_mlp_collect/maniskill_ppo_mlp_collect/checkpoints/global_step_50/actor/model_state_dict/full_weights.pt
 
 algorithm:
   update_epoch: 8
@@ -115,7 +115,7 @@ env:
         height: 224
       render_mode: all
     video_cfg:
-      save_video: True
+      save_video: False
       video_base_dir: ${runner.logger.log_path}/video/train
 
   eval:
