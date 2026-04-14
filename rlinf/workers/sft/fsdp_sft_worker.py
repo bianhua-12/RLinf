@@ -54,11 +54,15 @@ class FSDPSftWorker(FSDPModelManager, Worker):
             self.global_batch_size // self.micro_batch_size // self._world_size
         )
 
+        val_data_paths = self.cfg.data.get("val_data_paths")
+        if val_data_paths is None:
+            val_data_paths = self.cfg.data.get("eval_data_paths")
+
         # if train_data_paths is not set, the code will just eval the model
         if self.cfg.data.get("train_data_paths") is None:
             logging.warning("train_data_paths is not set, will just eval the model")
-            assert self.cfg.data.get("val_data_paths") is not None, (
-                "train_data_paths is not set, val_data_paths must be set"
+            assert val_data_paths is not None, (
+                "train_data_paths is not set, val_data_paths or eval_data_paths must be set"
             )
             self.data_loader = None
             self.data_iter = None
@@ -68,9 +72,9 @@ class FSDPSftWorker(FSDPModelManager, Worker):
             )
             self.data_iter = iter(self.data_loader)
 
-        if self.cfg.data.get("val_data_paths") is not None:
+        if val_data_paths is not None:
             self.eval_data_loader, self.eval_data_config = self.build_dataloader(
-                self.cfg.data.val_data_paths, eval_dataset=True
+                val_data_paths, eval_dataset=True
             )
         else:
             self.eval_data_loader = None

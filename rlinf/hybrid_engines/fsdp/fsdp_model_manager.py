@@ -138,7 +138,9 @@ class FSDPModelManager:
         model_config = AutoConfig.from_pretrained(
             cfg.model.model_path,
             trust_remote_code=True,
-            attn_implementation="flash_attention_2",
+            attn_implementation=cfg.model.get(
+                "attn_implementation", "flash_attention_2"
+            ),
         )
 
         if use_gptq:
@@ -171,6 +173,12 @@ class FSDPModelManager:
 
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
+
+        if cfg.model.get("is_lora", False) and hasattr(model, "lm_head"):
+            # Wrapping the tied/output projection as an individual FSDP leaf can
+            # expose the local shard to HF forward paths that call lm_head
+            # directly. Keep it managed by the parent FSDP module instead.
+            setattr(model.lm_head, "_to_lora", False)
 
         if cfg.fsdp_config.use_liger_kernel:
             self._optimize_with_liger_kernel(model)

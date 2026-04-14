@@ -258,6 +258,7 @@ class CollectEpisode(gym.Wrapper):
 
     def _record_reset_obs(self, obs) -> None:
         """Record the initial observation from reset into every env's buffer."""
+        obs = self._attach_rendered_extra_view(obs)
         for env_idx in range(self.num_envs):
             self._buffers[env_idx]["observations"].append(
                 self._slice_copy(obs, env_idx)
@@ -270,6 +271,12 @@ class CollectEpisode(gym.Wrapper):
     def _record_step(self, action, obs, reward, terminated, truncated, info) -> None:
         """Record one transition into every env's buffer."""
         self._global_step += 1
+        obs = self._attach_rendered_extra_view(obs)
+        if isinstance(info, dict) and "final_observation" in info:
+            info = copy.deepcopy(info)
+            info["final_observation"] = self._attach_rendered_extra_view(
+                info["final_observation"]
+            )
         for env_idx in range(self.num_envs):
             # Auto-reset envs store the pre-reset obs in info["final_observation"];
             # the current `obs` is the post-reset obs for the *next* episode.
@@ -295,6 +302,84 @@ class CollectEpisode(gym.Wrapper):
 
             # Update per-env success using already-sliced info (no extra copy).
             self._update_success(env_idx, self._slice_data(info, env_idx))
+
+    def _attach_rendered_extra_view(self, obs):
+        """Populate ``extra_view_images`` from human render if observations lack it."""
+        if not isinstance(obs, dict):
+            return obs
+        extra_view = obs.get("extra_view_images", obs.get("extra_view_image"))
+        if extra_view is not None:
+            return obs
+        rendered = self._render_extra_view_batch()
+        if rendered is None:
+            return obs
+        obs_copy = copy.deepcopy(obs)
+        obs_copy["extra_view_images"] = rendered
+        return obs_copy
+
+    def _render_extra_view_batch(self):
+        """Render a per-env human view array for collection-time dual-view export."""
+        render_targets = []
+        seen_ids = set()
+        for target in (
+            getattr(self.env, "env", None),
+            getattr(getattr(self.env, "env", None), "unwrapped", None),
+            getattr(getattr(getattr(self.env, "unwrapped", None), "env", None), "unwrapped", None),
+            getattr(self.env, "unwrapped", None),
+            self.env,
+        ):
+            if target is None:
+                continue
+            target_id = id(target)
+            if target_id in seen_ids:
+                continue
+            seen_ids.add(target_id)
+            render_targets.append(target)
+
+        rendered = None
+        for target in render_targets:
+            scene = getattr(target, "scene", None)
+            if scene is not None:
+                get_human_render_camera_images_fn = getattr(
+                    scene, "get_human_render_camera_images", None
+                )
+                update_render_fn = getattr(scene, "update_render", None)
+                if callable(get_human_render_camera_images_fn):
+                    try:
+                        if callable(update_render_fn):
+                            update_render_fn(
+                                update_sensors=False,
+                                update_human_render_cameras=True,
+                            )
+                        render_images = get_human_render_camera_images_fn("render_camera")
+                        if isinstance(render_images, dict):
+                            rendered = render_images.get("render_camera")
+                        else:
+                            rendered = render_images
+                    except Exception:
+                        rendered = None
+                    if rendered is not None:
+                        break
+
+            render_rgb_array_fn = getattr(target, "render_rgb_array", None)
+            if callable(render_rgb_array_fn):
+                try:
+                    rendered = render_rgb_array_fn("render_camera")
+                except TypeError:
+                    rendered = None
+                except Exception:
+                    rendered = None
+                if rendered is not None:
+                    break
+
+        if rendered is None:
+            return None
+        rendered_np = self._to_numpy(rendered)
+        if rendered_np is None:
+            return None
+        if rendered_np.ndim == 3:
+            rendered_np = np.expand_dims(rendered_np, axis=0)
+        return rendered_np
 
     def _reset_env_buffer(self, env_idx: int) -> None:
         """Advance episode counter, clear the buffer, and carry over pending obs."""
@@ -695,7 +780,61 @@ class CollectEpisode(gym.Wrapper):
 
     def _slice_copy(self, data, env_idx: int):
         """Slice batched data for a single env and deep-copy the result."""
-        return self._copy(self._slice_data(data, env_idx))
+        sliced = self._slice_data(data, env_idx)
+        copied = self._copy(sliced)
+        if isinstance(copied, dict) and "extra_view_images" in copied:
+            copied["extra_view_images"] = self._align_extra_view_images(
+                copied.get("extra_view_images"),
+                copied.get("main_images"),
+                env_idx,
+            )
+        return copied
+
+    def _align_extra_view_images(self, extra_view_images, main_images, env_idx: int):
+        """Convert tiled extra-view renders into a single env-aligned view."""
+        extra_view_np = self._to_numpy(extra_view_images)
+        main_np = self._to_numpy(main_images)
+        if extra_view_np is None or main_np is None or main_np.ndim < 3:
+            return extra_view_images
+
+        tile_h, tile_w = int(main_np.shape[0]), int(main_np.shape[1])
+        if extra_view_np.ndim == 4 and extra_view_np.shape[0] == 1:
+            extra_view_np = extra_view_np[0]
+        if extra_view_np.ndim != 3:
+            return extra_view_images
+
+        if extra_view_np.shape[0] == tile_h and extra_view_np.shape[1] == tile_w:
+            return np.expand_dims(self._to_uint8(extra_view_np), axis=0)
+
+        if (
+            extra_view_np.shape[0] % tile_h != 0
+            or extra_view_np.shape[1] % tile_w != 0
+        ):
+            return extra_view_images
+
+        rows = extra_view_np.shape[0] // tile_h
+        cols = extra_view_np.shape[1] // tile_w
+        if rows <= 0 or cols <= 0:
+            return extra_view_images
+
+        if cols == self.num_envs:
+            row, col = 0, env_idx
+        elif rows == self.num_envs:
+            row, col = env_idx, 0
+        elif rows * cols >= self.num_envs:
+            row, col = divmod(env_idx, cols)
+        else:
+            return extra_view_images
+
+        if row >= rows or col >= cols:
+            return extra_view_images
+
+        cropped = extra_view_np[
+            row * tile_h : (row + 1) * tile_h,
+            col * tile_w : (col + 1) * tile_w,
+            :,
+        ]
+        return np.expand_dims(self._to_uint8(cropped), axis=0)
 
     def _scalar_flag(self, flags, env_idx: int) -> bool:
         """Extract a boolean flag for ``env_idx`` from a batched flag."""

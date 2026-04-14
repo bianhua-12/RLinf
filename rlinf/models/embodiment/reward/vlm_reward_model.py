@@ -44,6 +44,20 @@ from rlinf.models.embodiment.reward.vlm_reward_utils.reward_parser import (
 from rlinf.models.embodiment.reward.base_reward_model import BaseRewardModel
 
 
+def _normalize_checkpoint_state_dict(checkpoint_state_dict: dict[str, Any]) -> dict[str, Any]:
+    """Strip common wrapper prefixes from serialized checkpoint keys."""
+    normalized = {
+        key.removeprefix("module."): value
+        for key, value in checkpoint_state_dict.items()
+    }
+    if normalized and all(key.startswith("model.") for key in normalized):
+        normalized = {
+            key.removeprefix("model."): value
+            for key, value in normalized.items()
+        }
+    return normalized
+
+
 class VLMRewardModel(BaseRewardModel):
     """A frozen VLM reward model that maps (images, task) -> scalar reward.
 
@@ -124,35 +138,39 @@ class VLMRewardModel(BaseRewardModel):
                 map_location="cpu",
                 weights_only=True,
             )
+            checkpoint_state_dict = _normalize_checkpoint_state_dict(checkpoint_state_dict)
             lora_state_dict = {
-                key.removeprefix("module."): value
+                key: value
                 for key, value in checkpoint_state_dict.items()
                 if "lora_" in key
             }
+
+            if lora_state_dict:
+                lora_rank = next(
+                    int(value.shape[0])
+                    for key, value in lora_state_dict.items()
+                    if "lora_A" in key
+                )
+                target_modules = sorted(
+                    {
+                        key.split(".lora_")[0].split(".")[-1]
+                        for key in lora_state_dict
+                        if ".lora_" in key
+                    }
+                )
+
+                lora_config = LoraConfig(
+                    r=lora_rank,
+                    lora_alpha=lora_rank,
+                    lora_dropout=0.0,
+                    target_modules=target_modules,
+                    init_lora_weights="gaussian",
+                )
+                self._model = get_peft_model(self._model, lora_config)
+                set_peft_model_state_dict(self._model, lora_state_dict)
+            else:
+                self._model.load_state_dict(checkpoint_state_dict, strict=True)
             del checkpoint_state_dict
-
-            lora_rank = next(
-                int(value.shape[0])
-                for key, value in lora_state_dict.items()
-                if "lora_A" in key
-            )
-            target_modules = sorted(
-                {
-                    key.split(".lora_")[0].split(".")[-1]
-                    for key in lora_state_dict
-                    if ".lora_" in key
-                }
-            )
-
-            lora_config = LoraConfig(
-                r=lora_rank,
-                lora_alpha=lora_rank,
-                lora_dropout=0.0,
-                target_modules=target_modules,
-                init_lora_weights="gaussian",
-            )
-            self._model = get_peft_model(self._model, lora_config)
-            set_peft_model_state_dict(self._model, lora_state_dict)
             del lora_state_dict
         
         self._model.eval()

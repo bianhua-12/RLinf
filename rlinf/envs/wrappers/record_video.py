@@ -294,6 +294,8 @@ class RecordVideo(gym.Wrapper):
                         value = value.item()
                     elif value.size == 1:
                         value = value.reshape(-1)[0].item()
+                elif isinstance(value, np.generic):
+                    value = value.item()
                 elif isinstance(value, numbers.Number):
                     pass
                 else:
