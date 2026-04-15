@@ -83,7 +83,7 @@ env:
   group_name: "EnvGroup"
 
   train:
-    total_num_envs: 128
+    total_num_envs: 32
     wrap_obs_mode: simple
     auto_reset: True
     ignore_terminations: False
@@ -154,8 +154,8 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 6400
-  global_batch_size: 6400
+  micro_batch_size: 128
+  global_batch_size: 128
   seed: 1234
   enable_offload: False
 
