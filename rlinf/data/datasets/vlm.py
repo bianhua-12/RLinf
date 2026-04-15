@@ -941,7 +941,7 @@ class RoboChallengeProgressSFTDataset(VLMBaseDataset):
             input_ids = torch.tensor(input_ids, dtype=torch.long)
 
         plen = int(input_ids.numel())
-        multi_modal_inputs = {k: v for k, v in full_inputs.items()}
+        multi_modal_inputs = dict(full_inputs)
         return input_ids, plen, attention_mask, label_mask, multi_modal_inputs
 
     @classmethod
