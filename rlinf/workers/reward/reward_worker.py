@@ -21,11 +21,11 @@ import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.utils.data import DataLoader, DistributedSampler
 
-from rlinf.config import torch_dtype_from_precision
 from rlinf.data.datasets.reward_model import RewardBinaryDataset
 from rlinf.data.io_struct import RolloutResult
 from rlinf.data.tokenizers import hf_tokenizer
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
+from rlinf.models.embodiment.reward import get_reward_model_class
 from rlinf.scheduler import (
     Channel,
     Cluster,
@@ -35,19 +35,14 @@ from rlinf.scheduler import (
 )
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.distributed import all_reduce_dict
+from rlinf.utils.down_sampling import down_sample_batch
 from rlinf.utils.metric_utils import append_to_dict
+from rlinf.utils.nested_dict_process import cat_list_of_dict_tensor
 from rlinf.utils.placement import (
     HybridComponentPlacement,
 )
 from rlinf.utils.utils import clear_memory
-from rlinf.utils.logging import get_logger
 
-from rlinf.data.datasets.reward_model import RewardBinaryDataset
-
-from rlinf.models.embodiment.reward import get_reward_model_class
-from rlinf.utils.down_sampling import down_sample_batch
-from rlinf.utils.comm_mapping import CommMapper
-from rlinf.utils.nested_dict_process import cat_list_of_dict_tensor
 
 class RewardWorker(Worker):
     """Reward Worker for inference during reasoning and agentic RL training."""
@@ -62,9 +57,13 @@ class RewardWorker(Worker):
             * self.cfg.algorithm.get("group_size", 1)
             // self._world_size
         )
-        self.do_down_sampling = self.cfg.algorithm.get("down_sampling", {}).get("do_down_sampling", False)
+        self.do_down_sampling = self.cfg.algorithm.get("down_sampling", {}).get(
+            "do_down_sampling", False
+        )
         if self.do_down_sampling:
-            self.down_sampling_config = self.cfg.algorithm.get("down_sampling", {}).get("down_sampling_config", {})
+            self.down_sampling_config = self.cfg.algorithm.get("down_sampling", {}).get(
+                "down_sampling_config", {}
+            )
 
     def init_worker(self):
         if self.cfg.reward.use_reward_model:
@@ -113,7 +112,9 @@ class RewardWorker(Worker):
                         self.tokenizer.decode(ids, skip_special_tokens=True)
                         for ids in rollout_result.response_ids
                     ]
-                rollout_result = down_sample_batch(rollout_result, self.down_sampling_config)
+                rollout_result = down_sample_batch(
+                    rollout_result, self.down_sampling_config
+                )
             # answer is not needed in training
             rollout_result.answers = None
 
@@ -139,7 +140,9 @@ class RewardWorker(Worker):
                     rollout_result.prompt_ids, skip_special_tokens=True
                 )
             kwargs["prompts"] = prompts
-        scores = self.rule_based_reward.get_reward(texts, rollout_result.answers, **kwargs)
+        scores = self.rule_based_reward.get_reward(
+            texts, rollout_result.answers, **kwargs
+        )
         return (
             torch.as_tensor(scores, dtype=torch.float, device=torch.device("cpu"))
             .view(-1, 1)
@@ -221,8 +224,6 @@ class EmbodiedRewardWorker(Worker):
         self.reward_threshold = self.cfg.reward.get("reward_threshold", 0.6)
 
     def model_provider_func(self):
-        from rlinf.models.embodiment.reward import get_reward_model_class
-
         reward_cls = get_reward_model_class(self.cfg.reward.model.model_type)
 
         model_cfg = self.cfg.reward.model
@@ -320,7 +321,9 @@ class EmbodiedRewardWorker(Worker):
     def _infer_reward_batch_size(reward_input: dict[str, Any]) -> int:
         main_images = reward_input.get("main_images", None)
         if main_images is None:
-            raise ValueError("Reward input dict missing 'main_images' for batch size inference.")
+            raise ValueError(
+                "Reward input dict missing 'main_images' for batch size inference."
+            )
         if not isinstance(main_images, (np.ndarray, torch.Tensor)):
             raise TypeError(f"Unsupported main_images type: {type(main_images)}")
 
@@ -330,7 +333,9 @@ class EmbodiedRewardWorker(Worker):
             if key == "last_run" or value is None:
                 continue
             elif isinstance(value, (torch.Tensor, np.ndarray, list)):
-                assert len(value) == batch_size, f"{key} batch size {len(value)} != main_images batch size {batch_size}"
+                assert len(value) == batch_size, (
+                    f"{key} batch size {len(value)} != main_images batch size {batch_size}"
+                )
         return batch_size
 
     def compute_image_rewards(
@@ -389,10 +394,12 @@ class EmbodiedRewardWorker(Worker):
         """
         dst_ranks_and_sizes = self.dst_ranks["train"]
         split_sizes = [size for _, size in dst_ranks_and_sizes]
-        reward_tensor_split = list(torch.split(reward_tensor, split_sizes, dim=0)) if reward_tensor is not None else [None] * len(dst_ranks_and_sizes)
-        for (dst_rank, _), reward_i in zip(
-            dst_ranks_and_sizes, reward_tensor_split
-        ):
+        reward_tensor_split = (
+            list(torch.split(reward_tensor, split_sizes, dim=0))
+            if reward_tensor is not None
+            else [None] * len(dst_ranks_and_sizes)
+        )
+        for (dst_rank, _), reward_i in zip(dst_ranks_and_sizes, reward_tensor_split):
             if isinstance(reward_i, torch.Tensor):
                 reward_i = reward_i.cpu().contiguous()
             output_channel.put(
@@ -447,8 +454,6 @@ class FSDPRewardWorker(FSDPModelManager, Worker):
         self._training_step = 0
 
     def model_provider_func(self):
-        from rlinf.models.embodiment.reward import get_reward_model_class
-
         reward_cls = get_reward_model_class(self.cfg.actor.model.model_type)
 
         model_cfg = self.cfg.actor.model

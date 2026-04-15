@@ -190,7 +190,7 @@ class ManiskillEnv(gym.Env):
             if "prompt" in wrap_obs_mode:
                 obs["task_descriptions"] = self.instruction
             return obs
-            
+
         # Default
         obs_image = raw_obs["sensor_data"]["3rd_view_camera"]["rgb"].to(
             torch.uint8

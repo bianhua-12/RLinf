@@ -1,18 +1,19 @@
-import torch
-
-from PIL import Image
 from dataclasses import dataclass, field
-from typing import Any, Optional, Dict, Union
+from typing import Any, Optional, Union
+
+import torch
+from PIL import Image
 from transformers import AutoProcessor
 
 from rlinf.data.datasets.vlm import (
-    VLMBaseDataset,
     RoboChallengeProgressSFTDataset,
     SimpleRobochallengeSFTDataset,
+    VLMBaseDataset,
 )
 
+
 def _to_pil_images(
-    images: Union[torch.Tensor, list[torch.Tensor]]
+    images: Union[torch.Tensor, list[torch.Tensor]],
 ) -> list[Image.Image]:
     """Convert EnvOutput image tensors to per-sample PIL image lists.
 
@@ -28,19 +29,20 @@ def _to_pil_images(
     per_sample: list[Image.Image] = []
     for i in range(arr.shape[0]):
         per_sample.append(Image.fromarray(arr[i][..., :3]).convert("RGB"))
-    return per_sample # [B, H, W, C]
+    return per_sample  # [B, H, W, C]
 
 
 def extract_images(
-    observations: dict[str, Any], image_keys: list[str], 
+    observations: dict[str, Any],
+    image_keys: list[str],
 ) -> list[list[Any]]:
     """
-        Args:
-            observations: dict[str, Any], shape = [num_envs, ...]
-            image_keys: list[str], shape = [num_image_keys]
+    Args:
+        observations: dict[str, Any], shape = [num_envs, ...]
+        image_keys: list[str], shape = [num_image_keys]
 
-        Output:
-            images: list[list[Any]], shape = [num_envs, num_image_keys]
+    Output:
+        images: list[list[Any]], shape = [num_envs, num_image_keys]
     """
     image_keys = image_keys or ["main_images"]
     batch_size = observations[image_keys[0]].shape[0]
@@ -57,13 +59,16 @@ def extract_images(
     return images
 
 
-INPUT_BUILDER_REGISTRY: Dict[str, type] = {}
+INPUT_BUILDER_REGISTRY: dict[str, type] = {}
+
 
 def register_input_builder(name: str):
     def decorator(cls: type):
         INPUT_BUILDER_REGISTRY[name.lower()] = cls
-        return cls 
+        return cls
+
     return decorator
+
 
 def get_input_builder(name: str) -> type:
     name_lower = name.lower()
@@ -81,20 +86,12 @@ class BaseInputBuilder:
     _processor: Optional[AutoProcessor] = field(default=None)
 
     def get_valid_input_ids(self, observations: dict[str, Any]) -> list[int]:
-        return list(
-            range(
-                len(
-                    observations[self.image_keys[0]]
-                )
-            )
-        )
+        return list(range(len(observations[self.image_keys[0]])))
 
-    def prepare_inputs(self, observations: dict[str, Any], valid_input_ids: list[int]) -> torch.Tensor:
-        return {
-            "images_list": None,
-            "videos_list": None,
-            "prompt_texts_list": None
-        }
+    def prepare_inputs(
+        self, observations: dict[str, Any], valid_input_ids: list[int]
+    ) -> torch.Tensor:
+        return {"images_list": None, "videos_list": None, "prompt_texts_list": None}
 
     def process_inputs(self, prepared_inputs: dict[str, Any]):
         return prepared_inputs
@@ -104,9 +101,9 @@ class BaseInputBuilder:
         prepared_inputs = self.prepare_inputs(observations, valid_input_ids)
         processed_inputs = self.process_inputs(prepared_inputs)
         processed_inputs = {
-            key: value.to(device) if isinstance(value, torch.Tensor) 
-                else value for key, value in processed_inputs.items()
-            }
+            key: value.to(device) if isinstance(value, torch.Tensor) else value
+            for key, value in processed_inputs.items()
+        }
         return processed_inputs
 
 
@@ -116,7 +113,10 @@ class BaseVLMInputBuilder(BaseInputBuilder):
     def prepare_inputs(self, observations: dict[str, Any], valid_input_ids: list[int]):
         images = extract_images(observations, self.image_keys)
         images_list = [images[env_idx] for env_idx in valid_input_ids]
-        task_descriptions = [str(observations["task_descriptions"][env_idx] or "") for env_idx in valid_input_ids]
+        task_descriptions = [
+            str(observations["task_descriptions"][env_idx] or "")
+            for env_idx in valid_input_ids
+        ]
 
         prompt_texts_list: list[str] = []
         for task_description in task_descriptions:
@@ -130,7 +130,7 @@ class BaseVLMInputBuilder(BaseInputBuilder):
         return {
             "images_list": images_list,
             "videos_list": None,
-            "prompt_texts_list": prompt_texts_list
+            "prompt_texts_list": prompt_texts_list,
         }
 
     def process_inputs(self, prepared_inputs: dict[str, Any]):
@@ -140,44 +140,46 @@ class BaseVLMInputBuilder(BaseInputBuilder):
         processed_inputs: dict[str, Any] = {}
         for prompt_texts, images in zip(prompt_texts_list, images_list):
             _, processed_input = VLMBaseDataset.process_inputs(
-                self._processor, 
-                self.system_prompt, 
-                self.use_chat_template, 
-                prompt_texts=prompt_texts, 
-                images=images
+                self._processor,
+                self.system_prompt,
+                self.use_chat_template,
+                prompt_texts=prompt_texts,
+                images=images,
             )
             for key, value in processed_input.items():
                 if isinstance(value, torch.Tensor):
-                    processed_inputs[key] = value if key not in processed_inputs else torch.cat([processed_inputs[key], value], dim=0)
+                    processed_inputs[key] = (
+                        value
+                        if key not in processed_inputs
+                        else torch.cat([processed_inputs[key], value], dim=0)
+                    )
                 else:
                     processed_inputs[key] = value
         return processed_inputs
+
 
 @register_input_builder("history_vlm_input_builder")
 @dataclass(kw_only=True)
 class HistoryVLMInputBuilder(BaseVLMInputBuilder):
     history_buffer_names: list[str]
-    def get_valid_input_ids(self, observations: dict[str, Any], history_input: dict[str, dict[str, list[list[Any]]]]) -> list[int]:
+
+    def get_valid_input_ids(
+        self,
+        observations: dict[str, Any],
+        history_input: dict[str, dict[str, list[list[Any]]]],
+    ) -> list[int]:
         return list(
-            range(
-                len(
-                    next(iter(history_input[self.history_buffer_names[0]].values()))
-                )
-            )
+            range(len(next(iter(history_input[self.history_buffer_names[0]].values()))))
         )
 
     def prepare_inputs(
         self,
         observations: dict[str, Any],
         history_input: dict[str, dict[str, list[list[Any]]]],
-        valid_input_ids: list[int]
+        valid_input_ids: list[int],
     ):
         del history_input
-        return {
-            "images_list": None,
-            "videos_list": None,
-            "prompt_texts_list": None
-        }
+        return {"images_list": None, "videos_list": None, "prompt_texts_list": None}
 
     def build_inputs(
         self,
@@ -194,10 +196,11 @@ class HistoryVLMInputBuilder(BaseVLMInputBuilder):
         )
         processed_inputs = self.process_inputs(prepared_inputs)
         processed_inputs = {
-            key: value.to(device) if isinstance(value, torch.Tensor) 
-                else value for key, value in processed_inputs.items()
-            }
+            key: value.to(device) if isinstance(value, torch.Tensor) else value
+            for key, value in processed_inputs.items()
+        }
         return processed_inputs, valid_input_ids
+
 
 @register_input_builder("video_vlm_input_builder")
 @dataclass
@@ -222,7 +225,9 @@ class VideoVLMInputBuilder(HistoryVLMInputBuilder):
         if batch_size == 0:
             return []
 
-        videos: list[list[list[Image.Image]]] = [[[] for _ in video_keys] for _ in range(batch_size)]
+        videos: list[list[list[Image.Image]]] = [
+            [[] for _ in video_keys] for _ in range(batch_size)
+        ]
 
         for batch_idx in range(batch_size):
             for video_idx, video_key in enumerate(video_keys):
@@ -231,14 +236,27 @@ class VideoVLMInputBuilder(HistoryVLMInputBuilder):
 
         return videos
 
+
 @register_input_builder("robochanallenge_input_builder")
 @dataclass
 class RobochanallengeInputBuilder(VideoVLMInputBuilder):
-    def get_valid_input_ids(self, observations: dict[str, Any], history_input: dict[str, dict[str, list[list[Any]]]]) -> list[int]:
+    def get_valid_input_ids(
+        self,
+        observations: dict[str, Any],
+        history_input: dict[str, dict[str, list[list[Any]]]],
+    ) -> list[int]:
         history_valid_ids = super().get_valid_input_ids(observations, history_input)
-        
-        observations_valid_ids = [env_id for env_id, task_description in enumerate(observations["task_descriptions"]) if len(task_description or "") > 0]
-        history_valid_ids = [env_idx for env_idx in history_valid_ids if env_idx in observations_valid_ids]
+
+        observations_valid_ids = [
+            env_id
+            for env_id, task_description in enumerate(observations["task_descriptions"])
+            if len(task_description or "") > 0
+        ]
+        history_valid_ids = [
+            env_idx
+            for env_idx in history_valid_ids
+            if env_idx in observations_valid_ids
+        ]
 
         for history_buffer_name in self.history_buffer_names:
             history_buffer = history_input.get(history_buffer_name)
@@ -250,16 +268,24 @@ class RobochanallengeInputBuilder(VideoVLMInputBuilder):
                 if not video_buffer:
                     return []
 
-                video_invalid_ids = [env_idx for env_idx, video in enumerate(video_buffer) if len(video) == 0]
-                history_valid_ids = [env_idx for env_idx in history_valid_ids if env_idx not in video_invalid_ids]
-                
+                video_invalid_ids = [
+                    env_idx
+                    for env_idx, video in enumerate(video_buffer)
+                    if len(video) == 0
+                ]
+                history_valid_ids = [
+                    env_idx
+                    for env_idx in history_valid_ids
+                    if env_idx not in video_invalid_ids
+                ]
+
         return history_valid_ids
 
     def prepare_inputs(
         self,
         observations: dict[str, Any],
         history_input: dict[str, dict[str, list[list[Any]]]],
-        valid_input_ids: list[int]
+        valid_input_ids: list[int],
     ):
         full_history = history_input.get("full_history", {})
         history_window = history_input.get("history_window", {})
@@ -295,12 +321,12 @@ class RobochanallengeInputBuilder(VideoVLMInputBuilder):
                 "{\n"
                 '  "clip_summary": "<describe the trend within the clip>",\n'
                 '  "cot": [\n'
-                '    {\n'
+                "    {\n"
                 '      "subtask": "<task-relevant subtask>",\n'
                 '      "status": "completed|improved|unchanged|worsened|broken",\n'
                 '      "evidence": "<visible evidence about the change within the clip>"\n'
-                '    }\n'
-                '  ],\n'
+                "    }\n"
+                "  ],\n"
                 '  "judgement": "positive|negative",\n'
                 '  "confidence": 1.0|0.6|0.2\n'
                 "}\n\n"
@@ -339,22 +365,21 @@ class RobochanallengeInputBuilder(VideoVLMInputBuilder):
         return {
             "images_list": None,
             "videos_list": videos_list,
-            "prompt_texts_list": prompt_texts_list
+            "prompt_texts_list": prompt_texts_list,
         }
-
 
     def process_inputs(self, prepared_inputs: dict[str, Any]):
         prompt_texts_list = prepared_inputs.get("prompt_texts_list")
         videos_list = prepared_inputs.get("videos_list")
 
         _, processed_inputs, _ = RoboChallengeProgressSFTDataset.process_inputs(
-            processor=self._processor, 
-            system_prompt=self.system_prompt, 
-            use_chat_template=self.use_chat_template, 
-            prompt_texts=prompt_texts_list, 
-            videos=videos_list
+            processor=self._processor,
+            system_prompt=self.system_prompt,
+            use_chat_template=self.use_chat_template,
+            prompt_texts=prompt_texts_list,
+            videos=videos_list,
         )
-        
+
         return processed_inputs
 
 
@@ -371,7 +396,7 @@ class SimpleRobochallengeInputBuilder(RobochanallengeInputBuilder):
 
         videos_clip = self.extract_videos(history_window)
         videos_list = [videos_clip[env_id] for env_id in valid_input_ids]
-        
+
         task_descriptions = [
             str(task_description or "")
             for task_description in observations["task_descriptions"]
@@ -384,7 +409,7 @@ class SimpleRobochallengeInputBuilder(RobochanallengeInputBuilder):
                 "Please judge whether the operation shown in this video segment "
                 "makes the task better or worse. Answer with exactly one word: "
                 "positive or negative."
-            ]            
+            ]
             prompt_texts_list.append(prompt_texts)
 
         return {
@@ -407,13 +432,14 @@ class SimpleRobochallengeInputBuilder(RobochanallengeInputBuilder):
 
         return processed_inputs
 
+
 @register_input_builder("dualview_robochallenge_input_builder")
 @dataclass
 class DualViewInputBuilder(VideoVLMInputBuilder):
     video_keys: list[str] = field(
         default_factory=lambda: ["main_images", "extra_view_images"]
     )
-    
+
     def prepare_inputs(
         self,
         observations: dict[str, Any],
@@ -445,4 +471,3 @@ class DualViewInputBuilder(VideoVLMInputBuilder):
             "videos_list": videos_list,
             "prompt_texts_list": prompt_texts_list,
         }
-    

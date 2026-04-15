@@ -1,17 +1,19 @@
-import re
 import json
+import re
+from typing import Any, Protocol
+
 import torch
-from dataclasses import dataclass
-from typing import Protocol, Dict, Any
 
+REWARD_PARSER_REGISTRY: dict[str, type] = {}
 
-REWARD_PARSER_REGISTRY: Dict[str, type] = {}
 
 def register_reward_parser(name: str):
     def decorator(cls: type):
         REWARD_PARSER_REGISTRY[name.lower()] = cls
-        return cls 
+        return cls
+
     return decorator
+
 
 def get_reward_parser(name: str) -> type:
     name_lower = name.lower()
@@ -22,7 +24,9 @@ def get_reward_parser(name: str) -> type:
 
 @register_reward_parser("base_reward_parser")
 class BaseRewardParser(Protocol):
-    def parse_rewards(self, outputs: list[str]) -> torch.Tensor:  # pragma: no cover - tiny wrapper
+    def parse_rewards(
+        self, outputs: list[str]
+    ) -> torch.Tensor:  # pragma: no cover - tiny wrapper
         pass
 
 
@@ -47,7 +51,10 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
             return None
     return None
 
-def _parse_robochallenge_output(text: str, use_confidence: bool, reward_weights: dict[str, float] = None) -> float | None:
+
+def _parse_robochallenge_output(
+    text: str, use_confidence: bool, reward_weights: dict[str, float] = None
+) -> float | None:
     obj = _extract_json_object(text)
     if obj is not None:
         judgement = obj.get("judgement", None)
@@ -57,10 +64,10 @@ def _parse_robochallenge_output(text: str, use_confidence: bool, reward_weights:
                 if judgement is not None:
                     break
 
-        if judgement is not None:            
+        if judgement is not None:
             if reward_weights is None:
                 reward_weights = {}
-                
+
             j = str(judgement).strip().lower()
             if j in ("positive", "negative", "unchanged"):
                 if not use_confidence:
@@ -83,11 +90,13 @@ def _parse_robochallenge_output(text: str, use_confidence: bool, reward_weights:
     if use_confidence:
         return None
 
-    matches = re.findall(r"\b(positive|negative|unchanged)\b", str(text).strip().lower())
+    matches = re.findall(
+        r"\b(positive|negative|unchanged)\b", str(text).strip().lower()
+    )
     if not matches:
         return None
     judgement = matches[-1]
-    
+
     if reward_weights is None:
         reward_weights = {}
 
@@ -97,8 +106,9 @@ def _parse_robochallenge_output(text: str, use_confidence: bool, reward_weights:
         return reward_weights.get("negative", -1.0)
     if judgement == "unchanged":
         return reward_weights.get("unchanged", 0.0)
-        
+
     return None
+
 
 @register_reward_parser("robochallenge_reward_parser")
 class RobochallengeRewardParser(BaseRewardParser):
@@ -113,14 +123,17 @@ class RobochallengeRewardParser(BaseRewardParser):
             "unchanged": unchanged_reward_weight,
             "negative": negative_reward_weight,
         }
-    
+
     def parse_rewards(self, outputs: list[str]) -> torch.Tensor:
         rewards: list[float] = []
         for output in outputs:
-            reward = _parse_robochallenge_output(output, use_confidence=False, reward_weights=self.reward_weights)
+            reward = _parse_robochallenge_output(
+                output, use_confidence=False, reward_weights=self.reward_weights
+            )
             rewards.append(0.0 if reward is None else float(reward))
         rewards = torch.tensor(rewards, dtype=torch.float32).clamp(0.0, 1.0)
         return rewards
+
 
 @register_reward_parser("confidence_robochallenge_reward_parser")
 class ConfidenceRoboChallengeRewardParser(BaseRewardParser):

@@ -191,10 +191,7 @@ class ResNetRewardModel(BaseImageRewardModel):
             "probabilities": probabilities,
         }
 
-    def compute_reward(
-        self,
-        observations: Any
-    ) -> torch.Tensor:
+    def compute_reward(self, observations: Any) -> torch.Tensor:
         """Compute rewards for inference.
 
         Args:
@@ -206,7 +203,9 @@ class ResNetRewardModel(BaseImageRewardModel):
         """
         images = observations.get("main_images", None)
         if images is None:
-            raise ValueError("Missing main_images in observations for ResNetRewardModel.")
+            raise ValueError(
+                "Missing main_images in observations for ResNetRewardModel."
+            )
 
         if isinstance(images, np.ndarray):
             images = torch.from_numpy(images)
@@ -214,7 +213,7 @@ class ResNetRewardModel(BaseImageRewardModel):
         images = images.to(device)
 
         images = self.preprocess_images(images)
-        
+
         with torch.no_grad():
             logits = self.backbone(images).squeeze(-1)  # (B,)
             # Return probabilities for binary classification
@@ -235,9 +234,7 @@ class ResNetRewardModel(BaseImageRewardModel):
 
             state_dict = load_file(model_path)
         else:
-            state_dict = torch.load(
-                model_path, map_location="cpu", weights_only=False
-            )
+            state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
 
         new_state_dict = {}
         for k, v in state_dict.items():

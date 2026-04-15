@@ -753,7 +753,9 @@ class RoboChallengeProgressSFTDataset(VLMBaseDataset):
     ) -> None:
         super().__init__(data_paths, config, tokenizer)
         self.eval_dataset = eval_dataset
-        self._data_root = config.data.get("data_root") or os.environ.get("RLINF_DATA_ROOT")
+        self._data_root = config.data.get("data_root") or os.environ.get(
+            "RLINF_DATA_ROOT"
+        )
 
     @classmethod
     def _build_video_user_content(
@@ -775,6 +777,7 @@ class RoboChallengeProgressSFTDataset(VLMBaseDataset):
         """
         Build Qwen3-VL processor inputs for RoboChallenge progress SFT.
         """
+
         def _render_prompt_text(
             prompt_text: str, answer_text_i: Optional[str]
         ) -> tuple[str, str]:
@@ -962,10 +965,12 @@ class RoboChallengeProgressSFTDataset(VLMBaseDataset):
         prompt_text, answer_text, videos, image_data = self._parse_raw_record(
             raw, idx, self._data_root
         )
-        input_ids, plen, attention_mask, label_mask, multi_modal_inputs = self.encode_prompt(
-            prompt_text=prompt_text,
-            videos=videos,
-            answer_text=answer_text,
+        input_ids, plen, attention_mask, label_mask, multi_modal_inputs = (
+            self.encode_prompt(
+                prompt_text=prompt_text,
+                videos=videos,
+                answer_text=answer_text,
+            )
         )
         if plen > self.max_prompt_length:
             input_ids = input_ids[: self.max_prompt_length]
@@ -1017,9 +1022,9 @@ class SimpleRobochallengeSFTDataset(RoboChallengeProgressSFTDataset):
         supervision_label = (
             supervision.get("label", "") if isinstance(supervision, dict) else ""
         )
-        answer_text = str(
-            raw.get("answer")
-            or raw.get("label")
-            or supervision_label
-        ).strip().lower()
+        answer_text = (
+            str(raw.get("answer") or raw.get("label") or supervision_label)
+            .strip()
+            .lower()
+        )
         return prompt_text, answer_text, [clip_path], [clip_path]
