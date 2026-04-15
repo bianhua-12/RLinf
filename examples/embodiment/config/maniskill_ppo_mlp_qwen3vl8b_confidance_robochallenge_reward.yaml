@@ -31,9 +31,8 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "maniskill_ppo_mlp_qwen3vl8b_robochallenge_reward_useoutput0"
-    # logger_backends: ["wandb", "tensorboard"]
-    logger_backends: ["tensorboard"] # TEST ONLY
+    experiment_name: "maniskill_ppo_mlp_qwen3vl8b_robochallenge_reward_useoutput150"
+    logger_backends: ["wandb", "tensorboard"]
 
   max_epochs: 1000
   max_steps: -1
@@ -218,7 +217,7 @@ reward:
 
   reward_threshold: 0.5 # Probability threshold for success/fail classification
   
-  use_output_step: 0
+  use_output_step: 150
 
   # How to combine learned rewards with environment rewards:
   # Weighted sum (reward = env_reward_weight * env_reward + reward_weight * reward_model_reward)
@@ -235,7 +234,7 @@ reward:
     # - input_builder_name -> get_input_builder(...)
     # - reward_parser_name -> get_reward_parser(...)
     input_builder_name: "robochanallenge_input_builder"
-    reward_parser_name: "robochallenge_reward_parser"
+    reward_parser_name: "confidence_robochallenge_reward_parser"
     history_buffers:
       full_history:
         history_size: 50

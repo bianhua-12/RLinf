@@ -31,23 +31,24 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "maniskill_ppo_mlp_qwen3vl8b_robochallenge_reward_TEST"
-    # logger_backends: ["wandb", "tensorboard"]
-    logger_backends: ["tensorboard"] # TEST ONLY
+    experiment_name: "maniskill_ppo_mlp_qwen3vl4b_robochallenge_reward_resume100"  
+    logger_backends: ["wandb", "tensorboard"]
+    # logger_backends: ["tensorboard"] # TEST ONLY
 
-  max_epochs: 5
-  max_steps: -1
+  max_epochs: 200
+  max_steps: 200
 
   only_eval: False
   eval_policy_path: null
   val_check_interval: 50
-  save_interval: 100
+  save_interval: 50
 
-  resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
+  # resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
+  resume_dir: "/workspace/RLinf_qwen_reward/logs/20260410-19:14:09-maniskill_ppo_mlp_qwen3vl4b_robochallenge_reward_useoutput0/maniskill_ppo_mlp_qwen3vl4b_robochallenge_reward_useoutput0/checkpoints/global_step_100"
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
-  update_epoch: 1
+  update_epoch: 8
   normalize_advantages: True
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
   group_size: 1
@@ -98,7 +99,7 @@ env:
   group_name: "EnvGroup"
 
   train:
-    total_num_envs: 4 # 128 no sr
+    total_num_envs: 512 # 128 no sr
     wrap_obs_mode: simple_prompt
     auto_reset: True
     ignore_terminations: False
@@ -173,8 +174,8 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 4
-  global_batch_size: 4
+  micro_batch_size: 800
+  global_batch_size: 6400
   seed: 1234
   enable_offload: False
 
@@ -224,43 +225,40 @@ reward:
   # Weighted sum (reward = env_reward_weight * env_reward + reward_weight * reward_model_reward)
   reward_weight: 1.0
   env_reward_weight: 0.0
-
-  history:
-    
   
   model:
     model_type: "history_vlm"
     # SFT checkpoint trained with RoboChallenge video QA + JSON answers
-    model_path: "/workspace/ckpts/qwen3vl-8b-robochallenge-stack-bowls-sft-80"
+    model_path: "/mnt/project_rlinf/ztx/RLinf/Qwen3-VL-4B-Instruct"
+    lora_path: "/mnt/project_rlinf/ztx/RLinf/logs/20260406-21:34:05-qwen3_vl_4b_sft/qwen3_vl_4b_video_judge_sft/checkpoints/global_step_1000"
+    enable_debug_video_output: false
+    debug_video_output_dir: ${runner.logger.log_path}/reward_debug_videos
+    debug_video_fps: 4
     precision: "bf16"
 
     # Match current VLMRewardModel code keys:
     # - input_builder_name -> get_input_builder(...)
     # - reward_parser_name -> get_reward_parser(...)
-    input_builder_name: "robochanallenge_input_builder"
+    input_builder_name: "simple_robochallenge_input_builder"
     reward_parser_name: "robochallenge_reward_parser"
-    history_buffers:
-      full_history:
-        history_size: 50
-        input_interval: 10
-        history_keys: ["main_images"]
-        input_on_done: false
-      history_window:
-        history_size: 10
-        input_interval: 10
-        history_keys: ["main_images"]
-        input_on_done: false
 
+    history_buffers:
+      history_window:
+        history_size: 5
+        input_interval: 5
+        history_keys: ["main_images"]
+        input_on_done: false
+    
     enable_history_offload: true
     infer_micro_batch_size: 64
 
     subprocessor_kwargs:
       video_processor:
         do_sample_frames: True
-        fps: 14.4 # 24.0 * 0.6
+        # fps: 14.4 # 24.0 * 0.6
 
     # Keep generation cheap for RL loop.
-    max_new_tokens: 256 # NOTE: mimic examples/agent/coding_online_rl/config/qwen2.5-1.5b-grpo-llm_judge.yaml
+    max_new_tokens: 64 # NOTE: mimic examples/agent/coding_online_rl/config/qwen2.5-1.5b-grpo-llm_judge.yaml
     temperature: 1.0
     use_chat_template: true
 

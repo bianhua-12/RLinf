@@ -18,10 +18,6 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    # actor: 4-5
-    # env: 0-3
-    # rollout: 4-5
-    # reward: 6-7  # Add reward worker placement # Add reward worker placement
     actor: all
     env: all
     rollout: all
@@ -29,11 +25,10 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "../results"
+    log_path: ../results
     project_name: rlinf
-    experiment_name: "maniskill_ppo_mlp_qwen3vl4b_robochallenge_reward_useoutput0"  
-    logger_backends: ["wandb", "tensorboard"]
-    # logger_backends: ["tensorboard"] # TEST ONLY
+    experiment_name: maniskill_ppo_mlp_qwen3vl4b_dualview_robochallenge_reward
+    logger_backends: ["tensorboard"]
 
   max_epochs: 1000
   max_steps: -1
@@ -41,19 +36,19 @@ runner:
   only_eval: False
   eval_policy_path: null
   val_check_interval: 50
-  save_interval: 100
+  save_interval: 50
 
-  resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
-  ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
+  resume_dir: null
+  ckpt_path: null
 
 algorithm:
   update_epoch: 8
   normalize_advantages: True
-  kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
+  kl_penalty: kl
   group_size: 1
 
   rollout_epoch: 1
-  eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
+  eval_rollout_epoch: 1
 
   reward_type: action_level
   logprob_type: action_level
@@ -61,9 +56,9 @@ algorithm:
 
   adv_type: gae
   loss_type: actor_critic
-  loss_agg_func: "token-mean"
-  
-  bootstrap_type: always # [standard, always]. Bootstrap Q-values according to terminations and truncations. "standard" only bootstraps when truncations, while "always" bootstraps when truncations or terminations.
+  loss_agg_func: token-mean
+
+  bootstrap_type: always
   kl_beta: 0.0
   entropy_bonus: 0
   clip_ratio_high: 0.2
@@ -75,7 +70,6 @@ algorithm:
   gamma: 0.8
   gae_lambda: 0.9
 
-  # params for rollout
   sampling_params:
     do_sample: True
     temperature_train: 1.0
@@ -84,8 +78,6 @@ algorithm:
     top_p: 1.0
     repetition_penalty: 1.0
 
-  # length argument for autoregressive sampling
-  # max length means max amount of tokens to generate
   length_params:
     max_new_token: 7
     max_length: 1024
@@ -95,10 +87,10 @@ data:
   rollout_batch_size: 128
 
 env:
-  group_name: "EnvGroup"
+  group_name: EnvGroup
 
   train:
-    total_num_envs: 512 # 128 no sr
+    total_num_envs: 512
     wrap_obs_mode: simple_prompt
     auto_reset: True
     ignore_terminations: False
@@ -109,24 +101,23 @@ env:
     max_episode_steps: 50
     max_steps_per_rollout_epoch: 50
     use_full_state: True
-    # RGB mode: obs contains both main_images (for reward) and states (for policy)
     is_eval: False
     init_params:
-      id: "PickCube-v1"
-      obs_mode: "rgb"  # RGB mode provides main_images + states
-      control_mode: "pd_joint_delta_pos"
-      sim_backend: "gpu"
+      id: PickCube-v1
+      obs_mode: rgb
+      control_mode: pd_joint_delta_pos
+      sim_backend: gpu
       sim_config:
         sim_freq: 100
         control_freq: 20
       sensor_configs:
-        shader_pack: "default"
+        shader_pack: default
         width: 224
         height: 224
       render_mode: all
     video_cfg:
-      save_video: True
-      video_base_dir: ${runner.logger.log_path}/video/train      # set True to discard failed episodes
+      save_video: False
+      video_base_dir: ${runner.logger.log_path}/video/train
 
   eval:
     total_num_envs: 32
@@ -143,15 +134,15 @@ env:
     use_full_state: True
     is_eval: True
     init_params:
-      id: "PickCube-v1"
-      obs_mode: "rgb"
-      control_mode: "pd_joint_delta_pos"
-      sim_backend: "gpu"
+      id: PickCube-v1
+      obs_mode: rgb
+      control_mode: pd_joint_delta_pos
+      sim_backend: gpu
       sim_config:
         sim_freq: 100
         control_freq: 20
       sensor_configs:
-        shader_pack: "default"
+        shader_pack: default
         width: 224
         height: 224
       render_mode: all
@@ -161,8 +152,8 @@ env:
       video_base_dir: ${runner.logger.log_path}/video/eval
 
 rollout:
-  group_name: "RolloutGroup"
-  backend: "huggingface"
+  group_name: RolloutGroup
+  backend: huggingface
   enable_offload: False
   pipeline_stage_num: 1
 
@@ -171,18 +162,16 @@ rollout:
     precision: ${actor.model.precision}
 
 actor:
-  group_name: "ActorGroup"
-  training_backend: "fsdp"
+  group_name: ActorGroup
+  training_backend: fsdp
   micro_batch_size: 800
   global_batch_size: 6400
   seed: 1234
   enable_offload: False
 
-  # Override the default values in model/mlp_policy
   model:
     model_path: ""
-    model_type: "mlp_policy"
-    # obs_dim: 42  # Full state dimension
+    model_type: mlp_policy
 
   optim:
     lr: 3.0e-4
@@ -193,50 +182,35 @@ actor:
     weight_decay: 0.01
     clip_grad: 0.5
 
-  # Override the default values in training_backend/fsdp
   fsdp_config:
-    strategy: "fsdp"
-    sharding_strategy: "no_shard"
+    strategy: fsdp
+    sharding_strategy: no_shard
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}
       buffer_dtype: ${actor.model.precision}
 
-# -----------------------------------------------------------------------------
-# Reward Model Configuration (trained ResNet reward model)
-# -----------------------------------------------------------------------------
 reward:
   use_reward_model: True
-  group_name: "RewardGroup"
-  
-  # Reward mode:
-  # - "per_step": Compute reward for every frame (default, prone to reward hacking)
-  # - "terminal": Only compute reward at episode end (last frame), prevents reward hacking
-  # reward_mode: "terminal"
-  reward_mode: "history_buffer"
+  group_name: RewardGroup
+  reward_mode: history_buffer
   history_reward_assign: True
-
-  reward_threshold: 0.5 # Probability threshold for success/fail classification
-  
-  use_output_step: 0
-
-  # How to combine learned rewards with environment rewards:
-  # Weighted sum (reward = env_reward_weight * env_reward + reward_weight * reward_model_reward)
+  reward_threshold: 0.5
   reward_weight: 1.0
   env_reward_weight: 0.0
-  
-  model:
-    model_type: "history_vlm"
-    # SFT checkpoint trained with RoboChallenge video QA + JSON answers
-    model_path: "/mnt/project_rlinf/ztx/RLinf/Qwen3-VL-4B-Instruct"
-    lora_path: "/mnt/project_rlinf/ztx/RLinf/logs/20260406-21:34:05-qwen3_vl_4b_sft/qwen3_vl_4b_video_judge_sft/checkpoints/global_step_1000"
-    precision: "bf16"
 
-    # Match current VLMRewardModel code keys:
-    # - input_builder_name -> get_input_builder(...)
-    # - reward_parser_name -> get_reward_parser(...)
-    input_builder_name: "simple_robochallenge_input_builder"
-    reward_parser_name: "simple_robochallenge_reward_parser"
+  model:
+    model_type: history_vlm
+    model_path: /mnt/project_rlinf/ztx/RLinf/Qwen3-VL-4B-Instruct
+    lora_path: /mnt/project_rlinf/ztx/RLinf/logs/qwen3_vl_4b_5frame_dualview_value_judge_v6_sft/qwen3_vl_4b_5frame_dualview_value_judge_v6_sft/checkpoints/global_step_1000
+    precision: bf16
+    input_builder_name: dualview_robochallenge_input_builder
+    reward_parser_name: robochallenge_reward_parser
+    reward_parser_params:
+      reward_weights:
+        positive_reward_weight: 1.0
+        unchanged_reward: 0.0
+        negative_reward: -0.5
 
     history_buffers:
       history_window:

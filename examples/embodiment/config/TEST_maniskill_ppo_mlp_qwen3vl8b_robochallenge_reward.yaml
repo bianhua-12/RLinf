@@ -204,7 +204,7 @@ reward:
     # - input_builder_name -> get_input_builder(...)
     # - reward_parser_name -> get_reward_parser(...)
     input_builder_name: "robochanallenge_input_builder"
-    reward_parser_name: "robochallenge_reward_parser"
+    reward_parser_name: "confidence_robochallenge_reward_parser"
 
     interval_return_mode: "zero"
     history_window_mode: "fixed"
