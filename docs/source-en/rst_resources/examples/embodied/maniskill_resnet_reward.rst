@@ -6,8 +6,8 @@ The main reference config is ``examples/embodiment/config/maniskill_ppo_mlp_resn
 
 Before getting started, it is recommended to read:
 
-1. :doc:`maniskill` to understand the base ManiSkill PPO pipeline.
-2. :doc:`../../tutorials/extend/reward_model` to understand offline reward-data preprocessing and ResNet reward-model training.
+1. :doc:`/rst_source/examples/embodied/maniskill` to understand the base ManiSkill PPO pipeline.
+2. :doc:`/rst_source/tutorials/extend/reward_model` to understand offline reward-data preprocessing and ResNet reward-model training.
 
 Configuration Overview
 ----------------------
@@ -88,4 +88,4 @@ Compared with the base ManiSkill PPO config, this example mainly changes three t
 2. The actor remains an ``mlp_policy`` over ``states``, so action generation cost stays low.
 3. A dedicated reward worker is added, and final rewards are computed centrally in ``EnvWorker``.
 
-If you still need to train the ResNet reward model itself, follow :doc:`../../tutorials/extend/reward_model` first, then plug the resulting checkpoint into this ManiSkill config.
+If you still need to train the ResNet reward model itself, follow :doc:`/rst_source/tutorials/extend/reward_model` first, then plug the resulting checkpoint into this ManiSkill config.

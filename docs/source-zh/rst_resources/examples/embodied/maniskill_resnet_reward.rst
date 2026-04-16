@@ -6,8 +6,8 @@ ManiSkill PPO（基于 ResNet Reward Model）
 
 在开始前，建议先阅读：
 
-1. :doc:`maniskill` 以熟悉基础 ManiSkill PPO 训练流程。
-2. :doc:`../../tutorials/extend/reward_model` 以了解离线 reward 数据预处理与 ResNet reward model 训练流程。
+1. :doc:`/rst_source/examples/embodied/maniskill` 以熟悉基础 ManiSkill PPO 训练流程。
+2. :doc:`/rst_source/tutorials/extend/reward_model` 以了解离线 reward 数据预处理与 ResNet reward model 训练流程。
 
 配置概览
 --------
@@ -88,4 +88,4 @@ ManiSkill PPO（基于 ResNet Reward Model）
 2. actor 仍然使用基于 ``states`` 的 ``mlp_policy``，因此动作生成开销较低。
 3. 新增专门的 reward worker，并由 ``EnvWorker`` 统一完成最终 reward 计算。
 
-如果还需要先训练 ResNet reward model，请先按 :doc:`../../tutorials/extend/reward_model` 完成训练，再将得到的 checkpoint 接入该 ManiSkill 配置。
+如果还需要先训练 ResNet reward model，请先按 :doc:`/rst_source/tutorials/extend/reward_model` 完成训练，再将得到的 checkpoint 接入该 ManiSkill 配置。

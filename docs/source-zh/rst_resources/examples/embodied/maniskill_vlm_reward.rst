@@ -11,8 +11,8 @@ ManiSkill PPO（基于 VLM Reward Model）
 
 在开始前，建议先阅读：
 
-1. :doc:`maniskill` 以熟悉基础 ManiSkill PPO 训练流程。
-2. :doc:`sft_vlm` 如果你需要准备或微调 reward worker 所使用的 Qwen3-VL checkpoint 或 LoRA。
+1. :doc:`/rst_source/examples/embodied/maniskill` 以熟悉基础 ManiSkill PPO 训练流程。
+2. :doc:`/rst_source/examples/embodied/sft_vlm` 如果你需要准备或微调 reward worker 所使用的 Qwen3-VL checkpoint 或 LoRA。
 
 配置概览
 --------

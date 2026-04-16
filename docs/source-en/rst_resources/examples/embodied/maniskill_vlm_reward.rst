@@ -11,8 +11,8 @@ Related configs in the same family are:
 
 Before getting started, it is recommended to read:
 
-1. :doc:`maniskill` to understand the base ManiSkill PPO pipeline.
-2. :doc:`sft_vlm` if you need to prepare or fine-tune the Qwen3-VL checkpoint or LoRA used by the reward worker.
+1. :doc:`/rst_source/examples/embodied/maniskill` to understand the base ManiSkill PPO pipeline.
+2. :doc:`/rst_source/examples/embodied/sft_vlm` if you need to prepare or fine-tune the Qwen3-VL checkpoint or LoRA used by the reward worker.
 
 Configuration Overview
 ----------------------
