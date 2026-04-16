@@ -45,7 +45,21 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         critic=None,
         reward=None,
     ):
-        super().__init__(cfg, actor, rollout, env, critic, reward)
+        if reward is not None and cfg.get("reward", {}).get("use_output_step", 0) != 0:
+            raise ValueError(
+                "Async PPO with reward workers only supports reward.use_output_step=0. "
+                "Delayed reward activation is not implemented for the long-running "
+                "async env/rollout pipeline."
+            )
+
+        super().__init__(
+            cfg=cfg,
+            actor=actor,
+            rollout=rollout,
+            env=env,
+            reward=reward,
+            critic=critic,
+        )
         self.env_metric_channel = Channel.create("EnvMetric")
         self.rollout_metric_channel = Channel.create("RolloutMetric")
         self.recompute_logprobs = bool(self.cfg.rollout.get("recompute_logprobs", True))
@@ -104,6 +118,18 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         self.actor.sync_model_to_rollout().wait()
         rollout_handle.wait()
 
+    def _start_reward_worker(self) -> Handle | None:
+        if self.reward is None:
+            return None
+
+        print(f"Activating reward worker at step {self.global_step}")
+        self.reward_channel = Channel.create("Reward")
+        self.reward_initialized = True
+        return self.reward.compute_rewards_async(
+            input_channel=self.reward_channel,
+            output_channel=self.env_channel,
+        )
+
     def run(self) -> None:
         start_step = self.global_step
         start_time = time.time()
@@ -111,6 +137,7 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         self.actor.set_global_step(self.global_step).wait()
         self.rollout.set_global_step(self.global_step).wait()
         self.update_rollout_weights()
+        reward_handle = self._start_reward_worker()
 
         env_handle: Handle = self.env.interact(
             input_channel=self.env_channel,
@@ -255,6 +282,9 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
 
         self.env.stop().wait()
         self.rollout.stop().wait()
+        if self.reward is not None:
+            self.reward.stop().wait()
+            reward_handle.wait()
 
         env_handle.wait()
         rollout_handle.wait()

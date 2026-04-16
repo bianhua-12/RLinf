@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from rlinf.models.embodiment.reward.vlm_reward_utils.input_builder import (
     RobochanallengeInputBuilder,
+    SimpleDualViewTernaryInputBuilder,
     VideoVLMInputBuilder,
 )
 
@@ -151,3 +152,60 @@ def test_robochallenge_prepare_inputs_aligns_selected_envs_and_video_order():
     assert [frame.getpixel((0, 0))[0] for frame in clip_video_env_1] == [12, 13]
     assert [frame.getpixel((0, 0))[0] for frame in full_video_env_3] == [30, 31, 32, 33]
     assert [frame.getpixel((0, 0))[0] for frame in clip_video_env_3] == [32, 33]
+
+
+def test_simple_dualview_builder_accepts_main_and_extra_view_history():
+    builder = SimpleDualViewTernaryInputBuilder(
+        _processor=None,
+        history_buffer_names=["history_window"],
+    )
+    observations = {
+        "task_descriptions": ["task-0", "task-1"],
+        "extra_view_images": torch.zeros((2, 2, 2, 3), dtype=torch.uint8),
+    }
+    history_input = {
+        "history_window": {
+            "main_images": [
+                [_make_frame(0), _make_frame(1)],
+                [_make_frame(10), _make_frame(11)],
+            ],
+            "extra_view_images": [
+                [_make_frame(100), _make_frame(101)],
+                [_make_frame(110), _make_frame(111)],
+            ],
+        }
+    }
+
+    valid_input_ids = builder.get_valid_input_ids(observations, history_input)
+    prepared = builder.prepare_inputs(observations, history_input, valid_input_ids)
+
+    assert valid_input_ids == [0, 1]
+    videos_env_0 = prepared["videos_list"][0]
+    videos_env_1 = prepared["videos_list"][1]
+    assert [frame.getpixel((0, 0))[0] for frame in videos_env_0[0]] == [0, 1]
+    assert [frame.getpixel((0, 0))[0] for frame in videos_env_0[1]] == [100, 101]
+    assert [frame.getpixel((0, 0))[0] for frame in videos_env_1[0]] == [10, 11]
+    assert [frame.getpixel((0, 0))[0] for frame in videos_env_1[1]] == [110, 111]
+
+
+def test_simple_dualview_builder_logs_missing_extra_view_when_valid_ids_empty(caplog):
+    builder = SimpleDualViewTernaryInputBuilder(
+        _processor=None,
+        history_buffer_names=["history_window"],
+    )
+    observations = {
+        "task_descriptions": ["task-0"],
+        "extra_view_images": None,
+    }
+    history_input = {
+        "history_window": {
+            "main_images": [[_make_frame(0), _make_frame(1)]],
+            "extra_view_images": [[]],
+        }
+    }
+
+    with caplog.at_level("WARNING"):
+        valid_input_ids = builder.get_valid_input_ids(observations, history_input)
+
+    assert valid_input_ids == []
+    assert "observations.extra_view_images is None" in caplog.text

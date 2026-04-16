@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, OrderedDict, Union
+import logging
+from collections import OrderedDict
+from typing import Optional, Union
 
 import gymnasium as gym
 import numpy as np
@@ -26,6 +28,8 @@ from omegaconf import open_dict
 from omegaconf.omegaconf import OmegaConf
 
 __all__ = ["ManiskillEnv"]
+
+logger = logging.getLogger(__name__)
 
 
 def extract_termination_from_info(info, num_envs, device):
@@ -82,6 +86,7 @@ class ManiskillEnv(gym.Env):
         self._show_goal_site_visual()
         if self.record_metrics:
             self._init_metrics()
+        self._warned_missing_extra_view_images = False
 
     @property
     def total_num_group_envs(self):
@@ -115,6 +120,7 @@ class ManiskillEnv(gym.Env):
     def extra_instructions(self):
         EXTRA_INSTRUCTION_MAP = {
             "PickCube-v1": "Pick up the red cube and place it on the green spot on the table.",
+            "PickCubeDualView-v1": "Pick up the red cube and place it on the green spot on the table.",
             # TODO: add more instructions for other tasks
         }
         return EXTRA_INSTRUCTION_MAP
@@ -155,6 +161,87 @@ class ManiskillEnv(gym.Env):
         if hasattr(goal_site, "show_visual"):
             goal_site.show_visual()
 
+    def _normalize_extra_view_images(
+        self, extra_view_images: torch.Tensor | np.ndarray | None
+    ) -> torch.Tensor | None:
+        if extra_view_images is None:
+            return None
+        if isinstance(extra_view_images, np.ndarray):
+            extra_view_images = torch.from_numpy(extra_view_images)
+        if extra_view_images.ndim == 3:
+            extra_view_images = extra_view_images.unsqueeze(0)
+        elif extra_view_images.ndim == 5:
+            extra_view_images = extra_view_images[:, 0]
+        if extra_view_images.ndim != 4:
+            raise ValueError(
+                "Expected extra_view_images to have shape [B, H, W, C], "
+                f"got {tuple(extra_view_images.shape)}."
+            )
+        return extra_view_images.to(torch.uint8)
+
+    def _get_extra_sensor_view(
+        self, sensor_data: dict[str, dict[str, torch.Tensor]]
+    ) -> torch.Tensor | None:
+        sorted_images = OrderedDict(sorted(sensor_data.items()))
+        sorted_images.pop("base_camera", None)
+        for sensor_outputs in sorted_images.values():
+            sensor_rgb = sensor_outputs.get("rgb", None)
+            if sensor_rgb is None:
+                continue
+            return self._normalize_extra_view_images(sensor_rgb)
+        return None
+
+    def _get_render_camera_view(self) -> torch.Tensor | None:
+        scene = getattr(self.env.unwrapped, "scene", None)
+        if scene is None:
+            return None
+
+        update_render_fn = getattr(scene, "update_render", None)
+        if callable(update_render_fn):
+            try:
+                update_render_fn(
+                    update_sensors=False,
+                    update_human_render_cameras=True,
+                )
+            except TypeError:
+                update_render_fn()
+
+        get_human_render_camera_images_fn = getattr(
+            scene, "get_human_render_camera_images", None
+        )
+        if callable(get_human_render_camera_images_fn):
+            render_images = get_human_render_camera_images_fn("render_camera")
+            if isinstance(render_images, dict):
+                render_images = render_images.get("render_camera")
+            normalized = self._normalize_extra_view_images(render_images)
+            if normalized is not None:
+                return normalized
+
+        render_rgb_array_fn = getattr(self.env.unwrapped, "render_rgb_array", None)
+        if callable(render_rgb_array_fn):
+            return self._normalize_extra_view_images(render_rgb_array_fn("render_camera"))
+
+        return None
+
+    def _get_extra_view_images(
+        self, sensor_data: dict[str, dict[str, torch.Tensor]]
+    ) -> torch.Tensor | None:
+        extra_view_images = self._get_extra_sensor_view(sensor_data)
+        if extra_view_images is not None:
+            return extra_view_images
+
+        extra_view_images = self._get_render_camera_view()
+        if extra_view_images is not None:
+            return extra_view_images
+
+        if not self._warned_missing_extra_view_images:
+            logger.warning(
+                "ManiskillEnv could not provide extra_view_images from sensor_data or "
+                "render_camera. Dual-view reward models will receive no second view."
+            )
+            self._warned_missing_extra_view_images = True
+        return None
+
     def _wrap_obs(self, raw_obs, infos=None):
         wrap_obs_mode = getattr(self.cfg, "wrap_obs_mode", "default")
         if wrap_obs_mode == "raw":
@@ -175,13 +262,7 @@ class ManiskillEnv(gym.Env):
                     )
 
                 main_images = sensor_data["base_camera"]["rgb"]
-                sorted_images = OrderedDict(sorted(sensor_data.items()))
-                sorted_images.pop("base_camera")
-                extra_view_images = (
-                    torch.stack([v["rgb"] for v in sorted_images.values()], dim=1)
-                    if sorted_images
-                    else None
-                )
+                extra_view_images = self._get_extra_view_images(sensor_data)
                 obs = {
                     "main_images": main_images,
                     "extra_view_images": extra_view_images,
