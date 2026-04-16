@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Compare a trained MLP value head against Qwen-VL reward on ManiSkill rollouts."""
 
 from __future__ import annotations
@@ -21,7 +35,6 @@ from PIL import Image, ImageDraw
 from rlinf.envs.maniskill.maniskill_env import ManiskillEnv
 from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
 from rlinf.models.embodiment.reward import get_reward_model_class
-
 
 DEFAULT_ACTOR_CKPT = (
     "logs/20260411-20:03:49-maniskill_ppo_mlp/maniskill_ppo_mlp/"
@@ -183,7 +196,9 @@ def zero_rewards_by_env(num_envs: int) -> list[list[float]]:
     return [[0.0] for _ in range(num_envs)]
 
 
-def append_images(history: list[list[torch.Tensor]], images: torch.Tensor, max_len: int) -> None:
+def append_images(
+    history: list[list[torch.Tensor]], images: torch.Tensor, max_len: int
+) -> None:
     images = images.detach().cpu()
     for env_id in range(images.shape[0]):
         history[env_id].append(images[env_id].clone())
@@ -191,7 +206,9 @@ def append_images(history: list[list[torch.Tensor]], images: torch.Tensor, max_l
             del history[env_id][0 : len(history[env_id]) - max_len]
 
 
-def append_values(history: list[list[float]], values: torch.Tensor, max_len: int) -> None:
+def append_values(
+    history: list[list[float]], values: torch.Tensor, max_len: int
+) -> None:
     values = values.detach().float().cpu().reshape(-1)
     for env_id in range(values.shape[0]):
         history[env_id].append(float(values[env_id].item()))
@@ -199,7 +216,9 @@ def append_values(history: list[list[float]], values: torch.Tensor, max_len: int
             del history[env_id][0 : len(history[env_id]) - max_len]
 
 
-def append_rewards(history: list[list[float]], rewards: list[Any], max_len: int) -> None:
+def append_rewards(
+    history: list[list[float]], rewards: list[Any], max_len: int
+) -> None:
     for env_id, reward in enumerate(rewards):
         history[env_id].append(float(reward))
         if len(history[env_id]) > max_len:
@@ -268,7 +287,9 @@ def save_history_clip(
     return str(rel_path)
 
 
-def window_stats(values: list[float], rewards: list[float], window_size: int) -> dict[str, float]:
+def window_stats(
+    values: list[float], rewards: list[float], window_size: int
+) -> dict[str, float]:
     value_window = list(values)
     reward_window = list(rewards)
     while len(value_window) < window_size:
@@ -288,7 +309,9 @@ def window_stats(values: list[float], rewards: list[float], window_size: int) ->
 
 
 @torch.inference_mode()
-def qwen_generate_with_text(model, reward_input: dict[str, Any]) -> tuple[torch.Tensor, list[str]]:
+def qwen_generate_with_text(
+    model, reward_input: dict[str, Any]
+) -> tuple[torch.Tensor, list[str]]:
     history_input = reward_input["history_input"]
     observations = {
         key: value for key, value in reward_input.items() if key != "history_input"
@@ -325,7 +348,9 @@ def qwen_generate_with_text(model, reward_input: dict[str, Any]) -> tuple[torch.
     return torch.cat(all_rewards, dim=0), all_outputs
 
 
-def write_outputs(output_dir: Path, records: list[StepRecord], metadata: dict[str, Any]) -> None:
+def write_outputs(
+    output_dir: Path, records: list[StepRecord], metadata: dict[str, Any]
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = {"metadata": metadata, "records": [asdict(record) for record in records]}
     with (output_dir / "value_qwen_compare.pkl").open("wb") as f:
@@ -333,7 +358,9 @@ def write_outputs(output_dir: Path, records: list[StepRecord], metadata: dict[st
     with (output_dir / "value_qwen_compare.jsonl").open("w", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
-    with (output_dir / "value_qwen_compare.csv").open("w", newline="", encoding="utf-8") as f:
+    with (output_dir / "value_qwen_compare.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as f:
         writer = csv.DictWriter(f, fieldnames=list(asdict(records[0]).keys()))
         writer.writeheader()
         for record in records:
@@ -366,7 +393,9 @@ def main() -> None:
     )
     obs, _ = env.reset()
     initial_states = obs["states"].to(device=device, dtype=torch.float32)
-    initial_values = value_model.value_head(initial_states).detach().float().cpu().reshape(-1)
+    initial_values = (
+        value_model.value_head(initial_states).detach().float().cpu().reshape(-1)
+    )
     image_history = clone_images_by_env(obs["main_images"])
     value_history = clone_values_by_env(initial_values)
     reward_history = zero_rewards_by_env(args.num_envs)
@@ -409,7 +438,9 @@ def main() -> None:
                 qwen_reward_model, reward_input
             )
 
-        success = tensor_to_list(infos.get("success", torch.zeros(args.num_envs, dtype=torch.bool)))
+        success = tensor_to_list(
+            infos.get("success", torch.zeros(args.num_envs, dtype=torch.bool))
+        )
         reward_values = tensor_to_list(reward)
         append_rewards(reward_history, reward_values, args.history_size)
         term_values = tensor_to_list(terminations)
@@ -485,9 +516,7 @@ def main() -> None:
         if (step + 1) % 10 == 0 or step == 0:
             latest = records[-args.num_envs :]
             mean_value = sum(r.value_1000 for r in latest) / len(latest)
-            mean_qwen = [
-                r.qwen_reward for r in latest if r.qwen_reward is not None
-            ]
+            mean_qwen = [r.qwen_reward for r in latest if r.qwen_reward is not None]
             mean_qwen_text = (
                 "nan" if not mean_qwen else f"{sum(mean_qwen) / len(mean_qwen):.4f}"
             )

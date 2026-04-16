@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Analyze online ManiSkill trajectories with env/value/Qwen reward agreement."""
 
 from __future__ import annotations
@@ -23,7 +37,6 @@ from transformers import AutoModelForVision2Seq, AutoProcessor
 from rlinf.data.datasets.vlm import SimpleRobochallengeSFTDataset
 from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
 from rlinf.models.embodiment.reward import get_reward_model_class
-
 
 DEFAULT_VALUE_CKPT = (
     "logs/20260411-20:03:49-maniskill_ppo_mlp/maniskill_ppo_mlp/"
@@ -189,15 +202,15 @@ def load_direct_qwen(
         key.removeprefix("module."): value
         for key, value in checkpoint_state_dict.items()
     }
-    if checkpoint_state_dict and all(key.startswith("model.") for key in checkpoint_state_dict):
+    if checkpoint_state_dict and all(
+        key.startswith("model.") for key in checkpoint_state_dict
+    ):
         checkpoint_state_dict = {
             key.removeprefix("model."): value
             for key, value in checkpoint_state_dict.items()
         }
     lora_state_dict = {
-        key: value
-        for key, value in checkpoint_state_dict.items()
-        if "lora_" in key
+        key: value for key, value in checkpoint_state_dict.items() if "lora_" in key
     }
 
     if lora_state_dict:
@@ -277,7 +290,9 @@ def parse_output_label(text: str) -> str:
 
 
 @torch.inference_mode()
-def qwen_generate_with_text(model, reward_input: dict[str, Any]) -> tuple[torch.Tensor, list[str]]:
+def qwen_generate_with_text(
+    model, reward_input: dict[str, Any]
+) -> tuple[torch.Tensor, list[str]]:
     history_input = reward_input["history_input"]
     observations = {
         key: value for key, value in reward_input.items() if key != "history_input"
@@ -323,7 +338,9 @@ def generate_direct_qwen(
     prompt: str,
     max_new_tokens: int,
 ) -> str:
-    pil_frames = [Image.fromarray(to_uint8_rgb(frame)).convert("RGB") for frame in frames]
+    pil_frames = [
+        Image.fromarray(to_uint8_rgb(frame)).convert("RGB") for frame in frames
+    ]
     _, inputs, _ = SimpleRobochallengeSFTDataset.process_inputs(
         processor=processor,
         system_prompt=None,
@@ -377,8 +394,8 @@ def save_clip(
             else:
                 rendered = to_uint8_rgb(
                     draw_overlay(
-                    frame,
-                    [f"input_frame={frame_idx + 1}/{len(frames)}"] + overlay_lines,
+                        frame,
+                        [f"input_frame={frame_idx + 1}/{len(frames)}"] + overlay_lines,
                     )
                 )
             for _ in range(render_frame_repeat):
@@ -453,12 +470,16 @@ def summarize_records(records: list[WindowRecord]) -> dict[str, Any]:
     return summary
 
 
-def write_outputs(output_dir: Path, records: list[WindowRecord], metadata: dict[str, Any]) -> None:
+def write_outputs(
+    output_dir: Path, records: list[WindowRecord], metadata: dict[str, Any]
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = {"metadata": metadata, "records": [asdict(record) for record in records]}
     with (output_dir / "online_reward_agreement.pkl").open("wb") as f:
         pickle.dump(payload, f)
-    with (output_dir / "online_reward_agreement.jsonl").open("w", encoding="utf-8") as f:
+    with (output_dir / "online_reward_agreement.jsonl").open(
+        "w", encoding="utf-8"
+    ) as f:
         for record in records:
             f.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
     if records:
@@ -486,7 +507,9 @@ def main() -> None:
 
     value_model = load_mlp(args.value_ckpt, args.value_device)
     reward_cls = get_reward_model_class("history_vlm")
-    wrapper_qwen = reward_cls(build_wrapper_qwen_cfg(args)).to(args.wrapper_device).eval()
+    wrapper_qwen = (
+        reward_cls(build_wrapper_qwen_cfg(args)).to(args.wrapper_device).eval()
+    )
     direct_processor, direct_model = load_direct_qwen(
         abs_path(args.qwen_model_path),
         abs_path(args.qwen_lora_path),
@@ -535,7 +558,9 @@ def main() -> None:
             )
 
         window_payloads: list[dict[str, Any]] = []
-        for start in range(0, len(observations) - args.window_size + 1, args.window_stride):
+        for start in range(
+            0, len(observations) - args.window_size + 1, args.window_stride
+        ):
             if args.max_windows > 0 and global_window_count >= args.max_windows:
                 break
             end = start + args.window_size
@@ -569,7 +594,9 @@ def main() -> None:
                 }
             },
         }
-        wrapper_rewards, wrapper_outputs = qwen_generate_with_text(wrapper_qwen, reward_input)
+        wrapper_rewards, wrapper_outputs = qwen_generate_with_text(
+            wrapper_qwen, reward_input
+        )
 
         for local_idx, payload in enumerate(window_payloads):
             direct_output = generate_direct_qwen(
@@ -594,7 +621,9 @@ def main() -> None:
                 safe_episode_stem = episode_stem.replace("/", "_")
                 rank_str = "00"
                 if "rank_" in episode_stem:
-                    rank_str = episode_stem.split("rank_", maxsplit=1)[1].split("_", maxsplit=1)[0]
+                    rank_str = episode_stem.split("rank_", maxsplit=1)[1].split(
+                        "_", maxsplit=1
+                    )[0]
                 base_name = (
                     f"{safe_episode_stem}"
                     f"_rank_{int(rank_str):02d}"

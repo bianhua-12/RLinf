@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Build a dual-view GAE-delta ternary dataset by reusing existing clip videos."""
 
 from __future__ import annotations
@@ -123,7 +137,9 @@ def build_dualview_record(
     gae_delta = end_gae - start_gae
     label = ternary_label(gae_delta, delta_threshold)
 
-    primary_clip_path = absolutize_clip_path(source_dataset_dir, primary_row["clip_path"])
+    primary_clip_path = absolutize_clip_path(
+        source_dataset_dir, primary_row["clip_path"]
+    )
     secondary_clip_path = absolutize_clip_path(
         source_dataset_dir, secondary_row["clip_path"]
     )
@@ -213,7 +229,9 @@ def main() -> None:
                 episode_id, _, _ = key
                 views = grouped_rows[key]
                 if primary_view_index not in views:
-                    raise ValueError(f"Missing primary view {primary_view_index} for {key}")
+                    raise ValueError(
+                        f"Missing primary view {primary_view_index} for {key}"
+                    )
                 for secondary_view_index in secondary_view_indices:
                     if secondary_view_index not in views:
                         raise ValueError(

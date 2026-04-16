@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Compare actor100 rollouts with dual-view ternary Qwen reward and value1000."""
 
 from __future__ import annotations
@@ -6,7 +20,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import pickle
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -25,7 +38,6 @@ from rlinf.models.embodiment.reward import get_reward_model_class
 from rlinf.models.embodiment.reward.vlm_reward_utils.reward_parser import (
     _parse_ternary_output,
 )
-
 
 DEFAULT_ACTOR_CKPT = (
     "logs/20260411-20:03:49-maniskill_ppo_mlp/maniskill_ppo_mlp/"
@@ -71,7 +83,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--value-ckpt", default=DEFAULT_VALUE_CKPT)
     parser.add_argument("--qwen-model-path", default=DEFAULT_QWEN_MODEL)
     parser.add_argument("--qwen-lora-path", default=DEFAULT_QWEN_LORA)
-    parser.add_argument("--output-dir", default="logs/maniskill_actor100_dualview_reward_compare")
+    parser.add_argument(
+        "--output-dir", default="logs/maniskill_actor100_dualview_reward_compare"
+    )
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
@@ -200,7 +214,9 @@ def _render_extra_view_batch(env: Any) -> torch.Tensor | None:
     for target in (
         getattr(env, "env", None),
         getattr(getattr(env, "env", None), "unwrapped", None),
-        getattr(getattr(getattr(env, "unwrapped", None), "env", None), "unwrapped", None),
+        getattr(
+            getattr(getattr(env, "unwrapped", None), "env", None), "unwrapped", None
+        ),
         getattr(env, "unwrapped", None),
         env,
     ):
@@ -266,7 +282,9 @@ def clone_values_by_env(values: torch.Tensor) -> list[list[float]]:
     return [[float(values[i].item())] for i in range(values.shape[0])]
 
 
-def append_frames(history: list[list[torch.Tensor]], frames: torch.Tensor, max_len: int) -> None:
+def append_frames(
+    history: list[list[torch.Tensor]], frames: torch.Tensor, max_len: int
+) -> None:
     frames = frames.detach().cpu()
     for env_id in range(frames.shape[0]):
         history[env_id].append(frames[env_id].clone())
@@ -274,7 +292,9 @@ def append_frames(history: list[list[torch.Tensor]], frames: torch.Tensor, max_l
             del history[env_id][0 : len(history[env_id]) - max_len]
 
 
-def append_values(history: list[list[float]], values: torch.Tensor, max_len: int) -> None:
+def append_values(
+    history: list[list[float]], values: torch.Tensor, max_len: int
+) -> None:
     values = values.detach().float().cpu().reshape(-1)
     for env_id in range(values.shape[0]):
         history[env_id].append(float(values[env_id].item()))
@@ -290,7 +310,9 @@ def to_uint8_rgb(image: torch.Tensor | Any) -> np.ndarray:
     return image[..., :3]
 
 
-def render_dualview_frame(main_frame: Any, third_frame: Any, lines: list[str] | None = None) -> np.ndarray:
+def render_dualview_frame(
+    main_frame: Any, third_frame: Any, lines: list[str] | None = None
+) -> np.ndarray:
     main_np = to_uint8_rgb(main_frame)
     third_np = to_uint8_rgb(third_frame)
     combined = np.concatenate([main_np, third_np], axis=1)
@@ -333,7 +355,9 @@ def save_dualview_clip(
     clip_path = output_dir / rel_path
     clip_path.parent.mkdir(parents=True, exist_ok=True)
     with imageio.get_writer(clip_path, fps=fps) as writer:
-        for frame_idx, (main_frame, third_frame) in enumerate(zip(main_frames, third_frames)):
+        for frame_idx, (main_frame, third_frame) in enumerate(
+            zip(main_frames, third_frames)
+        ):
             frame_lines = None
             if overlay_lines is not None:
                 frame_lines = [f"input_frame={frame_idx + 1}/{history_size}"]
@@ -370,8 +394,12 @@ def build_direct_inputs(
     ]
     videos = []
     for env_id in valid_ids:
-        main_frames = [Image.fromarray(to_uint8_rgb(frame)) for frame in main_history[env_id]]
-        third_frames = [Image.fromarray(to_uint8_rgb(frame)) for frame in third_history[env_id]]
+        main_frames = [
+            Image.fromarray(to_uint8_rgb(frame)) for frame in main_history[env_id]
+        ]
+        third_frames = [
+            Image.fromarray(to_uint8_rgb(frame)) for frame in third_history[env_id]
+        ]
         videos.append([main_frames, third_frames])
 
     _, full_inputs, _ = RoboChallengeProgressSFTDataset.process_inputs(
@@ -386,7 +414,9 @@ def build_direct_inputs(
 
 
 @torch.inference_mode()
-def qwen_generate_with_text(model, reward_input: dict[str, Any]) -> tuple[torch.Tensor, list[str]]:
+def qwen_generate_with_text(
+    model, reward_input: dict[str, Any]
+) -> tuple[torch.Tensor, list[str]]:
     history_input = reward_input["history_input"]
     observations = {
         key: value for key, value in reward_input.items() if key != "history_input"
@@ -447,7 +477,9 @@ def direct_generate_with_text(
             valid_ids,
         )
         inputs = {
-            key: value.to(model._model.device) if isinstance(value, torch.Tensor) else value
+            key: value.to(model._model.device)
+            if isinstance(value, torch.Tensor)
+            else value
             for key, value in inputs.items()
         }
         prompt_length = inputs["input_ids"].shape[-1]
@@ -463,15 +495,21 @@ def direct_generate_with_text(
     return all_scores, all_labels, all_outputs
 
 
-def write_outputs(output_dir: Path, records: list[CompareRecord], metadata: dict[str, Any]) -> None:
+def write_outputs(
+    output_dir: Path, records: list[CompareRecord], metadata: dict[str, Any]
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = {"metadata": metadata, "records": [asdict(record) for record in records]}
     with (output_dir / "dualview_reward_compare.pkl").open("wb") as f:
         pickle.dump(payload, f)
-    with (output_dir / "dualview_reward_compare.jsonl").open("w", encoding="utf-8") as f:
+    with (output_dir / "dualview_reward_compare.jsonl").open(
+        "w", encoding="utf-8"
+    ) as f:
         for record in records:
             f.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
-    with (output_dir / "dualview_reward_compare.csv").open("w", newline="", encoding="utf-8") as f:
+    with (output_dir / "dualview_reward_compare.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as f:
         writer = csv.DictWriter(f, fieldnames=list(asdict(records[0]).keys()))
         writer.writeheader()
         for record in records:
@@ -540,12 +578,16 @@ def main() -> None:
     )
     obs, _ = env.reset()
     initial_states = obs["states"].to(device=device, dtype=torch.float32)
-    initial_values = value_model.value_head(initial_states).detach().float().cpu().reshape(-1)
+    initial_values = (
+        value_model.value_head(initial_states).detach().float().cpu().reshape(-1)
+    )
     extra_view_batch = _extract_extra_view(obs)
     if extra_view_batch is None:
         extra_view_batch = _render_extra_view_batch(env)
     if extra_view_batch is None:
-        raise ValueError("Unable to obtain dual-view render_camera frames from environment.")
+        raise ValueError(
+            "Unable to obtain dual-view render_camera frames from environment."
+        )
     main_history = clone_frames_by_env(obs["main_images"])
     third_history = clone_frames_by_env(extra_view_batch)
     value_history = clone_values_by_env(initial_values)
@@ -553,15 +595,21 @@ def main() -> None:
 
     for step in range(args.steps):
         states = obs["states"].to(device=device, dtype=torch.float32)
-        actions, _, _, _ = actor._generate_actions(states, mode="eval", calculate_values=True)
+        actions, _, _, _ = actor._generate_actions(
+            states, mode="eval", calculate_values=True
+        )
         obs, reward, terminations, truncations, infos = env.step(actions.to(env.device))
         next_states = obs["states"].to(device=device, dtype=torch.float32)
-        value_after_step = value_model.value_head(next_states).detach().float().cpu().reshape(-1)
+        value_after_step = (
+            value_model.value_head(next_states).detach().float().cpu().reshape(-1)
+        )
         extra_view_batch = _extract_extra_view(obs)
         if extra_view_batch is None:
             extra_view_batch = _render_extra_view_batch(env)
         if extra_view_batch is None:
-            raise ValueError("Unable to obtain dual-view render_camera frames from environment.")
+            raise ValueError(
+                "Unable to obtain dual-view render_camera frames from environment."
+            )
         append_frames(main_history, obs["main_images"], args.history_size)
         append_frames(third_history, extra_view_batch, args.history_size)
         append_values(value_history, value_after_step, args.history_size)
@@ -586,11 +634,13 @@ def main() -> None:
             reward_scores_tensor, reward_outputs = qwen_generate_with_text(
                 qwen_reward_model, reward_input
             )
-            direct_score_list, direct_label_list, direct_output_list = direct_generate_with_text(
-                qwen_reward_model,
-                list(map(str, obs["task_descriptions"])),
-                main_history,
-                third_history,
+            direct_score_list, direct_label_list, direct_output_list = (
+                direct_generate_with_text(
+                    qwen_reward_model,
+                    list(map(str, obs["task_descriptions"])),
+                    main_history,
+                    third_history,
+                )
             )
             for env_id in range(args.num_envs):
                 qwen_scores[env_id] = float(reward_scores_tensor[env_id].item())
@@ -690,7 +740,11 @@ def main() -> None:
             reward_mean = [
                 r.reward_model_score for r in latest if r.reward_model_score is not None
             ]
-            reward_text = "nan" if not reward_mean else f"{sum(reward_mean) / len(reward_mean):.4f}"
+            reward_text = (
+                "nan"
+                if not reward_mean
+                else f"{sum(reward_mean) / len(reward_mean):.4f}"
+            )
             print(
                 f"step={step + 1}/{args.steps} value_delta_mean={value_mean:+.4f} "
                 f"reward_model_mean={reward_text}",

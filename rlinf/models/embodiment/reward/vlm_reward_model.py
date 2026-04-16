@@ -146,8 +146,8 @@ def load_reward_checkpoint_into_model(
     model: Any,
     checkpoint_path: str,
 ) -> tuple[Any, dict[str, str]]:
-    resolved_checkpoint_path, checkpoint_state_dict = _load_reward_checkpoint_state_dict(
-        checkpoint_path
+    resolved_checkpoint_path, checkpoint_state_dict = (
+        _load_reward_checkpoint_state_dict(checkpoint_path)
     )
     lora_state_dict = _extract_lora_state_dict(checkpoint_state_dict)
     if lora_state_dict:

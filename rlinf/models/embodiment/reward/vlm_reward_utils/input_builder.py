@@ -467,7 +467,9 @@ class SimpleDualViewTernaryInputBuilder(VideoVLMInputBuilder):
             if len(task_description or "") > 0
         ]
         history_valid_ids = [
-            env_idx for env_idx in history_valid_ids if env_idx in observations_valid_ids
+            env_idx
+            for env_idx in history_valid_ids
+            if env_idx in observations_valid_ids
         ]
 
         for history_buffer_name in self.history_buffer_names:
