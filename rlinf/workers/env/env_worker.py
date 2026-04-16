@@ -64,7 +64,9 @@ class EnvWorker(Worker):
         self.stage_num = self.cfg.rollout.pipeline_stage_num
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
-        self.history_reward_assign = self.cfg.get("reward", {}).get("history_reward_assign", True)
+        self.history_reward_assign = self.cfg.get("reward", {}).get(
+            "history_reward_assign", True
+        )
         self.use_reward_model = self.cfg.get("reward", {}).get(
             "use_reward_model", False
         )
@@ -251,9 +253,6 @@ class EnvWorker(Worker):
                     fps=getattr(env_cfg.data_collection, "fps", 10),
                     only_success=getattr(
                         env_cfg.data_collection, "only_success", False
-                    ),
-                    stats_sample_ratio=getattr(
-                        env_cfg.data_collection, "stats_sample_ratio", 0.1
                     ),
                     finalize_interval=getattr(
                         env_cfg.data_collection, "finalize_interval", 100
@@ -797,7 +796,9 @@ class EnvWorker(Worker):
                 raise ValueError("stage_id is required for history-buffer reward.")
             history_manager = self.train_history_managers[stage_id]
             history_manager.append_to_history_entries(observations)
-            history_input, history_lengths = history_manager.build_history_input(dones=dones)
+            history_input, history_lengths = history_manager.build_history_input(
+                dones=dones
+            )
             reward_input["history_input"] = history_input
             self.history_lengths[stage_id] = dict(history_lengths)
 
@@ -838,15 +839,23 @@ class EnvWorker(Worker):
 
     def assign_history_reward(self, stage_id: int, reward_model_output: torch.Tensor):
         reward_assign_lengths = [
-            min(history_buffer_length[env_id] for history_buffer_length in self.history_lengths[stage_id].values())
+            min(
+                history_buffer_length[env_id]
+                for history_buffer_length in self.history_lengths[stage_id].values()
+            )
             for env_id in range(self.train_num_envs_per_stage)
         ]
         rollout_rewards = self.rollout_results[stage_id].rewards
         rollout_rewards_length = len(rollout_rewards)
-        reward_assign_lengths = [min(reward_assign_length, rollout_rewards_length) for reward_assign_length in reward_assign_lengths]
+        reward_assign_lengths = [
+            min(reward_assign_length, rollout_rewards_length)
+            for reward_assign_length in reward_assign_lengths
+        ]
         if not any(reward_assign_lengths):
             return
-        reward = (self.reward_weight * reward_model_output).to(rollout_rewards[-1].dtype)
+        reward = (self.reward_weight * reward_model_output).to(
+            rollout_rewards[-1].dtype
+        )
         for env_id, reward_assign_length in enumerate(reward_assign_lengths):
             for reward_assign_step in range(2, reward_assign_length + 1):
                 rollout_rewards[-reward_assign_step][env_id] += reward[env_id]
@@ -1009,7 +1018,11 @@ class EnvWorker(Worker):
                         rewards=rewards,
                     )
                     self.rollout_results[stage_id].append_step_result(chunk_step_result)
-                    if self.reward_mode == "history_buffer" and self.history_reward_assign and reward_model_output is not None:
+                    if (
+                        self.reward_mode == "history_buffer"
+                        and self.history_reward_assign
+                        and reward_model_output is not None
+                    ):
                         self.assign_history_reward(stage_id, reward_model_output)
                     if rollout_result.save_flags is not None:
                         self.rollout_results[stage_id].mark_last_step_with_flags(
@@ -1076,7 +1089,11 @@ class EnvWorker(Worker):
                     rewards=rewards,
                 )
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
-                if self.reward_mode == "history_buffer" and self.history_reward_assign and reward_model_output is not None:
+                if (
+                    self.reward_mode == "history_buffer"
+                    and self.history_reward_assign
+                    and reward_model_output is not None
+                ):
                     self.assign_history_reward(stage_id, reward_model_output)
 
             self.store_last_obs_and_intervened_info(env_outputs)

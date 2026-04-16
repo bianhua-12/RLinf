@@ -80,7 +80,9 @@ def split_dict_to_chunk(data: dict, split_size, dim=0):
     splited_list = [{} for _ in range(split_size)]
     for key, value in data.items():
         if isinstance(value, torch.Tensor):
-            split_vs = torch.chunk(value, split_size, dim=dim)
+            split_vs = [
+                chunk.contiguous() for chunk in torch.chunk(value, split_size, dim=dim)
+            ]
         elif value is None:
             split_vs = [None for _ in range(split_size)]
         elif isinstance(value, dict):
@@ -148,7 +150,7 @@ def cat_list_of_dict_tensor(list_of_dict: list, dim=0):
         elif isinstance(_v0, np.ndarray):
             ret[key] = np.concatenate([v for v in v_list if v is not None], axis=dim)
         elif isinstance(_v0, list):
-            assert dim == 0, (f"{key=} is list, dim !=0 is not supported!")
+            assert dim == 0, f"{key=} is list, dim !=0 is not supported!"
             ret[key] = [item for sub in v_list if sub is not None for item in sub]
         elif isinstance(_v0, dict):
             ret[key] = cat_list_of_dict_tensor(v_list, dim=dim)

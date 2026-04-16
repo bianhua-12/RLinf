@@ -16,24 +16,19 @@
 from __future__ import annotations
 
 import os
-
-import torch
-
-from omegaconf import DictConfig
-
 from typing import Any, Optional
 
-from transformers import AutoConfig, AutoModelForVision2Seq, AutoProcessor
-
+import torch
+from omegaconf import DictConfig
 from peft import (
     LoraConfig,
-    PeftModel,
     get_peft_model,
     set_peft_model_state_dict,
 )
+from transformers import AutoConfig, AutoModelForVision2Seq, AutoProcessor
 
 from rlinf.config import torch_dtype_from_precision
-
+from rlinf.models.embodiment.reward.base_reward_model import BaseRewardModel
 from rlinf.models.embodiment.reward.vlm_reward_utils.input_builder import (
     HistoryVLMInputBuilder,
     get_input_builder,
@@ -41,21 +36,6 @@ from rlinf.models.embodiment.reward.vlm_reward_utils.input_builder import (
 from rlinf.models.embodiment.reward.vlm_reward_utils.reward_parser import (
     get_reward_parser,
 )
-from rlinf.models.embodiment.reward.base_reward_model import BaseRewardModel
-
-
-def _normalize_checkpoint_state_dict(checkpoint_state_dict: dict[str, Any]) -> dict[str, Any]:
-    """Strip common wrapper prefixes from serialized checkpoint keys."""
-    normalized = {
-        key.removeprefix("module."): value
-        for key, value in checkpoint_state_dict.items()
-    }
-    if normalized and all(key.startswith("model.") for key in normalized):
-        normalized = {
-            key.removeprefix("model."): value
-            for key, value in normalized.items()
-        }
-    return normalized
 
 
 class VLMRewardModel(BaseRewardModel):
@@ -84,14 +64,14 @@ class VLMRewardModel(BaseRewardModel):
         self.gen_kwargs = {
             "max_new_tokens": int(cfg.get("max_new_tokens", 32)),
             "do_sample": bool(cfg.get("do_sample", True)),
-            "temperature": float(cfg.get("temperature", 0.0))
+            "temperature": float(cfg.get("temperature", 0.0)),
         }
-        
+
     def setup_processor(self) -> None:
         self._processor = AutoProcessor.from_pretrained(
             self.model_path, trust_remote_code=True
         )
-        self._setup_subprocessor( 
+        self._setup_subprocessor(
             subprocessor_kwargs=self.cfg.get("subprocessor_kwargs", {})
         )
 
@@ -109,18 +89,23 @@ class VLMRewardModel(BaseRewardModel):
                 if hasattr(subprocessoror, key):
                     setattr(subprocessoror, key, value)
 
-
     def setup_input_builder(self) -> None:
-        self.input_builder = get_input_builder(self.cfg.get("input_builder_name", "base_vlm_input_builder"))(**self.cfg.get("input_builder_params", {}), _processor=self._processor)
+        self.input_builder = get_input_builder(
+            self.cfg.get("input_builder_name", "base_vlm_input_builder")
+        )(**self.cfg.get("input_builder_params", {}), _processor=self._processor)
 
     def setup_reward_parser(self) -> None:
-        self.reward_parser = get_reward_parser(self.cfg.get("reward_parser_name", "base_reward_parser"))(**self.cfg.get("reward_parser_params", {}))
+        self.reward_parser = get_reward_parser(
+            self.cfg.get("reward_parser_name", "base_reward_parser")
+        )(**self.cfg.get("reward_parser_params", {}))
 
-    def forward(self, input_data: torch.Tensor, labels: Optional[torch.Tensor] = None) -> dict[str, Any]:
+    def forward(
+        self, input_data: torch.Tensor, labels: Optional[torch.Tensor] = None
+    ) -> dict[str, Any]:
         raise NotImplementedError(
             "VLMRewardModel is a frozen inference-time reward model; training via forward() is not supported."
         )
-    
+
     def setup_model(self) -> None:
         _ = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
 
@@ -131,48 +116,46 @@ class VLMRewardModel(BaseRewardModel):
         )
 
         if self.lora_path:
-            full_weights_path = os.path.join(self.lora_path, "actor", "model_state_dict", "full_weights.pt")
+            full_weights_path = os.path.join(
+                self.lora_path, "actor", "model_state_dict", "full_weights.pt"
+            )
 
             checkpoint_state_dict = torch.load(
                 full_weights_path,
                 map_location="cpu",
                 weights_only=True,
             )
-            checkpoint_state_dict = _normalize_checkpoint_state_dict(checkpoint_state_dict)
             lora_state_dict = {
-                key: value
+                key.removeprefix("module."): value
                 for key, value in checkpoint_state_dict.items()
                 if "lora_" in key
             }
-
-            if lora_state_dict:
-                lora_rank = next(
-                    int(value.shape[0])
-                    for key, value in lora_state_dict.items()
-                    if "lora_A" in key
-                )
-                target_modules = sorted(
-                    {
-                        key.split(".lora_")[0].split(".")[-1]
-                        for key in lora_state_dict
-                        if ".lora_" in key
-                    }
-                )
-
-                lora_config = LoraConfig(
-                    r=lora_rank,
-                    lora_alpha=lora_rank,
-                    lora_dropout=0.0,
-                    target_modules=target_modules,
-                    init_lora_weights="gaussian",
-                )
-                self._model = get_peft_model(self._model, lora_config)
-                set_peft_model_state_dict(self._model, lora_state_dict)
-            else:
-                self._model.load_state_dict(checkpoint_state_dict, strict=True)
             del checkpoint_state_dict
+
+            lora_rank = next(
+                int(value.shape[0])
+                for key, value in lora_state_dict.items()
+                if "lora_A" in key
+            )
+            target_modules = sorted(
+                {
+                    key.split(".lora_")[0].split(".")[-1]
+                    for key in lora_state_dict
+                    if ".lora_" in key
+                }
+            )
+
+            lora_config = LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_rank,
+                lora_dropout=0.0,
+                target_modules=target_modules,
+                init_lora_weights="gaussian",
+            )
+            self._model = get_peft_model(self._model, lora_config)
+            set_peft_model_state_dict(self._model, lora_state_dict)
             del lora_state_dict
-        
+
         self._model.eval()
 
     @torch.no_grad()
@@ -180,7 +163,9 @@ class VLMRewardModel(BaseRewardModel):
         self,
         observations: Any,
     ) -> torch.Tensor:
-        batched_inputs = self.input_builder.build_inputs(observations, self._model.device)
+        batched_inputs = self.input_builder.build_inputs(
+            observations, self._model.device
+        )
         prompt_length = batched_inputs["input_ids"].shape[-1]
         output_ids = self._model.generate(**batched_inputs, **self.gen_kwargs)
         del batched_inputs
@@ -190,22 +175,25 @@ class VLMRewardModel(BaseRewardModel):
         del output_ids
         return self.reward_parser.parse_rewards(outputs)
 
+
 class HistoryVLMRewardModel(VLMRewardModel):
     def __init__(self, cfg: DictConfig):
         self.history_buffer_names = list(cfg.history_buffers.keys())
-        self.infer_micro_batch_size: int = int(
-            cfg.get("infer_micro_batch_size", 0)
-        )
+        self.infer_micro_batch_size: int = int(cfg.get("infer_micro_batch_size", 0))
 
         super().__init__(cfg)
 
     def setup_input_builder(self) -> None:
         self.input_builder = get_input_builder(
             self.cfg.get("input_builder_name", "history_vlm_input_builder")
-        )(**self.cfg.get("input_builder_params", {}), _processor=self._processor, history_buffer_names=self.history_buffer_names)
-        assert isinstance(
-            self.input_builder, HistoryVLMInputBuilder
-        ), "HistoryVLMRewardModel only supports HistoryVLMInputBuilder"
+        )(
+            **self.cfg.get("input_builder_params", {}),
+            _processor=self._processor,
+            history_buffer_names=self.history_buffer_names,
+        )
+        assert isinstance(self.input_builder, HistoryVLMInputBuilder), (
+            "HistoryVLMRewardModel only supports HistoryVLMInputBuilder"
+        )
 
     def forward(
         self, input_data: torch.Tensor, labels: Optional[torch.Tensor] = None
@@ -236,16 +224,16 @@ class HistoryVLMRewardModel(VLMRewardModel):
     ) -> dict[str, Any]:
         sliced_observations = {}
         for observation_key, observation_values in observations.items():
-            sliced_observations.update(
-                {observation_key: observation_values[start:end]}
-            )
+            sliced_observations.update({observation_key: observation_values[start:end]})
         return sliced_observations
 
     def compute_reward(
         self,
         reward_input: dict[str, Any],
     ) -> torch.Tensor:
-        history_input: dict[str, dict[str, list[list[Any]]]] = reward_input.pop("history_input")
+        history_input: dict[str, dict[str, list[list[Any]]]] = reward_input.pop(
+            "history_input"
+        )
         input_batch_size = len(next(iter(next(iter(history_input.values())).values())))
         observations = reward_input
 
@@ -276,9 +264,10 @@ class HistoryVLMRewardModel(VLMRewardModel):
             )
             del output_ids
 
-            reward_chunk[valid_input_ids] = self.reward_parser.parse_rewards(outputs).to(dtype=torch.float32)
+            reward_chunk[valid_input_ids] = self.reward_parser.parse_rewards(
+                outputs
+            ).to(dtype=torch.float32)
             reward_chunks.append(reward_chunk)
             del outputs
 
         return torch.cat(reward_chunks, dim=0)
-        

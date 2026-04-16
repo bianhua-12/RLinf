@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import ast
-import copy
 import json
 import logging
 import os
@@ -714,184 +713,6 @@ class Robo2VLMSFTDataset(Robo2VLMDataset):
         )
 
 
-@VLMDatasetRegistry.register("qwen_vl_video_sft")
-class QwenVLVideoSFTDataset(Robo2VLMSFTDataset):
-    """SFT dataset for Qwen-VL video conversations stored as JSON messages."""
-
-    def _resolve_video_paths(
-        self, messages: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        resolved = copy.deepcopy(messages)
-        video_root = self.cfg.data.get("video_root", None)
-        if video_root is not None:
-            video_root = os.path.abspath(str(video_root))
-
-        for message in resolved:
-            content = message.get("content", [])
-            if not isinstance(content, list):
-                continue
-            for item in content:
-                if not isinstance(item, dict) or "video" not in item:
-                    continue
-                video_path = item["video"]
-                if not isinstance(video_path, str) or not video_path:
-                    continue
-                if video_path.startswith(("http://", "https://", "file://")):
-                    continue
-                if not os.path.isabs(video_path):
-                    if video_root is None:
-                        raise ValueError(
-                            "Relative video path found, but data.video_root is not set: "
-                            f"{video_path}"
-                        )
-                    video_path = os.path.join(video_root, video_path)
-                item["video"] = video_path
-                for cfg_key, item_key in (
-                    ("video_nframes", "nframes"),
-                    ("video_fps", "fps"),
-                    ("video_min_pixels", "min_pixels"),
-                    ("video_max_pixels", "max_pixels"),
-                    ("video_total_pixels", "total_pixels"),
-                ):
-                    value = self.cfg.data.get(cfg_key, None)
-                    if value is not None and item_key not in item:
-                        item[item_key] = value
-        return resolved
-
-    def _load_video_inputs(
-        self, messages: list[dict[str, Any]]
-    ) -> tuple[list[Any] | None, list[Any] | None, dict[str, Any]]:
-        from qwen_vl_utils import process_vision_info
-
-        image_inputs, video_inputs, video_kwargs = process_vision_info(
-            messages,
-            return_video_kwargs=True,
-        )
-        return image_inputs, video_inputs, video_kwargs
-
-    def _processor_inputs(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        add_generation_prompt: bool,
-        image_inputs: list[Any] | None,
-        video_inputs: list[Any] | None,
-        video_kwargs: dict[str, Any],
-    ):
-        if self._processor is None:
-            self._processor = AutoProcessor.from_pretrained(
-                self.cfg.actor.model.model_path
-            )
-
-        prompt_text = self._processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        if isinstance(prompt_text, list):
-            prompt_text = prompt_text[0]
-
-        processor_kwargs = dict(video_kwargs)
-        return self._processor(
-            text=[prompt_text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-            **processor_kwargs,
-        )
-
-    def encode_prompt(
-        self, raw: dict[str, Any]
-    ) -> tuple[torch.Tensor, int, dict[str, Any], torch.Tensor, Optional[str]]:
-        messages = raw.get("messages", None)
-        if not isinstance(messages, list):
-            raise ValueError("qwen_vl_video_sft records must contain a messages list.")
-
-        messages = self._resolve_video_paths(messages)
-        user_messages = [
-            message for message in messages if message.get("role") != "assistant"
-        ]
-        assistant_messages = [
-            message for message in messages if message.get("role") == "assistant"
-        ]
-        if not user_messages or not assistant_messages:
-            raise ValueError(
-                "messages must contain at least one user and one assistant turn."
-            )
-
-        answer = str(raw.get("answer", ""))
-        if not answer:
-            assistant_content = assistant_messages[-1].get("content", [])
-            if isinstance(assistant_content, list):
-                for item in assistant_content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        answer = str(item.get("text", ""))
-                        break
-            elif assistant_content:
-                answer = str(assistant_content)
-
-        image_inputs, video_inputs, video_kwargs = self._load_video_inputs(messages)
-
-        if self.eval_dataset:
-            prompt_inputs = self._processor_inputs(
-                user_messages,
-                add_generation_prompt=True,
-                image_inputs=image_inputs,
-                video_inputs=video_inputs,
-                video_kwargs=video_kwargs,
-            )
-            label_mask = prompt_inputs["attention_mask"]
-        else:
-            prompt_inputs = self._processor_inputs(
-                messages,
-                add_generation_prompt=False,
-                image_inputs=image_inputs,
-                video_inputs=video_inputs,
-                video_kwargs=video_kwargs,
-            )
-            label_prompt_inputs = self._processor_inputs(
-                user_messages,
-                add_generation_prompt=True,
-                image_inputs=image_inputs,
-                video_inputs=video_inputs,
-                video_kwargs=video_kwargs,
-            )
-            label_mask = label_prompt_inputs["attention_mask"]
-
-        input_ids = prompt_inputs.pop("input_ids")
-        attention_mask = prompt_inputs.pop("attention_mask")
-        if (
-            isinstance(input_ids, torch.Tensor)
-            and input_ids.dim() == 2
-            and input_ids.size(0) == 1
-        ):
-            input_ids = input_ids.squeeze(0)
-        if (
-            isinstance(attention_mask, torch.Tensor)
-            and attention_mask.dim() == 2
-            and attention_mask.size(0) == 1
-        ):
-            attention_mask = attention_mask.squeeze(0)
-        if (
-            isinstance(label_mask, torch.Tensor)
-            and label_mask.dim() == 2
-            and label_mask.size(0) == 1
-        ):
-            label_mask = label_mask.squeeze(0)
-
-        multi_modal_inputs = {key: value for key, value in prompt_inputs.items()}
-        return (
-            input_ids.to(dtype=torch.long),
-            int(input_ids.numel()),
-            messages,
-            answer,
-            attention_mask,
-            label_mask,
-            multi_modal_inputs,
-        )
-
-
 def _resolve_video_path(path: str, data_root: Optional[str]) -> str:
     """解析视频路径：若原路径不存在且 data_root 已配置，则用 data_root 重写。"""
     if not isinstance(path, str):
@@ -932,7 +753,9 @@ class RoboChallengeProgressSFTDataset(VLMBaseDataset):
     ) -> None:
         super().__init__(data_paths, config, tokenizer)
         self.eval_dataset = eval_dataset
-        self._data_root = config.data.get("data_root") or os.environ.get("RLINF_DATA_ROOT")
+        self._data_root = config.data.get("data_root") or os.environ.get(
+            "RLINF_DATA_ROOT"
+        )
 
     @classmethod
     def _build_video_user_content(
@@ -954,6 +777,7 @@ class RoboChallengeProgressSFTDataset(VLMBaseDataset):
         """
         Build Qwen3-VL processor inputs for RoboChallenge progress SFT.
         """
+
         def _render_prompt_text(
             prompt_text: str, answer_text_i: Optional[str]
         ) -> tuple[str, str]:
@@ -1117,7 +941,7 @@ class RoboChallengeProgressSFTDataset(VLMBaseDataset):
             input_ids = torch.tensor(input_ids, dtype=torch.long)
 
         plen = int(input_ids.numel())
-        multi_modal_inputs = {k: v for k, v in full_inputs.items()}
+        multi_modal_inputs = dict(full_inputs)
         return input_ids, plen, attention_mask, label_mask, multi_modal_inputs
 
     @classmethod
@@ -1141,10 +965,12 @@ class RoboChallengeProgressSFTDataset(VLMBaseDataset):
         prompt_text, answer_text, videos, image_data = self._parse_raw_record(
             raw, idx, self._data_root
         )
-        input_ids, plen, attention_mask, label_mask, multi_modal_inputs = self.encode_prompt(
-            prompt_text=prompt_text,
-            videos=videos,
-            answer_text=answer_text,
+        input_ids, plen, attention_mask, label_mask, multi_modal_inputs = (
+            self.encode_prompt(
+                prompt_text=prompt_text,
+                videos=videos,
+                answer_text=answer_text,
+            )
         )
         if plen > self.max_prompt_length:
             input_ids = input_ids[: self.max_prompt_length]
@@ -1196,9 +1022,9 @@ class SimpleRobochallengeSFTDataset(RoboChallengeProgressSFTDataset):
         supervision_label = (
             supervision.get("label", "") if isinstance(supervision, dict) else ""
         )
-        answer_text = str(
-            raw.get("answer")
-            or raw.get("label")
-            or supervision_label
-        ).strip().lower()
+        answer_text = (
+            str(raw.get("answer") or raw.get("label") or supervision_label)
+            .strip()
+            .lower()
+        )
         return prompt_text, answer_text, [clip_path], [clip_path]
