@@ -16,12 +16,14 @@ from typing import Any
 
 import imageio.v2 as imageio
 import torch
-from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
 from PIL import Image
 from qwen_vl_utils import process_vision_info
 from transformers import AutoModelForVision2Seq, AutoProcessor
 
 from rlinf.data.datasets.vlm import SimpleRobochallengeSFTDataset
+from rlinf.models.embodiment.reward.vlm_reward_model import (
+    load_reward_checkpoint_into_model,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,42 +80,7 @@ def load_model(model_path: str, checkpoint: str, device: str, dtype: torch.dtype
         trust_remote_code=True,
         torch_dtype=dtype,
     )
-
-    checkpoint_state_dict = torch.load(
-        checkpoint,
-        map_location="cpu",
-        weights_only=True,
-    )
-    lora_state_dict = {
-        key.removeprefix("module."): value
-        for key, value in checkpoint_state_dict.items()
-        if "lora_" in key
-    }
-    del checkpoint_state_dict
-    if lora_state_dict:
-        lora_rank = next(
-            int(value.shape[0])
-            for key, value in lora_state_dict.items()
-            if "lora_A" in key
-        )
-        target_modules = sorted(
-            {
-                key.split(".lora_")[0].split(".")[-1]
-                for key in lora_state_dict
-                if ".lora_" in key
-            }
-        )
-        model = get_peft_model(
-            model,
-            LoraConfig(
-                r=lora_rank,
-                lora_alpha=lora_rank,
-                lora_dropout=0.0,
-                target_modules=target_modules,
-                init_lora_weights="gaussian",
-            ),
-        )
-        set_peft_model_state_dict(model, lora_state_dict)
+    model, _ = load_reward_checkpoint_into_model(model, checkpoint)
 
     return processor, model.to(device).eval()
 

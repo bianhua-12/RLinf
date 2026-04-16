@@ -38,6 +38,145 @@ from rlinf.models.embodiment.reward.vlm_reward_utils.reward_parser import (
 )
 
 
+def _resolve_reward_checkpoint_file(checkpoint_path: str) -> str:
+    if os.path.isfile(checkpoint_path):
+        return checkpoint_path
+
+    if not os.path.isdir(checkpoint_path):
+        raise FileNotFoundError(
+            f"Reward checkpoint path does not exist: {checkpoint_path}"
+        )
+
+    candidates = (
+        os.path.join(checkpoint_path, "actor", "model_state_dict", "full_weights.pt"),
+        os.path.join(checkpoint_path, "model_state_dict", "full_weights.pt"),
+        os.path.join(checkpoint_path, "full_weights.pt"),
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        "Unable to resolve reward checkpoint file from path "
+        f"{checkpoint_path}. Expected a file path or one of: {candidates}"
+    )
+
+
+def _load_reward_checkpoint_state_dict(
+    checkpoint_path: str,
+) -> tuple[str, dict[str, torch.Tensor]]:
+    resolved_checkpoint_path = _resolve_reward_checkpoint_file(checkpoint_path)
+    checkpoint_state_dict = torch.load(
+        resolved_checkpoint_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    if not isinstance(checkpoint_state_dict, dict):
+        raise ValueError(
+            "Reward checkpoint must contain a state_dict dictionary, got "
+            f"{type(checkpoint_state_dict).__name__}"
+        )
+
+    normalized_state_dict = {
+        key.removeprefix("module."): value
+        for key, value in checkpoint_state_dict.items()
+        if isinstance(key, str)
+    }
+    if not normalized_state_dict:
+        raise ValueError(
+            f"Reward checkpoint {resolved_checkpoint_path} does not contain any "
+            "string-keyed model weights."
+        )
+
+    return resolved_checkpoint_path, normalized_state_dict
+
+
+def _extract_lora_state_dict(
+    checkpoint_state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    return {
+        key: value for key, value in checkpoint_state_dict.items() if "lora_" in key
+    }
+
+
+def _build_lora_config(lora_state_dict: dict[str, torch.Tensor]) -> LoraConfig:
+    lora_a_entries = [
+        (key, value) for key, value in lora_state_dict.items() if "lora_A" in key
+    ]
+    if not lora_a_entries:
+        raise ValueError(
+            "Detected LoRA-style reward checkpoint, but no lora_A weights were found."
+        )
+
+    lora_rank = int(lora_a_entries[0][1].shape[0])
+    target_modules = sorted(
+        {
+            key.split(".lora_")[0].split(".")[-1]
+            for key in lora_state_dict
+            if ".lora_" in key
+        }
+    )
+    if not target_modules:
+        raise ValueError(
+            "Detected LoRA-style reward checkpoint, but could not infer target "
+            "modules from lora_* keys."
+        )
+
+    return LoraConfig(
+        r=lora_rank,
+        lora_alpha=lora_rank,
+        lora_dropout=0.0,
+        target_modules=target_modules,
+        init_lora_weights="gaussian",
+    )
+
+
+def _unpack_load_state_dict_result(
+    load_result: Any,
+) -> tuple[list[str], list[str]]:
+    if hasattr(load_result, "missing_keys") and hasattr(load_result, "unexpected_keys"):
+        return list(load_result.missing_keys), list(load_result.unexpected_keys)
+    if isinstance(load_result, tuple) and len(load_result) == 2:
+        missing_keys, unexpected_keys = load_result
+        return list(missing_keys), list(unexpected_keys)
+    return [], []
+
+
+def load_reward_checkpoint_into_model(
+    model: Any,
+    checkpoint_path: str,
+) -> tuple[Any, dict[str, str]]:
+    resolved_checkpoint_path, checkpoint_state_dict = _load_reward_checkpoint_state_dict(
+        checkpoint_path
+    )
+    lora_state_dict = _extract_lora_state_dict(checkpoint_state_dict)
+    if lora_state_dict:
+        lora_config = _build_lora_config(lora_state_dict)
+        model = get_peft_model(model, lora_config)
+        set_peft_model_state_dict(model, lora_state_dict)
+        return model, {
+            "checkpoint_path": resolved_checkpoint_path,
+            "checkpoint_format": "lora",
+        }
+
+    load_result = model.load_state_dict(checkpoint_state_dict, strict=False)
+    missing_keys, unexpected_keys = _unpack_load_state_dict_result(load_result)
+    if missing_keys or unexpected_keys:
+        missing_preview = ", ".join(missing_keys[:5]) or "none"
+        unexpected_preview = ", ".join(unexpected_keys[:5]) or "none"
+        raise ValueError(
+            "Reward checkpoint was recognized as merged full weights, but it is "
+            "incompatible with the base model. "
+            f"missing_keys={missing_preview}; "
+            f"unexpected_keys={unexpected_preview}"
+        )
+
+    return model, {
+        "checkpoint_path": resolved_checkpoint_path,
+        "checkpoint_format": "full_weights",
+    }
+
+
 class VLMRewardModel(BaseRewardModel):
     """A frozen VLM reward model that maps (images, task) -> scalar reward.
 
@@ -54,6 +193,7 @@ class VLMRewardModel(BaseRewardModel):
         self.lora_path = self.cfg.get("lora_path")
 
         self.dtype = torch_dtype_from_precision(cfg.precision)
+        self.checkpoint_metadata: Optional[dict[str, str]] = None
 
         self.setup_processor()
         self.setup_model()
@@ -116,45 +256,9 @@ class VLMRewardModel(BaseRewardModel):
         )
 
         if self.lora_path:
-            full_weights_path = os.path.join(
-                self.lora_path, "actor", "model_state_dict", "full_weights.pt"
+            self._model, self.checkpoint_metadata = load_reward_checkpoint_into_model(
+                self._model, self.lora_path
             )
-
-            checkpoint_state_dict = torch.load(
-                full_weights_path,
-                map_location="cpu",
-                weights_only=True,
-            )
-            lora_state_dict = {
-                key.removeprefix("module."): value
-                for key, value in checkpoint_state_dict.items()
-                if "lora_" in key
-            }
-            del checkpoint_state_dict
-
-            lora_rank = next(
-                int(value.shape[0])
-                for key, value in lora_state_dict.items()
-                if "lora_A" in key
-            )
-            target_modules = sorted(
-                {
-                    key.split(".lora_")[0].split(".")[-1]
-                    for key in lora_state_dict
-                    if ".lora_" in key
-                }
-            )
-
-            lora_config = LoraConfig(
-                r=lora_rank,
-                lora_alpha=lora_rank,
-                lora_dropout=0.0,
-                target_modules=target_modules,
-                init_lora_weights="gaussian",
-            )
-            self._model = get_peft_model(self._model, lora_config)
-            set_peft_model_state_dict(self._model, lora_state_dict)
-            del lora_state_dict
 
         self._model.eval()
 

@@ -21,6 +21,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
+from rlinf.models.embodiment.reward import vlm_reward_model as vlm_reward_model_module
 from rlinf.models.embodiment.reward.vlm_reward_model import HistoryVLMRewardModel
 from rlinf.models.embodiment.reward.vlm_reward_utils.input_builder import (
     HistoryVLMInputBuilder,
@@ -32,9 +33,16 @@ from rlinf.utils.nested_dict_process import cat_list_of_dict_tensor, split_dict
 class _FakeModel:
     def __init__(self):
         self.device = torch.device("cpu")
+        self.loaded_state_dict = None
+        self.strict = None
 
     def eval(self):
         return self
+
+    def load_state_dict(self, state_dict, strict=True):
+        self.loaded_state_dict = state_dict
+        self.strict = strict
+        return [], []
 
     def generate(
         self, input_ids: torch.Tensor, reward_ids: torch.Tensor, **kwargs
@@ -271,6 +279,98 @@ def test_history_vlm_reward_model_writes_sparse_valid_envs_back_to_slots():
 
     assert torch.equal(rewards, torch.tensor([0.0, 21.0, 0.0, 23.0]))
     assert model.input_builder.calls == [[21], [23]]
+
+
+def test_load_reward_checkpoint_into_model_supports_directory_full_weights(tmp_path):
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_file = checkpoint_dir / "actor" / "model_state_dict" / "full_weights.pt"
+    checkpoint_file.parent.mkdir(parents=True)
+    torch.save(
+        {
+            "module.linear.weight": torch.ones((2, 2), dtype=torch.float32),
+            "linear.bias": torch.zeros((2,), dtype=torch.float32),
+        },
+        checkpoint_file,
+    )
+
+    model = _FakeModel()
+    loaded_model, metadata = vlm_reward_model_module.load_reward_checkpoint_into_model(
+        model, str(checkpoint_dir)
+    )
+
+    assert loaded_model is model
+    assert metadata["checkpoint_format"] == "full_weights"
+    assert metadata["checkpoint_path"] == str(checkpoint_file)
+    assert model.strict is False
+    assert sorted(model.loaded_state_dict) == ["linear.bias", "linear.weight"]
+
+
+def test_load_reward_checkpoint_into_model_supports_lora_checkpoint(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    checkpoint_file = tmp_path / "full_weights.pt"
+    torch.save(
+        {
+            "module.model.layers.0.q_proj.lora_A.weight": torch.ones(
+                (8, 4), dtype=torch.float32
+            ),
+            "module.model.layers.0.q_proj.lora_B.weight": torch.ones(
+                (4, 8), dtype=torch.float32
+            ),
+        },
+        checkpoint_file,
+    )
+
+    calls: dict[str, object] = {}
+
+    def fake_get_peft_model(model, config):
+        calls["base_model"] = model
+        calls["config"] = config
+        wrapped_model = _FakeModel()
+        calls["wrapped_model"] = wrapped_model
+        return wrapped_model
+
+    def fake_set_peft_model_state_dict(model, state_dict):
+        calls["state_dict"] = state_dict
+        calls["loaded_model"] = model
+
+    monkeypatch.setattr(vlm_reward_model_module, "get_peft_model", fake_get_peft_model)
+    monkeypatch.setattr(
+        vlm_reward_model_module,
+        "set_peft_model_state_dict",
+        fake_set_peft_model_state_dict,
+    )
+
+    model = _FakeModel()
+    loaded_model, metadata = vlm_reward_model_module.load_reward_checkpoint_into_model(
+        model, str(checkpoint_file)
+    )
+
+    assert loaded_model is calls["wrapped_model"]
+    assert metadata["checkpoint_format"] == "lora"
+    assert metadata["checkpoint_path"] == str(checkpoint_file)
+    assert calls["config"].r == 8
+    assert set(calls["config"].target_modules) == {"q_proj"}
+    assert sorted(calls["state_dict"]) == [
+        "model.layers.0.q_proj.lora_A.weight",
+        "model.layers.0.q_proj.lora_B.weight",
+    ]
+
+
+def test_load_reward_checkpoint_into_model_rejects_incompatible_full_weights(tmp_path):
+    checkpoint_file = tmp_path / "bad_full_weights.pt"
+    torch.save({"bad.weight": torch.ones((1,), dtype=torch.float32)}, checkpoint_file)
+
+    class _IncompatibleModel(_FakeModel):
+        def load_state_dict(self, state_dict, strict=True):
+            self.loaded_state_dict = state_dict
+            self.strict = strict
+            return ["missing.weight"], ["bad.weight"]
+
+    with pytest.raises(ValueError, match="incompatible with the base model"):
+        vlm_reward_model_module.load_reward_checkpoint_into_model(
+            _IncompatibleModel(), str(checkpoint_file)
+        )
 
 
 @pytest.mark.parametrize(

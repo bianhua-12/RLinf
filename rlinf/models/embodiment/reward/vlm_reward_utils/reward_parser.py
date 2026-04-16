@@ -124,6 +124,37 @@ def _parse_robochallenge_output(
     return None
 
 
+def _parse_ternary_output(text: str) -> tuple[float | None, str | None]:
+    obj = _extract_json_object(text)
+    if obj is not None:
+        judgement = obj.get("judgement", None)
+        if judgement is None:
+            for key in ("answer", "label"):
+                judgement = obj.get(key, None)
+                if judgement is not None:
+                    break
+        if judgement is not None:
+            label = str(judgement).strip().lower()
+            if label == "positive":
+                return 1.0, "positive"
+            if label == "unchanged":
+                return 0.0, "unchanged"
+            if label == "negative":
+                return -1.0, "negative"
+
+    matches = re.findall(r"\b(positive|negative|unchanged)\b", str(text).strip().lower())
+    if not matches:
+        return None, None
+    label = matches[-1]
+    if label == "positive":
+        return 1.0, "positive"
+    if label == "unchanged":
+        return 0.0, "unchanged"
+    if label == "negative":
+        return -1.0, "negative"
+    return None, None
+
+
 @register_reward_parser("robochallenge_reward_parser")
 class RobochallengeRewardParser(BaseRewardParser):
     def __init__(
@@ -158,3 +189,40 @@ class ConfidenceRoboChallengeRewardParser(BaseRewardParser):
             rewards.append(0.0 if reward is None else float(reward))
         rewards = torch.tensor(rewards, dtype=torch.float32).clamp(0.0, 1.0)
         return rewards
+
+
+@register_reward_parser("simple_ternary_reward_parser")
+class SimpleTernaryRewardParser(BaseRewardParser):
+    def parse_rewards(self, outputs: list[str]) -> torch.Tensor:
+        rewards: list[float] = []
+        for output in outputs:
+            reward, _ = _parse_ternary_output(output)
+            rewards.append(0.0 if reward is None else float(reward))
+        return torch.tensor(rewards, dtype=torch.float32).clamp(-1.0, 1.0)
+
+
+@register_reward_parser("weighted_ternary_reward_parser")
+class WeightedTernaryRewardParser(BaseRewardParser):
+    def __init__(
+        self,
+        positive_reward: float = 1.0,
+        unchanged_reward: float = 0.0,
+        negative_reward: float = -0.5,
+    ) -> None:
+        self.positive_reward = float(positive_reward)
+        self.unchanged_reward = float(unchanged_reward)
+        self.negative_reward = float(negative_reward)
+
+    def parse_rewards(self, outputs: list[str]) -> torch.Tensor:
+        rewards: list[float] = []
+        for output in outputs:
+            _, label = _parse_ternary_output(output)
+            if label == "positive":
+                rewards.append(self.positive_reward)
+            elif label == "negative":
+                rewards.append(self.negative_reward)
+            elif label == "unchanged":
+                rewards.append(self.unchanged_reward)
+            else:
+                rewards.append(self.unchanged_reward)
+        return torch.tensor(rewards, dtype=torch.float32)

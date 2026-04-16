@@ -447,6 +447,96 @@ class SimpleRobochallengeInputBuilder(RobochanallengeInputBuilder):
         return processed_inputs
 
 
+@register_input_builder("simple_dualview_ternary_input_builder")
+@dataclass
+class SimpleDualViewTernaryInputBuilder(VideoVLMInputBuilder):
+    video_keys: list[str] = field(
+        default_factory=lambda: ["main_images", "extra_view_images"]
+    )
+    strict_min_frames: int = 2
+
+    def get_valid_input_ids(
+        self,
+        observations: dict[str, Any],
+        history_input: dict[str, dict[str, list[list[Any]]]],
+    ) -> list[int]:
+        history_valid_ids = super().get_valid_input_ids(observations, history_input)
+        observations_valid_ids = [
+            env_id
+            for env_id, task_description in enumerate(observations["task_descriptions"])
+            if len(task_description or "") > 0
+        ]
+        history_valid_ids = [
+            env_idx for env_idx in history_valid_ids if env_idx in observations_valid_ids
+        ]
+
+        for history_buffer_name in self.history_buffer_names:
+            history_buffer = history_input.get(history_buffer_name)
+            if not history_buffer:
+                return []
+            for video_key in self.video_keys:
+                video_buffer = history_buffer.get(video_key)
+                if not video_buffer:
+                    return []
+                invalid_ids = [
+                    env_idx
+                    for env_idx, video in enumerate(video_buffer)
+                    if len(video) < self.strict_min_frames
+                ]
+                history_valid_ids = [
+                    env_idx
+                    for env_idx in history_valid_ids
+                    if env_idx not in invalid_ids
+                ]
+        return history_valid_ids
+
+    def prepare_inputs(
+        self,
+        observations: dict[str, Any],
+        history_input: dict[str, dict[str, list[list[Any]]]],
+        valid_input_ids: list[int],
+    ):
+        history_window = history_input.get("history_window", {})
+        videos_clip = self.extract_videos(history_window, self.video_keys)
+        videos_list = [videos_clip[env_id] for env_id in valid_input_ids]
+
+        task_descriptions = [
+            str(task_description or "")
+            for task_description in observations["task_descriptions"]
+        ]
+        prompt_texts_list: list[list[str]] = []
+        for env_id in valid_input_ids:
+            task_description = task_descriptions[env_id].strip()
+            prompt_texts_list.append(
+                [
+                    f"You are currently performing the task: {task_description}. "
+                    "Please judge whether the operation shown in these two video views "
+                    "makes the task better, worse, or unchanged. "
+                    "Answer with exactly one word: positive, negative, or unchanged."
+                ]
+            )
+
+        return {
+            "images_list": None,
+            "videos_list": videos_list,
+            "prompt_texts_list": prompt_texts_list,
+        }
+
+    def process_inputs(self, prepared_inputs: dict[str, Any]):
+        prompt_texts_list = prepared_inputs.get("prompt_texts_list")
+        videos_list = prepared_inputs.get("videos_list")
+
+        _, processed_inputs, _ = RoboChallengeProgressSFTDataset.process_inputs(
+            processor=self._processor,
+            system_prompt=self.system_prompt,
+            use_chat_template=self.use_chat_template,
+            prompt_texts=prompt_texts_list,
+            videos=videos_list,
+            answer_text=None,
+        )
+        return processed_inputs
+
+
 @register_input_builder("dualview_robochallenge_input_builder")
 @dataclass
 class DualViewInputBuilder(VideoVLMInputBuilder):
