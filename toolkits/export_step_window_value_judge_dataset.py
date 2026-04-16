@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Export 5-frame value-delta video judge samples from collected episodes."""
 
 from __future__ import annotations
@@ -191,7 +205,9 @@ def materialize_clips(
             write_clip(output_dir / sample["clip_path"], frames, fps=fps)
 
 
-def build_reverse_positive_sample(sample: dict[str, Any], prompt: str) -> dict[str, Any]:
+def build_reverse_positive_sample(
+    sample: dict[str, Any], prompt: str
+) -> dict[str, Any]:
     """Create a negative sample by reversing a value-increasing clip."""
     clip_path = Path(sample["clip_path"])
     reversed_clip_path = clip_path.with_name(f"negative_reverse_{clip_path.name}")
@@ -206,10 +222,16 @@ def build_reverse_positive_sample(sample: dict[str, Any], prompt: str) -> dict[s
     reversed_sample["segment_metadata"]["augmentation"] = "reverse_positive"
     reversed_sample["supervision"] = dict(sample["supervision"])
     reversed_sample["supervision"]["label"] = "negative"
-    reversed_sample["supervision"]["score"] = -abs(float(sample["supervision"]["score"]))
-    reversed_sample["supervision"]["score_name"] = "reversed_positive_value_delta_window"
+    reversed_sample["supervision"]["score"] = -abs(
+        float(sample["supervision"]["score"])
+    )
+    reversed_sample["supervision"]["score_name"] = (
+        "reversed_positive_value_delta_window"
+    )
     reversed_sample["supervision"]["source_label"] = "positive"
-    reversed_sample["supervision"]["source_score"] = float(sample["supervision"]["score"])
+    reversed_sample["supervision"]["source_score"] = float(
+        sample["supervision"]["score"]
+    )
     return reversed_sample
 
 

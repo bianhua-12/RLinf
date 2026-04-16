@@ -930,9 +930,10 @@ def validate_sft_cfg(cfg: DictConfig) -> DictConfig:
     )
 
     with open_dict(cfg):
-        if cfg.data.get("val_data_paths", None) is None and cfg.data.get(
-            "eval_data_paths", None
-        ) is not None:
+        if (
+            cfg.data.get("val_data_paths", None) is None
+            and cfg.data.get("eval_data_paths", None) is not None
+        ):
             cfg.data.val_data_paths = cfg.data.eval_data_paths
 
         if cfg.data.get("train_data_paths", None) is None:

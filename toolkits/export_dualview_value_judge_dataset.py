@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Export dual-view 5-frame value-judge samples from collected episodes."""
 
 from __future__ import annotations
@@ -16,7 +30,6 @@ import numpy as np
 import torch
 
 from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
-
 
 DEFAULT_VALUE_CKPT = (
     "/mnt/project_rlinf/ztx/RLinf/logs/20260411-20:03:49-maniskill_ppo_mlp/"
@@ -115,7 +128,9 @@ def load_value_model(path: str, obs_dim: int, device: str) -> MLPPolicy:
     return model.to(device).eval()
 
 
-def extract_dual_view_frames(observations: list[dict[str, Any]], start_idx: int, end_idx: int) -> tuple[list[Any], list[Any]] | None:
+def extract_dual_view_frames(
+    observations: list[dict[str, Any]], start_idx: int, end_idx: int
+) -> tuple[list[Any], list[Any]] | None:
     main_frames: list[Any] = []
     third_frames: list[Any] = []
     for idx in range(start_idx, end_idx + 1):
@@ -145,7 +160,9 @@ def write_clip(path: Path, frames: list[Any], fps: int) -> None:
             writer.append_data(to_numpy_rgb(frame))
 
 
-def build_messages(prompt: str, main_rel_path: str, third_rel_path: str, label: str) -> list[dict[str, Any]]:
+def build_messages(
+    prompt: str, main_rel_path: str, third_rel_path: str, label: str
+) -> list[dict[str, Any]]:
     return [
         {
             "role": "user",
@@ -199,7 +216,9 @@ def maybe_balance(
             grouped["positive"] = grouped["positive"][:keep]
             grouped["negative"] = grouped["negative"][:keep]
         elif max_per_label is not None:
-            grouped = {label: values[:max_per_label] for label, values in grouped.items()}
+            grouped = {
+                label: values[:max_per_label] for label, values in grouped.items()
+            }
         if max_per_label is not None and "unchanged" in grouped:
             grouped["unchanged"] = grouped["unchanged"][:max_per_label]
     elif max_per_label is not None:
@@ -279,9 +298,15 @@ def build_reverse_positive_sample(sample: dict[str, Any]) -> dict[str, Any]:
     reversed_sample["supervision"] = dict(sample["supervision"])
     reversed_sample["supervision"]["label"] = "negative"
     reversed_sample["supervision"]["source_label"] = "positive"
-    reversed_sample["supervision"]["source_score"] = float(sample["supervision"]["score"])
-    reversed_sample["supervision"]["score"] = -abs(float(sample["supervision"]["score"]))
-    reversed_sample["supervision"]["score_name"] = "reversed_positive_value_delta_window"
+    reversed_sample["supervision"]["source_score"] = float(
+        sample["supervision"]["score"]
+    )
+    reversed_sample["supervision"]["score"] = -abs(
+        float(sample["supervision"]["score"])
+    )
+    reversed_sample["supervision"]["score_name"] = (
+        "reversed_positive_value_delta_window"
+    )
     return reversed_sample
 
 
@@ -351,7 +376,9 @@ def main() -> None:
         )
         prompt = prompt_for_task(task)
 
-        for start_idx in range(0, len(observations) - args.window_size + 1, args.stride):
+        for start_idx in range(
+            0, len(observations) - args.window_size + 1, args.stride
+        ):
             end_idx = start_idx + args.window_size - 1
             if extract_dual_view_frames(observations, start_idx, end_idx) is None:
                 skipped["missing_dual_view"] += 1
@@ -360,9 +387,7 @@ def main() -> None:
             end_value = float(values[end_idx].item())
             delta = end_value - start_value
             label = label_from_delta(delta, args.delta_threshold)
-            base_name = (
-                f"{episode_path.stem}_frames_{start_idx:04d}_{end_idx:04d}"
-            )
+            base_name = f"{episode_path.stem}_frames_{start_idx:04d}_{end_idx:04d}"
             main_rel_path = Path(split) / "main_clips" / f"{label}_{base_name}.mp4"
             third_rel_path = Path(split) / "third_clips" / f"{label}_{base_name}.mp4"
             sample = {

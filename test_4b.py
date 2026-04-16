@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import argparse
@@ -15,16 +29,18 @@ from typing import Any
 import imageio.v2 as imageio
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
 from omegaconf import OmegaConf, open_dict
+from PIL import Image, ImageDraw, ImageFont
 
 REPO_ROOT = Path(__file__).resolve().parents[0]
 sys.path.insert(0, str(REPO_ROOT))
 
-from rlinf.models.embodiment.reward import get_reward_model_class
+from rlinf.models.embodiment.reward import get_reward_model_class  # noqa: E402
 
-
-DEFAULT_CONFIG = REPO_ROOT / "examples/embodiment/config/maniskill_ppo_mlp_qwen3vl4b_robochallenge_reward_useoutput0.yaml"
+DEFAULT_CONFIG = (
+    REPO_ROOT
+    / "examples/embodiment/config/maniskill_ppo_mlp_qwen3vl4b_robochallenge_reward_useoutput0.yaml"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -317,7 +333,6 @@ def render_debug_video(
     output_path: Path,
     fps: int,
 ) -> None:
-    sample_frame = resize_frame(normalize_frame(history_window_frames[0]), scale=3)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with imageio.get_writer(output_path, fps=fps) as writer:
         for frame in history_window_frames:
@@ -439,9 +454,7 @@ def main() -> None:
         "parse_ok_rate": None
         if not rows
         else sum(row["parse_ok"] for row in rows) / len(rows),
-        "pred_reward_mean": None
-        if not rows
-        else sum(pred_rewards) / len(pred_rewards),
+        "pred_reward_mean": None if not rows else sum(pred_rewards) / len(pred_rewards),
         "gt_reward_mean": None if not rows else sum(gt_rewards) / len(gt_rewards),
         "corr_pred_vs_gt_reward": pearson(pred_rewards, gt_rewards),
         "corr_pred_vs_segment_return": pearson(pred_rewards, segment_returns),

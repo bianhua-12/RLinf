@@ -15,9 +15,9 @@
 import os
 import sys
 
-from omegaconf import OmegaConf
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -78,9 +78,7 @@ class _FakeHistoryInputBuilder(HistoryVLMInputBuilder):
         del observations
         history_window = history_input["history_window"]["main_images"]
         return [
-            env_idx
-            for env_idx, frames in enumerate(history_window)
-            if len(frames) > 0
+            env_idx for env_idx, frames in enumerate(history_window) if len(frames) > 0
         ]
 
     def prepare_inputs(

@@ -142,7 +142,9 @@ def _parse_ternary_output(text: str) -> tuple[float | None, str | None]:
             if label == "negative":
                 return -1.0, "negative"
 
-    matches = re.findall(r"\b(positive|negative|unchanged)\b", str(text).strip().lower())
+    matches = re.findall(
+        r"\b(positive|negative|unchanged)\b", str(text).strip().lower()
+    )
     if not matches:
         return None, None
     label = matches[-1]

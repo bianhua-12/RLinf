@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import argparse
@@ -14,13 +28,13 @@ from typing import Any
 import imageio.v2 as imageio
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
 from omegaconf import OmegaConf, open_dict
+from PIL import Image, ImageDraw, ImageFont
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from rlinf.models.embodiment.reward import get_reward_model_class
+from rlinf.models.embodiment.reward import get_reward_model_class  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -326,7 +340,9 @@ def render_debug_video(
             left_frame = pad_frame(
                 resize_frame(
                     normalize_frame(
-                        full_history_frames[min(frame_idx, len(full_history_frames) - 1)]
+                        full_history_frames[
+                            min(frame_idx, len(full_history_frames) - 1)
+                        ]
                     ),
                     scale=3,
                 ),
@@ -361,10 +377,11 @@ def main() -> None:
 
     history_buffers = cfg.reward.model.history_buffers
     full_history_size = int(history_buffers.full_history.history_size)
-    history_window_size = int(history_buffers.history_window.history_size)
     interval = int(history_buffers.history_window.input_interval)
     if bool(history_buffers.history_window.get("input_on_done", False)):
-        raise ValueError("this visual debugger assumes history_window.input_on_done=False")
+        raise ValueError(
+            "this visual debugger assumes history_window.input_on_done=False"
+        )
 
     episode_paths = sorted(glob.glob(args.episode_glob))[: args.max_episodes]
     rows: list[dict[str, Any]] = []
@@ -462,9 +479,15 @@ def main() -> None:
         "num_episodes": len(episode_paths),
         "num_rows": len(rows),
         "num_videos": len(rows),
-        "parse_ok_rate": None if len(rows) == 0 else sum(row["parse_ok"] for row in rows) / len(rows),
-        "pred_reward_mean": None if len(rows) == 0 else sum(pred_rewards) / len(pred_rewards),
-        "pred_positive_rate_at_0_5": None if len(rows) == 0 else sum(r >= 0.5 for r in pred_rewards) / len(pred_rewards),
+        "parse_ok_rate": None
+        if len(rows) == 0
+        else sum(row["parse_ok"] for row in rows) / len(rows),
+        "pred_reward_mean": None
+        if len(rows) == 0
+        else sum(pred_rewards) / len(pred_rewards),
+        "pred_positive_rate_at_0_5": None
+        if len(rows) == 0
+        else sum(r >= 0.5 for r in pred_rewards) / len(pred_rewards),
         "corr_pred_vs_segment_return": pearson(pred_rewards, segment_returns),
         "corr_pred_vs_prefix_return": pearson(pred_rewards, prefix_returns),
         "corr_pred_vs_episode_success": pearson(pred_rewards, success_labels),

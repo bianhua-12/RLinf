@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
@@ -24,6 +25,8 @@ from rlinf.data.datasets.vlm import (
     SimpleRobochallengeSFTDataset,
     VLMBaseDataset,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _to_pil_images(
@@ -454,6 +457,23 @@ class SimpleDualViewTernaryInputBuilder(VideoVLMInputBuilder):
         default_factory=lambda: ["main_images", "extra_view_images"]
     )
     strict_min_frames: int = 2
+    _consecutive_missing_extra_view_empties: int = field(
+        default=0, init=False, repr=False
+    )
+
+    def _maybe_log_missing_extra_view(self, observations: dict[str, Any]) -> None:
+        if observations.get("extra_view_images") is not None:
+            self._consecutive_missing_extra_view_empties = 0
+            return
+
+        self._consecutive_missing_extra_view_empties += 1
+        if self._consecutive_missing_extra_view_empties in {1, 10}:
+            logger.warning(
+                "SimpleDualViewTernaryInputBuilder produced no valid inputs because "
+                "observations.extra_view_images is None. Reward outputs will stay at "
+                "0.0 until a second view is available. consecutive_empty_calls=%d",
+                self._consecutive_missing_extra_view_empties,
+            )
 
     def get_valid_input_ids(
         self,
@@ -467,7 +487,9 @@ class SimpleDualViewTernaryInputBuilder(VideoVLMInputBuilder):
             if len(task_description or "") > 0
         ]
         history_valid_ids = [
-            env_idx for env_idx in history_valid_ids if env_idx in observations_valid_ids
+            env_idx
+            for env_idx in history_valid_ids
+            if env_idx in observations_valid_ids
         ]
 
         for history_buffer_name in self.history_buffer_names:
@@ -488,6 +510,10 @@ class SimpleDualViewTernaryInputBuilder(VideoVLMInputBuilder):
                     for env_idx in history_valid_ids
                     if env_idx not in invalid_ids
                 ]
+        if history_valid_ids:
+            self._consecutive_missing_extra_view_empties = 0
+        else:
+            self._maybe_log_missing_extra_view(observations)
         return history_valid_ids
 
     def prepare_inputs(
