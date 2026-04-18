@@ -19,6 +19,7 @@ from typing import Optional, Union
 import gymnasium as gym
 import numpy as np
 import torch
+import torch.nn.functional as F
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.utils import common, gym_utils
 from mani_skill.utils.common import torch_clone_dict
@@ -177,7 +178,26 @@ class ManiskillEnv(gym.Env):
                 "Expected extra_view_images to have shape [B, H, W, C], "
                 f"got {tuple(extra_view_images.shape)}."
             )
-        return extra_view_images.to(torch.uint8)
+        return extra_view_images.to(self.device, dtype=torch.uint8)
+
+    def _resize_extra_view_to_main(
+        self, extra_view_images: torch.Tensor | None, main_images: torch.Tensor
+    ) -> torch.Tensor | None:
+        if extra_view_images is None:
+            return None
+        if extra_view_images.shape[1:3] == main_images.shape[1:3]:
+            return extra_view_images
+        return (
+            F.interpolate(
+                extra_view_images.permute(0, 3, 1, 2).float(),
+                size=main_images.shape[1:3],
+                mode="bilinear",
+                align_corners=False,
+            )
+            .permute(0, 2, 3, 1)
+            .clamp(0, 255)
+            .to(torch.uint8)
+        )
 
     def _get_extra_sensor_view(
         self, sensor_data: dict[str, dict[str, torch.Tensor]]
@@ -221,6 +241,10 @@ class ManiskillEnv(gym.Env):
         if callable(render_rgb_array_fn):
             return self._normalize_extra_view_images(render_rgb_array_fn("render_camera"))
 
+        render_fn = getattr(self.env, "render", None)
+        if callable(render_fn):
+            return self._normalize_extra_view_images(render_fn())
+
         return None
 
     def _get_extra_view_images(
@@ -263,6 +287,9 @@ class ManiskillEnv(gym.Env):
 
                 main_images = sensor_data["base_camera"]["rgb"]
                 extra_view_images = self._get_extra_view_images(sensor_data)
+                extra_view_images = self._resize_extra_view_to_main(
+                    extra_view_images, main_images
+                )
                 obs = {
                     "main_images": main_images,
                     "extra_view_images": extra_view_images,

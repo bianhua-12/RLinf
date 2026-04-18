@@ -48,10 +48,18 @@ fi
 
 echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
 
-echo "Using Python at $(which python)"
+if [ -n "${RLINF_PYTHON:-}" ]; then
+    PYTHON_BIN="${RLINF_PYTHON}"
+elif [ -x "${REPO_PATH}/.venv/bin/python" ]; then
+    PYTHON_BIN="${REPO_PATH}/.venv/bin/python"
+else
+    PYTHON_BIN="$(which python)"
+fi
+
+echo "Using Python at ${PYTHON_BIN}"
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}" #/$(date +'%Y%m%d-%H:%M:%S')"
 MEGA_LOG_FILE="${LOG_DIR}/run_embodiment.log"
 mkdir -p "${LOG_DIR}"
-CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
+CMD="${PYTHON_BIN} ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
 echo ${CMD} > ${MEGA_LOG_FILE}
 ${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}

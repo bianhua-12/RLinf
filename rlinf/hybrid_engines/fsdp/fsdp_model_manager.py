@@ -175,6 +175,41 @@ class FSDPModelManager:
                 trust_remote_code=True,
             )
 
+        trainable_modules = cfg.model.get("trainable_modules", None)
+        freeze_modules = cfg.model.get("freeze_modules", None)
+        if trainable_modules is not None:
+            trainable_filters = [str(item) for item in trainable_modules]
+            for _, param in model.named_parameters():
+                param.requires_grad = False
+            for name, param in model.named_parameters():
+                if any(module_filter in name for module_filter in trainable_filters):
+                    param.requires_grad = True
+            trainable_count = sum(
+                param.numel() for param in model.parameters() if param.requires_grad
+            )
+            total_count = sum(param.numel() for param in model.parameters())
+            self._logger.info(
+                "[FSDP] Enabled trainable_modules=%s, trainable params=%d/%d",
+                trainable_filters,
+                trainable_count,
+                total_count,
+            )
+        elif freeze_modules is not None:
+            freeze_filters = [str(item) for item in freeze_modules]
+            for name, param in model.named_parameters():
+                if any(module_filter in name for module_filter in freeze_filters):
+                    param.requires_grad = False
+            trainable_count = sum(
+                param.numel() for param in model.parameters() if param.requires_grad
+            )
+            total_count = sum(param.numel() for param in model.parameters())
+            self._logger.info(
+                "[FSDP] Applied freeze_modules=%s, trainable params=%d/%d",
+                freeze_filters,
+                trainable_count,
+                total_count,
+            )
+
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
@@ -316,6 +351,26 @@ class FSDPModelManager:
         self._strategy.load_checkpoint(
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
+        self._reset_optimizer_lrs_from_config()
+
+    def _reset_optimizer_lrs_from_config(self) -> None:
+        """Keep resumed optimizer state but honor current YAML learning rates."""
+        if self.optimizer is None:
+            return
+
+        param_groups = self.optimizer.param_groups
+        if len(param_groups) >= 1:
+            param_groups[0]["lr"] = self._cfg.optim.lr
+            param_groups[0]["initial_lr"] = self._cfg.optim.lr
+        if len(param_groups) >= 2:
+            param_groups[1]["lr"] = self._cfg.optim.value_lr
+            param_groups[1]["initial_lr"] = self._cfg.optim.value_lr
+
+        if self.lr_scheduler is not None and hasattr(self.lr_scheduler, "base_lrs"):
+            base_lrs = [group["lr"] for group in param_groups]
+            self.lr_scheduler.base_lrs = base_lrs
+            if hasattr(self.lr_scheduler, "_last_lr"):
+                self.lr_scheduler._last_lr = base_lrs
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         """

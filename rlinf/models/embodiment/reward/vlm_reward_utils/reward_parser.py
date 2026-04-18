@@ -14,7 +14,7 @@
 
 import json
 import re
-from typing import Any, Protocol
+from typing import Any
 
 import torch
 
@@ -37,11 +37,11 @@ def get_reward_parser(name: str) -> type:
 
 
 @register_reward_parser("base_reward_parser")
-class BaseRewardParser(Protocol):
+class BaseRewardParser:
     def parse_rewards(
         self, outputs: list[str]
     ) -> torch.Tensor:  # pragma: no cover - tiny wrapper
-        pass
+        raise NotImplementedError
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -164,7 +164,30 @@ class RobochallengeRewardParser(BaseRewardParser):
         positive_reward_weight: float = 1.0,
         unchanged_reward_weight: float = 0.0,
         negative_reward_weight: float = -0.5,
+        reward_weights: dict[str, float] | None = None,
+        positive_reward: float | None = None,
+        unchanged_reward: float | None = None,
+        negative_reward: float | None = None,
     ) -> None:
+        if reward_weights is not None:
+            positive_reward_weight = reward_weights.get(
+                "positive_reward_weight",
+                reward_weights.get("positive_reward", positive_reward_weight),
+            )
+            unchanged_reward_weight = reward_weights.get(
+                "unchanged_reward_weight",
+                reward_weights.get("unchanged_reward", unchanged_reward_weight),
+            )
+            negative_reward_weight = reward_weights.get(
+                "negative_reward_weight",
+                reward_weights.get("negative_reward", negative_reward_weight),
+            )
+        if positive_reward is not None:
+            positive_reward_weight = positive_reward
+        if unchanged_reward is not None:
+            unchanged_reward_weight = unchanged_reward
+        if negative_reward is not None:
+            negative_reward_weight = negative_reward
         self.reward_weights = {
             "positive": positive_reward_weight,
             "unchanged": unchanged_reward_weight,
@@ -178,7 +201,7 @@ class RobochallengeRewardParser(BaseRewardParser):
                 output, use_confidence=False, reward_weights=self.reward_weights
             )
             rewards.append(0.0 if reward is None else float(reward))
-        rewards = torch.tensor(rewards, dtype=torch.float32).clamp(0.0, 1.0)
+        rewards = torch.tensor(rewards, dtype=torch.float32).clamp(-1.0, 1.0)
         return rewards
 
 

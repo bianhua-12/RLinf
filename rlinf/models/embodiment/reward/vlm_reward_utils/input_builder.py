@@ -76,6 +76,47 @@ def extract_images(
     return images
 
 
+def _process_video_prompt_inputs(
+    processor: AutoProcessor,
+    prompt_texts_list: list[list[str]],
+    videos_list: list[list[Any]],
+) -> dict[str, Any]:
+    """Build batched Qwen3-VL inputs with one video token per input video."""
+
+    video_tok = getattr(processor, "video_token", "<|video_pad|>")
+    rendered_prompts: list[str] = []
+    videos_kwargs = {"video_metadata": []}
+
+    for prompt_texts, videos in zip(prompt_texts_list, videos_list):
+        prompt_text = prompt_texts[0]
+        user_content = "\n".join([video_tok] * len(videos)) + f"\n\n{prompt_text}"
+
+        try:
+            rendered_prompt = processor.apply_chat_template(
+                [{"role": "user", "content": user_content}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            rendered_prompt = (
+                f"<|im_start|>user\n{user_content}<|im_end|>\n"
+                f"<|im_start|>assistant\n"
+            )
+
+        rendered_prompts.append(rendered_prompt)
+        videos_kwargs["video_metadata"].append(
+            [{"total_num_frames": len(video), "fps": 24.0} for video in videos]
+        )
+
+    return processor(
+        text=rendered_prompts,
+        videos=videos_list,
+        return_tensors="pt",
+        padding=True,
+        videos_kwargs=videos_kwargs,
+    )
+
+
 INPUT_BUILDER_REGISTRY: dict[str, type] = {}
 
 
@@ -398,6 +439,113 @@ class RobochanallengeInputBuilder(VideoVLMInputBuilder):
         )
 
         return processed_inputs
+
+
+@register_input_builder("threeview_robochallenge_input_builder")
+@dataclass
+class ThreeViewRobochallengeInputBuilder(RobochanallengeInputBuilder):
+    """Original RoboChallenge prompt with full video + two clip views."""
+
+    full_video_keys: list[str] = field(default_factory=lambda: ["main_images"])
+    clip_video_keys: list[str] = field(
+        default_factory=lambda: ["main_images", "extra_view_images"]
+    )
+    strict_min_frames: int = 1
+
+    def get_valid_input_ids(
+        self,
+        observations: dict[str, Any],
+        history_input: dict[str, dict[str, list[list[Any]]]],
+    ) -> list[int]:
+        if not self.history_buffer_names:
+            return []
+        first_history = history_input.get(self.history_buffer_names[0])
+        if not first_history:
+            return []
+        first_payload = next(iter(first_history.values()), None)
+        if first_payload is None:
+            return []
+
+        valid_ids = list(range(len(first_payload)))
+        valid_ids = [
+            env_id
+            for env_id in valid_ids
+            if len(observations["task_descriptions"][env_id] or "") > 0
+        ]
+
+        required_buffers = [
+            ("full_history", self.full_video_keys),
+            ("history_window", self.clip_video_keys),
+        ]
+        for history_buffer_name, video_keys in required_buffers:
+            history_buffer = history_input.get(history_buffer_name)
+            if not history_buffer:
+                return []
+
+            for video_key in video_keys:
+                video_buffer = history_buffer.get(video_key)
+                if not video_buffer:
+                    return []
+
+                invalid_ids = [
+                    env_idx
+                    for env_idx, video in enumerate(video_buffer)
+                    if len(video) < self.strict_min_frames
+                ]
+                valid_ids = [
+                    env_idx for env_idx in valid_ids if env_idx not in invalid_ids
+                ]
+
+        return valid_ids
+
+    def prepare_inputs(
+        self,
+        observations: dict[str, Any],
+        history_input: dict[str, dict[str, list[list[Any]]]],
+        valid_input_ids: list[int],
+    ):
+        base_inputs = super().prepare_inputs(
+            observations, history_input, valid_input_ids
+        )
+
+        full_history = history_input.get("full_history", {})
+        history_window = history_input.get("history_window", {})
+        full_videos = self.extract_videos(full_history, self.full_video_keys)
+        main_clip_videos = self.extract_videos(history_window, ["main_images"])
+        extra_clip_videos = self.extract_videos(history_window, ["extra_view_images"])
+
+        if not (
+            len(full_videos) == len(main_clip_videos) == len(extra_clip_videos)
+        ):
+            raise ValueError(
+                "Mismatched three-view history buffer batch sizes: "
+                f"full_history={len(full_videos)}, "
+                f"main_clip={len(main_clip_videos)}, "
+                f"extra_clip={len(extra_clip_videos)}."
+            )
+
+        videos_list: list[list[Any]] = []
+        for env_id in valid_input_ids:
+            videos_list.append(
+                full_videos[env_id]
+                + main_clip_videos[env_id]
+                + extra_clip_videos[env_id]
+            )
+
+        return {
+            "images_list": None,
+            "videos_list": videos_list,
+            "prompt_texts_list": base_inputs["prompt_texts_list"],
+        }
+
+    def process_inputs(self, prepared_inputs: dict[str, Any]):
+        prompt_texts_list = prepared_inputs.get("prompt_texts_list")
+        videos_list = prepared_inputs.get("videos_list")
+        return _process_video_prompt_inputs(
+            processor=self._processor,
+            prompt_texts_list=prompt_texts_list,
+            videos_list=videos_list,
+        )
 
 
 @register_input_builder("simple_robochallenge_input_builder")
