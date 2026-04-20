@@ -100,6 +100,7 @@ VLM reward 的主路径如下：
 
 - ``maniskill_ppo_mlp_qwen3vl4b_dualview_robochallenge_reward.yaml`` 切换到 ``dualview_robochallenge_input_builder``，用于双视角片段判断，并支持 ``unchanged`` 标签。
 - ``maniskill_ppo_mlp_qwen3vl8b_confidance_robochallenge_reward.yaml`` 使用 ``confidence_robochallenge_reward_parser``，并同时配置 ``full_history`` 和 ``history_window`` 两个历史缓冲，更接近一种进度评分方案，而不是简单的二分类判别。
+- 传感器版双视角训练建议使用 ``PickCubeDualView-v1``。这个环境会直接提供 ``sensor_data.base_camera`` 和 ``sensor_data.orbit_camera``，这样 RLinf 可以直接得到 ``extra_view_images``，而不必再依赖 ``render_camera`` 回退路径。
 
 当前实现说明
 ------------
@@ -110,6 +111,7 @@ VLM reward 的主路径如下：
 - 在主单视角配置中，reward worker 只消费 ``main_images`` 的历史输入。虽然环境观测里仍然有 ``extra_view_images``，但 ``simple_robochallenge_input_builder`` 并不会使用它。
 - ``robochallenge_reward_parser`` 会把最终 reward 截断到 ``[0, 1]``。实际效果上，``positive`` 会得到正分，而 ``negative`` 会被裁成 ``0``，而不是变成带符号惩罚。
 - 对 dual-view 变体而言，``dualview_robochallenge_input_builder`` 会从 ``history_input`` 中同时读取 ``main_images`` 和 ``extra_view_images``。如果想真正使用双视角历史输入，需要在历史缓冲配置里同时记录这两个键。
+- 当前使用 GAE-delta 的双视角配置已经把 ManiSkill 的 env id 切到 ``PickCubeDualView-v1``，因此第二视角来自 reset 时采样的 orbit sensor camera，而不是 ``render_camera``。
 - ``confidence_robochallenge_reward_parser`` 同样输出 ``[0, 1]`` 区间的值；对 ``negative`` 判断，它会返回 ``1 - confidence``，因此它更像是一个有界分数，而不是带符号的惩罚值。
 
 实践说明

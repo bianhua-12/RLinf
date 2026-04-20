@@ -67,6 +67,20 @@ class BasePolicy(ABC):
             f"{self.__class__.__name__} does not support DAgger SFT training."
         )
 
+    def get_replay_buffer_projection(
+        self,
+    ) -> dict[str, tuple[str, ...]] | None:
+        """Return the replay-view fields required by this policy.
+
+        Returns:
+            A nested field projection for replay-buffer flattening. Keys may include
+            ``curr_obs``, ``next_obs``, and ``forward_inputs``. Returning ``None``
+            keeps the full trajectory payload in replay, which is still required by
+            vision-based policies. State-based policies should override this method to
+            keep only the observation keys they actually train on.
+        """
+        return None
+
     @abstractmethod
     def default_forward(self, **kwargs): ...
 

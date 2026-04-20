@@ -222,6 +222,9 @@ class EmbodiedRewardWorker(Worker):
         self._interact_task = None
 
         self.reward_threshold = self.cfg.reward.get("reward_threshold", 0.6)
+        self.aggregate_request_count = int(
+            self.cfg.reward.get("aggregate_request_count", 1)
+        )
 
     def model_provider_func(self):
         reward_cls = get_reward_model_class(self.cfg.reward.model.model_type)
@@ -303,6 +306,38 @@ class EmbodiedRewardWorker(Worker):
                 ),
                 async_op=True,
             ).async_wait()
+            actual_size = self._infer_reward_batch_size(data)
+            assert actual_size == expected_size, (
+                f"Expected reward input batch size {expected_size} from env rank {src_rank}, "
+                f"got batch size {actual_size}."
+            )
+            last_run = data.get("last_run", None)
+            last_run_count += int(last_run.sum().item()) if last_run is not None else 0
+            batches.append(data)
+
+        merged = cat_list_of_dict_tensor(
+            [{k: v for k, v in b.items() if k != "last_run"} for b in batches], dim=0
+        )
+        return merged, last_run_count
+
+    def try_recv_merged_reward_input(
+        self, input_channel: Channel, mode: Literal["train", "eval"] = "train"
+    ) -> tuple[dict[str, Any], int] | None:
+        assert mode in ["train", "eval"], f"{mode=} is not supported"
+        src_ranks_and_sizes = self.src_ranks[mode]
+        queue_keys = [
+            CommMapper.build_channel_key(
+                src_rank, self._rank, extra=f"{mode}_reward_input"
+            )
+            for src_rank, _ in src_ranks_and_sizes
+        ]
+        if any(input_channel.qsize(key=queue_key) <= 0 for queue_key in queue_keys):
+            return None
+
+        batches: list[dict[str, Any]] = []
+        last_run_count = 0
+        for (src_rank, expected_size), queue_key in zip(src_ranks_and_sizes, queue_keys):
+            data = input_channel.get(key=queue_key)
             actual_size = self._infer_reward_batch_size(data)
             assert actual_size == expected_size, (
                 f"Expected reward input batch size {expected_size} from env rank {src_rank}, "
@@ -410,6 +445,56 @@ class EmbodiedRewardWorker(Worker):
                 async_op=True,
             )
 
+    async def recv_aggregated_reward_inputs(
+        self,
+        input_channel: Channel,
+        mode: Literal["train", "eval"] = "train",
+    ) -> tuple[dict[str, Any], list[int], int]:
+        reward_inputs: list[dict[str, Any]] = []
+        batch_sizes: list[int] = []
+        total_last_run_count = 0
+
+        reward_input, last_run_count = await self.recv_merged_reward_input(
+            input_channel, mode=mode
+        )
+        reward_inputs.append(reward_input)
+        batch_sizes.append(self._infer_reward_batch_size(reward_input))
+        total_last_run_count += last_run_count
+
+        while len(reward_inputs) < self.aggregate_request_count:
+            if total_last_run_count >= self.local_num_train_envs:
+                break
+            next_request = self.try_recv_merged_reward_input(input_channel, mode=mode)
+            if next_request is None:
+                break
+            reward_input, last_run_count = next_request
+            reward_inputs.append(reward_input)
+            batch_sizes.append(self._infer_reward_batch_size(reward_input))
+            total_last_run_count += last_run_count
+
+        if len(reward_inputs) == 1:
+            return reward_inputs[0], batch_sizes, total_last_run_count
+        return (
+            cat_list_of_dict_tensor(reward_inputs, dim=0),
+            batch_sizes,
+            total_last_run_count,
+        )
+
+    def send_aggregated_reward_output(
+        self,
+        output_channel: Channel,
+        reward_tensor: torch.Tensor | np.ndarray | None,
+        batch_sizes: list[int],
+    ) -> None:
+        if reward_tensor is None:
+            for _ in batch_sizes:
+                self.send_reward_output(output_channel, None)
+            return
+
+        reward_splits = torch.split(reward_tensor, batch_sizes, dim=0)
+        for reward_split in reward_splits:
+            self.send_reward_output(output_channel, reward_split)
+
     async def compute_rewards_async(
         self, input_channel: Channel, output_channel: Channel
     ):
@@ -426,7 +511,7 @@ class EmbodiedRewardWorker(Worker):
 
     async def _compute_rewards(self, input_channel: Channel, output_channel: Channel):
         while True:
-            observations, _ = await self.recv_merged_reward_input(
+            observations, batch_sizes, _ = await self.recv_aggregated_reward_inputs(
                 input_channel, mode="train"
             )
             rewards = self.model.compute_reward(observations)
@@ -434,7 +519,7 @@ class EmbodiedRewardWorker(Worker):
             if rewards is not None and rewards.dim() == 1:
                 rewards = rewards.unsqueeze(-1)
 
-            self.send_reward_output(output_channel, rewards)
+            self.send_aggregated_reward_output(output_channel, rewards, batch_sizes)
 
     async def stop(self):
         if self._interact_task is not None and not self._interact_task.done():

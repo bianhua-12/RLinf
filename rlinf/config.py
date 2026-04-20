@@ -869,6 +869,37 @@ def validate_embodied_cfg(cfg):
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)
         assert weight_sync_interval > 0, "weight_sync_interval must be greater than 0"
         cfg.runner.weight_sync_interval = weight_sync_interval
+        if cfg.algorithm.loss_type == "embodied_sac":
+            pending_step_window = int(cfg.reward.get("pending_step_window", 1))
+            assert pending_step_window > 0, (
+                "reward.pending_step_window must be greater than 0"
+            )
+            cfg.reward.pending_step_window = pending_step_window
+
+            aggregate_request_count = int(cfg.reward.get("aggregate_request_count", 1))
+            assert aggregate_request_count > 0, (
+                "reward.aggregate_request_count must be greater than 0"
+            )
+            assert aggregate_request_count <= pending_step_window, (
+                "reward.aggregate_request_count must be less than or equal to "
+                "reward.pending_step_window"
+            )
+            cfg.reward.aggregate_request_count = aggregate_request_count
+            if cfg.get("reward", {}).get("use_reward_model", False):
+                assert cfg.reward.get("use_output_step", 0) == 0, (
+                    "Async embodied runs with external reward workers only support "
+                    "reward.use_output_step=0"
+                )
+            replay_save_checkpoint = bool(
+                cfg.algorithm.replay_buffer.get("save_checkpoint", True)
+            )
+            replay_load_checkpoint = bool(
+                cfg.algorithm.replay_buffer.get(
+                    "load_checkpoint", replay_save_checkpoint
+                )
+            )
+            cfg.algorithm.replay_buffer.save_checkpoint = replay_save_checkpoint
+            cfg.algorithm.replay_buffer.load_checkpoint = replay_load_checkpoint
         if (
             SupportedEnvType(cfg.env.train.env_type) == SupportedEnvType.MANISKILL
             or SupportedEnvType(cfg.env.eval.env_type) == SupportedEnvType.MANISKILL

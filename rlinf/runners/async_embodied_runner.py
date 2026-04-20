@@ -104,9 +104,6 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             return True
 
         rollout_handle, actor_handle = self._pending_rollout_weight_sync
-        self.logger.info(
-            f"Rollout handle done: {rollout_handle.done()}, actor handle done: {actor_handle.done()}"
-        )
         if no_wait and (not rollout_handle.done() or not actor_handle.done()):
             return False
 
@@ -136,6 +133,8 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         start_step = self.global_step
         start_time = time.time()
         self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
+        if self.reward is not None:
+            self.reward_channel = Channel.create("Reward")
 
         env_handle: Handle = self.env.interact(
             input_channel=self.env_channel,
@@ -157,6 +156,7 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         actor_handle: Handle = self.actor.recv_rollout_trajectories(
             input_channel=self.actor_channel
         )
+        actor_handle.wait()
 
         while self.global_step < self.max_steps:
             skip_step = False

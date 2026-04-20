@@ -4,6 +4,12 @@ Brief for AI coding agents working on RLinf. For full contribution flow, code st
 
 **Quick orientation:** RLinf is a distributed RL stack (embodied + reasoning + agent). It uses **Ray** for process management and **Hydra** for config. Single-machine runs use `cluster.num_nodes: 1`; multi-node needs Ray started on every node with `RLINF_NODE_RANK` set *before* `ray start`. Pre-commit runs Ruff (lint + format) and commit-check; use Google-style docstrings and type hints. All user-facing changes need tests and docs. If something is unclear, add a `TODO(agent)` and note the limitation.
 
+## Qwen3-VL environment notes
+
+- If you run Qwen3-VL video tooling or local evaluation helpers that import `qwen_vl_utils` (for example `toolkits/direct_qwen_5frame_eval.py`), install `qwen-vl-utils` in the active environment first.
+- For `qwen3_vl` / `qwen3_vl_moe` SFT or reward-model work, ensure `transformers>=4.57.1`. The VLM SFT docs in `docs/source-en/rst_source/examples/embodied/sft_vlm.rst` and `docs/source-zh/rst_source/examples/embodied/sft_vlm.rst` require that minimum version for Qwen3-VL training.
+- Be careful with version drift: some default extras in `pyproject.toml` still pin `transformers==4.51.1`, while embodied deps allow newer versions. For Qwen3-VL jobs, either upgrade the current env or use a dedicated env, e.g. `uv pip install qwen-vl-utils "transformers>=4.57.1,<=4.57.6"`.
+
 ---
 
 ## Code structure

@@ -31,3 +31,4 @@ lingbot-vla-4b/
 lingbot-vla-4b-posttrain-robotwin/
 RoboTwin/
 examples/embodiment/.ps__*
+wandb/
