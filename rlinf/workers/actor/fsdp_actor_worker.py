@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import pickle
 import time
 from functools import partial
 from typing import Optional
@@ -1233,7 +1234,79 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        self._maybe_dump_rollout_batch()
         return rollout_metrics
+
+    def _maybe_dump_rollout_batch(self) -> None:
+        dump_cfg = self.cfg.actor.get("rollout_dump", None)
+        if not dump_cfg or not dump_cfg.get("enabled", False):
+            return
+        interval = int(dump_cfg.get("interval", 1))
+        if interval <= 0 or self.version % interval != 0:
+            return
+
+        save_dir = os.path.expanduser(str(dump_cfg.get("save_dir", "")))
+        if not save_dir:
+            return
+        os.makedirs(save_dir, exist_ok=True)
+
+        include_obs = bool(dump_cfg.get("include_obs", True))
+        include_forward_inputs = bool(dump_cfg.get("include_forward_inputs", True))
+        batch = {}
+        for key, value in self.rollout_batch.items():
+            if key in ("curr_obs", "next_obs") and not include_obs:
+                continue
+            if key == "forward_inputs" and not include_forward_inputs:
+                continue
+            batch[key] = self._to_cpu_dump(value)
+
+        payload = {
+            "rank": self._rank,
+            "world_size": self._world_size,
+            "global_step": int(self.version),
+            "algorithm": {
+                "adv_type": self.cfg.algorithm.adv_type,
+                "gamma": float(self.cfg.algorithm.get("gamma", 1)),
+                "gae_lambda": float(self.cfg.algorithm.get("gae_lambda", 1)),
+                "reward_type": self.cfg.algorithm.reward_type,
+                "bootstrap_type": self.cfg.algorithm.get("bootstrap_type", None),
+            },
+            "shapes": self._shape_tree(batch),
+            "batch": batch,
+        }
+        path = os.path.join(
+            save_dir,
+            f"global_step_{int(self.version):06d}_rank_{self._rank:02d}.pkl",
+        )
+        with open(path, "wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        self.logger.info(f"[rollout_dump] wrote {path}")
+
+    def _to_cpu_dump(self, value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().contiguous()
+        if isinstance(value, dict):
+            return {key: self._to_cpu_dump(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._to_cpu_dump(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._to_cpu_dump(item) for item in value)
+        return value
+
+    def _shape_tree(self, value):
+        if isinstance(value, torch.Tensor):
+            return {
+                "type": "tensor",
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+            }
+        if isinstance(value, dict):
+            return {key: self._shape_tree(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._shape_tree(item) for item in value[:3]]
+        if isinstance(value, tuple):
+            return tuple(self._shape_tree(item) for item in value[:3])
+        return type(value).__name__
 
     def _build_sft_data_loader(self):
         if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:

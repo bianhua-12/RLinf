@@ -19,6 +19,7 @@ import re
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig
 
 from rlinf.config import SupportedModel
@@ -68,6 +69,118 @@ class FSDPVlmSftWorker(FSDPSftWorker):
                 ):
                     self.data_loader.sampler.set_epoch(self._data_epoch)
                 self.data_iter = iter(self.data_loader)
+
+    def _get_label_loss_cfg(self):
+        return self.cfg.actor.model.get("extra_label_loss", None)
+
+    def _get_valid_label_token_ids(self) -> torch.Tensor:
+        if hasattr(self, "_valid_label_token_ids"):
+            return self._valid_label_token_ids
+
+        label_loss_cfg = self._get_label_loss_cfg()
+        valid_answers = list(
+            label_loss_cfg.get("valid_answers", ["positive", "negative", "unchanged"])
+        )
+        token_ids = set()
+        for answer in valid_answers:
+            for text in (answer, f" {answer}"):
+                ids = self.tokenizer.encode(text, add_special_tokens=False)
+                if ids:
+                    token_ids.add(int(ids[0]))
+        if not token_ids:
+            raise ValueError("extra_label_loss.valid_answers produced no token ids.")
+
+        self._valid_label_token_ids = torch.tensor(
+            sorted(token_ids), dtype=torch.long, device=self.device
+        )
+        return self._valid_label_token_ids
+
+    def _get_label_token_ids(self, answer: str) -> torch.Tensor:
+        cache_name = f"_{answer}_label_token_ids"
+        if hasattr(self, cache_name):
+            return getattr(self, cache_name)
+
+        token_ids = set()
+        for text in (answer, f" {answer}"):
+            ids = self.tokenizer.encode(text, add_special_tokens=False)
+            if ids:
+                token_ids.add(int(ids[0]))
+        if not token_ids:
+            raise ValueError(f"Could not tokenize label answer: {answer}")
+
+        tensor = torch.tensor(sorted(token_ids), dtype=torch.long, device=self.device)
+        setattr(self, cache_name, tensor)
+        return tensor
+
+    def _compute_extra_label_loss(
+        self,
+        logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        label_mask: torch.Tensor,
+        answers: list[str] | None,
+    ) -> torch.Tensor:
+        label_loss_cfg = self._get_label_loss_cfg()
+        if not label_loss_cfg or not label_loss_cfg.get("enabled", False):
+            return logits.new_zeros(())
+
+        answer_mask = attention_mask & ~label_mask
+        has_answer = answer_mask.any(dim=1)
+        if not has_answer.any():
+            return logits.new_zeros(())
+
+        first_answer_pos = answer_mask.float().argmax(dim=1).long()
+        valid = has_answer & (first_answer_pos > 0)
+        if not valid.any():
+            return logits.new_zeros(())
+
+        batch_idx = torch.arange(input_ids.shape[0], device=input_ids.device)[valid]
+        pred_pos = first_answer_pos[valid] - 1
+        target_ids = input_ids[batch_idx, first_answer_pos[valid]]
+        answer_logits = logits[batch_idx, pred_pos, :]
+
+        token_ce = F.cross_entropy(answer_logits, target_ids, reduction="mean")
+
+        valid_token_ids = self._get_valid_label_token_ids()
+        log_probs = F.log_softmax(answer_logits, dim=-1)
+        valid_log_mass = torch.logsumexp(log_probs[:, valid_token_ids], dim=-1)
+        invalid_mass_loss = (-valid_log_mass).mean()
+
+        flip_loss = logits.new_zeros(())
+        if answers is not None:
+            selected_answers = [answers[int(i)] for i in batch_idx.detach().cpu().tolist()]
+            positive_mask = torch.tensor(
+                [str(answer).strip().lower() == "positive" for answer in selected_answers],
+                dtype=torch.bool,
+                device=answer_logits.device,
+            )
+            negative_mask = torch.tensor(
+                [str(answer).strip().lower() == "negative" for answer in selected_answers],
+                dtype=torch.bool,
+                device=answer_logits.device,
+            )
+            flip_terms = []
+            if positive_mask.any():
+                neg_ids = self._get_label_token_ids("negative")
+                neg_log_mass = torch.logsumexp(log_probs[positive_mask][:, neg_ids], dim=-1)
+                flip_terms.append(neg_log_mass.exp())
+            if negative_mask.any():
+                pos_ids = self._get_label_token_ids("positive")
+                pos_log_mass = torch.logsumexp(log_probs[negative_mask][:, pos_ids], dim=-1)
+                flip_terms.append(pos_log_mass.exp())
+            if flip_terms:
+                flip_loss = torch.cat(flip_terms).mean()
+
+        token_ce_coef = float(label_loss_cfg.get("token_ce_coef", 1.0))
+        invalid_mass_coef = float(label_loss_cfg.get("invalid_mass_coef", 2.0))
+        positive_negative_flip_coef = float(
+            label_loss_cfg.get("positive_negative_flip_coef", 2.0)
+        )
+        return (
+            token_ce_coef * token_ce
+            + invalid_mass_coef * invalid_mass_loss
+            + positive_negative_flip_coef * flip_loss
+        )
 
     def load_checkpoint(self, load_path: str):
         super().load_checkpoint(load_path)
@@ -300,6 +413,7 @@ class FSDPVlmSftWorker(FSDPSftWorker):
         for k, v in multi_modal_inputs.items():
             multi_modal_inputs[k] = v.to(device=self.device)
         label_mask = batch["label_mask"].to(device=self.device, dtype=torch.bool)
+        answers = batch.get("answer", None)
 
         labels = input_ids.detach().clone().masked_fill(~attention_mask, -100)
         # label_mask is encode by prompt without answer, so we need to mask the labels just save the answer tokens
@@ -314,4 +428,11 @@ class FSDPVlmSftWorker(FSDPSftWorker):
             )
 
         # train model return the loss
-        return outputs.loss
+        extra_loss = self._compute_extra_label_loss(
+            logits=outputs.logits,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            label_mask=label_mask,
+            answers=answers,
+        )
+        return outputs.loss + extra_loss

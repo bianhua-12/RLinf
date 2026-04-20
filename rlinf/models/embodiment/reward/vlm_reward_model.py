@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Optional
 
@@ -36,6 +37,8 @@ from rlinf.models.embodiment.reward.vlm_reward_utils.input_builder import (
 from rlinf.models.embodiment.reward.vlm_reward_utils.reward_parser import (
     get_reward_parser,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_reward_checkpoint_file(checkpoint_path: str) -> str:
@@ -284,6 +287,13 @@ class HistoryVLMRewardModel(VLMRewardModel):
     def __init__(self, cfg: DictConfig):
         self.history_buffer_names = list(cfg.history_buffers.keys())
         self.infer_micro_batch_size: int = int(cfg.get("infer_micro_batch_size", 0))
+        self.debug_dump_first_inference: bool = bool(
+            cfg.get("debug_dump_first_inference", False)
+        )
+        self.debug_dump_first_inference_dir: str = str(
+            cfg.get("debug_dump_first_inference_dir", "")
+        )
+        self._debug_dump_first_inference_done = False
 
         super().__init__(cfg)
 
@@ -331,6 +341,86 @@ class HistoryVLMRewardModel(VLMRewardModel):
             sliced_observations.update({observation_key: observation_values[start:end]})
         return sliced_observations
 
+    def _dump_first_inference_inputs(
+        self,
+        prepared_inputs: dict[str, Any],
+        valid_input_ids: list[int],
+        outputs: list[str],
+        start: int,
+    ) -> None:
+        if not self.debug_dump_first_inference or not valid_input_ids:
+            return
+
+        dump_dir = self.debug_dump_first_inference_dir or os.path.join(
+            os.getcwd(), "reward_first_inference_inputs"
+        )
+        worker_dir = os.path.join(dump_dir, f"pid_{os.getpid()}")
+        os.makedirs(worker_dir, exist_ok=True)
+
+        try:
+            import imageio.v2 as imageio
+            import numpy as np
+        except Exception as exc:
+            logger.warning("Failed to import imageio/numpy for reward dump: %s", exc)
+            return
+
+        videos_list = prepared_inputs.get("videos_list") or []
+        prompt_texts_list = prepared_inputs.get("prompt_texts_list") or []
+
+        def _frame_to_numpy(frame: Any) -> Any:
+            if isinstance(frame, torch.Tensor):
+                frame = frame.detach().cpu().numpy()
+            elif hasattr(frame, "__array__"):
+                frame = np.asarray(frame)
+            else:
+                frame = np.asarray(frame)
+
+            if frame.dtype != np.uint8:
+                frame = np.clip(frame, 0, 255).astype(np.uint8)
+            return frame[..., :3]
+
+        for local_idx, env_id in enumerate(valid_input_ids):
+            global_env_id = start + env_id
+            env_dir = os.path.join(worker_dir, f"env_{global_env_id:05d}")
+            os.makedirs(env_dir, exist_ok=True)
+
+            prompt = prompt_texts_list[local_idx][0]
+            output = outputs[local_idx] if local_idx < len(outputs) else ""
+            prompt_path = os.path.join(env_dir, "prompt_and_output.txt")
+            with open(prompt_path, "w", encoding="utf-8") as f:
+                f.write("PROMPT:\n")
+                f.write(prompt)
+                f.write("\n\nOUTPUT:\n")
+                f.write(output)
+                f.write("\n")
+
+            logger.warning(
+                "[reward_first_inference_dump] env=%s prompt_path=%s prompt=%s output=%s",
+                global_env_id,
+                prompt_path,
+                prompt,
+                output,
+            )
+
+            for video_idx, video in enumerate(videos_list[local_idx]):
+                video_path = os.path.join(env_dir, f"video_{video_idx:02d}.mp4")
+                frames = [_frame_to_numpy(frame) for frame in video]
+                if not frames:
+                    logger.warning(
+                        "[reward_first_inference_dump] skip empty video: env=%s video=%s",
+                        global_env_id,
+                        video_idx,
+                    )
+                    continue
+                imageio.mimsave(video_path, frames, fps=8)
+                logger.warning(
+                    "[reward_first_inference_dump] env=%s video=%s frames=%s path=%s",
+                    global_env_id,
+                    video_idx,
+                    len(frames),
+                    video_path,
+                )
+
     def compute_reward(
         self,
         reward_input: dict[str, Any],
@@ -344,20 +434,33 @@ class HistoryVLMRewardModel(VLMRewardModel):
         infer_micro_batch_size = self.infer_micro_batch_size or input_batch_size
 
         reward_chunks: list[torch.Tensor] = []
+        did_infer = False
         for start in range(0, input_batch_size, infer_micro_batch_size):
             end = min(start + infer_micro_batch_size, input_batch_size)
             micro_observations = self.slice_observations(observations, start, end)
             micro_history_input = self.slice_history_input(history_input, start, end)
             reward_chunk = torch.zeros((end - start,), dtype=torch.float32)
 
-            batched_inputs, valid_input_ids = self.input_builder.build_inputs(
+            valid_input_ids = self.input_builder.get_valid_input_ids(
                 micro_observations,
-                self._model.device,
                 micro_history_input,
             )
             if len(valid_input_ids) == 0:
                 reward_chunks.append(reward_chunk)
                 continue
+
+            prepared_inputs = self.input_builder.prepare_inputs(
+                micro_observations,
+                micro_history_input,
+                valid_input_ids,
+            )
+            batched_inputs = self.input_builder.process_inputs(prepared_inputs)
+            batched_inputs = {
+                key: value.to(self._model.device)
+                if isinstance(value, torch.Tensor)
+                else value
+                for key, value in batched_inputs.items()
+            }
 
             prompt_length = batched_inputs["input_ids"].shape[-1]
             output_ids = self._model.generate(**batched_inputs, **self.gen_kwargs)
@@ -367,6 +470,15 @@ class HistoryVLMRewardModel(VLMRewardModel):
                 output_ids[..., prompt_length:], skip_special_tokens=True
             )
             del output_ids
+            did_infer = True
+
+            if not self._debug_dump_first_inference_done:
+                self._dump_first_inference_inputs(
+                    prepared_inputs=prepared_inputs,
+                    valid_input_ids=valid_input_ids,
+                    outputs=outputs,
+                    start=start,
+                )
 
             reward_chunk[valid_input_ids] = self.reward_parser.parse_rewards(
                 outputs
@@ -374,4 +486,6 @@ class HistoryVLMRewardModel(VLMRewardModel):
             reward_chunks.append(reward_chunk)
             del outputs
 
+        if did_infer:
+            self._debug_dump_first_inference_done = True
         return torch.cat(reward_chunks, dim=0)

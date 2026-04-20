@@ -16,6 +16,7 @@ import ast
 import json
 import logging
 import os
+import pickle
 from io import BytesIO
 from typing import Any, Callable, Optional, Union
 
@@ -735,6 +736,16 @@ def _resolve_video_path(path: str, data_root: Optional[str]) -> str:
     return path
 
 
+def _frames_to_pil_list(frames: Any) -> list[Image.Image]:
+    arr = ast.literal_eval(frames) if isinstance(frames, str) else frames
+    images = []
+    for frame in arr:
+        frame_arr = torch.as_tensor(frame).detach().cpu().numpy()
+        image = Image.fromarray(frame_arr[..., :3].astype("uint8"))
+        images.append(image)
+    return images
+
+
 @VLMDatasetRegistry.register("robochallenge_progress_sft")
 class RoboChallengeProgressSFTDataset(VLMBaseDataset):
     """SFT dataset for RoboChallenge progress: full_video + video_clip 输入，与 pilot 一致。
@@ -1028,3 +1039,85 @@ class SimpleRobochallengeSFTDataset(RoboChallengeProgressSFTDataset):
             .lower()
         )
         return prompt_text, answer_text, [clip_path], [clip_path]
+
+
+@VLMDatasetRegistry.register("qwen_vl_video_sft")
+class QwenVlVideoSFTDataset(RoboChallengeProgressSFTDataset):
+    """SFT dataset for Qwen-VL records with two video views in segments.jsonl."""
+
+    @classmethod
+    def _parse_raw_record(
+        cls,
+        raw: dict[str, Any],
+        idx: int,
+        data_root: Optional[str],
+    ) -> tuple[str, str, list[Any], list[str]]:
+        pkl_path = raw.get("pkl_path")
+        if pkl_path:
+            resolved_pkl_path = _resolve_video_path(str(pkl_path), data_root)
+            with open(resolved_pkl_path, "rb") as f:
+                payload = pickle.load(f)
+            prompt_text = str(
+                raw.get("prompt") or raw.get("question") or payload.get("prompt") or ""
+            ).strip()
+            if not prompt_text:
+                raise ValueError(f"Sample {idx} missing prompt or question")
+
+            supervision = raw.get("supervision")
+            supervision_label = (
+                supervision.get("label", "") if isinstance(supervision, dict) else ""
+            )
+            answer_text = (
+                str(
+                    raw.get("answer")
+                    or raw.get("label")
+                    or supervision_label
+                    or payload.get("answer")
+                    or ""
+                )
+                .strip()
+                .lower()
+            )
+            main_frames = _frames_to_pil_list(payload["main_frames"])
+            third_frames = _frames_to_pil_list(payload["third_frames"])
+            return (
+                prompt_text,
+                answer_text,
+                [main_frames, third_frames],
+                [resolved_pkl_path],
+            )
+
+        clip_paths = raw.get("clip_paths")
+        if isinstance(clip_paths, list) and len(clip_paths) >= 2:
+            main_clip = clip_paths[0]
+            third_clip = clip_paths[1]
+        else:
+            main_clip = raw.get("main_clip_path") or raw.get("full_video")
+            third_clip = (
+                raw.get("third_clip_path")
+                or raw.get("secondary_clip_path")
+                or raw.get("video_clip")
+            )
+
+        if not main_clip or not third_clip:
+            raise ValueError(
+                f"Sample {idx} missing dual-view video paths: "
+                "expected clip_paths or main_clip_path/third_clip_path"
+            )
+
+        main_clip = _resolve_video_path(str(main_clip), data_root)
+        third_clip = _resolve_video_path(str(third_clip), data_root)
+        prompt_text = str(raw.get("prompt") or raw.get("question") or "").strip()
+        if not prompt_text:
+            raise ValueError(f"Sample {idx} missing prompt or question")
+
+        supervision = raw.get("supervision")
+        supervision_label = (
+            supervision.get("label", "") if isinstance(supervision, dict) else ""
+        )
+        answer_text = (
+            str(raw.get("answer") or raw.get("label") or supervision_label)
+            .strip()
+            .lower()
+        )
+        return prompt_text, answer_text, [main_clip, third_clip], [main_clip, third_clip]
