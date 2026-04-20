@@ -15,6 +15,7 @@
 import asyncio
 import queue
 import threading
+import time
 
 import torch
 
@@ -32,6 +33,7 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
     async def recv_rollout_trajectories(self, input_channel):
         if getattr(self, "_recv_queue", None) is None:
             self._recv_queue = queue.Queue()
+        self._recv_thread_exc = None
         if (
             getattr(self, "_recv_rollout_thread", None) is None
             or not self._recv_rollout_thread.is_alive()
@@ -44,13 +46,16 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
             self._recv_rollout_thread.start()
 
     def _recv_rollout_thread_main(self, input_channel):
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
-        while not self.should_stop:
-            for _ in range(split_num):
-                trajectory = input_channel.get()
-                self._recv_queue.put(trajectory)
+        try:
+            send_num = self._component_placement.get_world_size("env") * self.stage_num
+            recv_num = self._component_placement.get_world_size("actor")
+            split_num = compute_split_num(send_num, recv_num)
+            while not self.should_stop:
+                for _ in range(split_num):
+                    trajectory = input_channel.get()
+                    self._recv_queue.put(trajectory)
+        except Exception as exc:  # pragma: no cover - exercised via run_training
+            self._recv_thread_exc = exc
 
     def _drain_received_trajectories(self, max_trajectories: int | None = None):
         if getattr(self, "_recv_queue", None) is None:
@@ -81,12 +86,30 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
                 self.demo_buffer.add_trajectories(intervene_traj_list)
 
     async def _wait_for_replay_buffer_ready(self, min_buffer_size: int):
+        last_log_time = 0.0
         while True:
+            recv_thread_exc = getattr(self, "_recv_thread_exc", None)
+            if recv_thread_exc is not None:
+                raise RuntimeError(
+                    "Async SAC rollout intake thread failed."
+                ) from recv_thread_exc
             self._drain_received_trajectories(
                 max_trajectories=self.cfg.actor.get("recv_drain_max_trajectories", 256)
             )
             if await self.replay_buffer.is_ready_async(min_buffer_size):
+                self.log_info(
+                    "Replay buffer is ready for async SAC training: "
+                    f"size={len(self.replay_buffer)}, min_buffer_size={min_buffer_size}."
+                )
                 return
+            now = time.monotonic()
+            if now - last_log_time >= 10.0:
+                self.log_info(
+                    "Waiting for async SAC replay buffer readiness: "
+                    f"size={len(self.replay_buffer)}, min_buffer_size={min_buffer_size}, "
+                    f"recv_queue={self._recv_queue.qsize() if getattr(self, '_recv_queue', None) is not None else 0}."
+                )
+                last_log_time = now
             await asyncio.sleep(1)
 
     @Worker.timer("run_training")

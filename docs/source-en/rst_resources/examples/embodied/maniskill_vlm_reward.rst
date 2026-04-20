@@ -100,6 +100,7 @@ The other two configs mainly change the input builder and parser:
 
 - ``maniskill_ppo_mlp_qwen3vl4b_dualview_robochallenge_reward.yaml`` switches to ``dualview_robochallenge_input_builder``. It is designed for two-view clips and also supports the ``unchanged`` label.
 - ``maniskill_ppo_mlp_qwen3vl8b_confidance_robochallenge_reward.yaml`` uses ``confidence_robochallenge_reward_parser`` and two history buffers, ``full_history`` plus ``history_window``. It is closer to a progress-scoring setup than a plain binary classifier.
+- Sensor-based dual-view training is intended to use ``PickCubeDualView-v1``, which exposes ``sensor_data.base_camera`` plus ``sensor_data.orbit_camera`` so RLinf can populate ``extra_view_images`` without relying on the human render camera fallback.
 
 Current Implementation Notes
 ----------------------------
@@ -110,6 +111,7 @@ The current code path has a few details worth knowing:
 - In the main single-view config, the reward worker only consumes ``main_images`` history. ``extra_view_images`` are still present in env observations, but they are not used by ``simple_robochallenge_input_builder``.
 - ``robochallenge_reward_parser`` clamps final rewards into ``[0, 1]``. In practice, this means ``positive`` maps to a positive score while ``negative`` is clipped to ``0`` rather than becoming a signed penalty.
 - For the dual-view variant, ``dualview_robochallenge_input_builder`` reads both ``main_images`` and ``extra_view_images`` from ``history_input``. To get true two-view history inputs, both keys need to be recorded in the configured history buffer.
+- The active dual-view GAE-delta configs point their ManiSkill env id at ``PickCubeDualView-v1`` so the second view comes from a reset-sampled orbit sensor camera rather than ``render_camera``.
 - ``confidence_robochallenge_reward_parser`` also outputs values in ``[0, 1]``. For ``negative`` judgements it returns ``1 - confidence``, so it behaves as a bounded score rather than a signed penalty.
 
 Practical Notes

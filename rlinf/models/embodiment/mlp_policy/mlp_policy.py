@@ -113,6 +113,13 @@ class MLPPolicy(nn.Module, BasePolicy):
         )
         return {"states": batch["states"], "action": target_actions}
 
+    def get_replay_buffer_projection(self) -> dict[str, tuple[str, ...]]:
+        """Keep only state tensors in replay for state-based SAC training."""
+        return {
+            "curr_obs": ("states",),
+            "next_obs": ("states",),
+        }
+
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         obs = kwargs.get("obs")
         if obs is not None:

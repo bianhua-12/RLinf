@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import numpy as np
+import psutil
 import torch
 
 from rlinf.data.embodied_io_struct import Trajectory
@@ -54,6 +55,56 @@ class TrajectoryCache:
         self._traj_key_lengths: dict[int, dict] = {}
         self._last_slot = 0
         self._slot_to_id: dict[int, int] = {}
+
+    def _collect_allocation_estimates(
+        self,
+        trajectory: dict,
+        total_samples: int,
+        prefix: str = "",
+    ) -> list[tuple[str, int]]:
+        estimates: list[tuple[str, int]] = []
+        for key, value in trajectory.items():
+            path = f"{prefix}.{key}" if prefix else key
+            if isinstance(value, torch.Tensor):
+                per_sample = int(np.prod(value.shape[1:])) * value.element_size()
+                estimates.append((path, total_samples * per_sample))
+            elif isinstance(value, dict):
+                estimates.extend(
+                    self._collect_allocation_estimates(value, total_samples, path)
+                )
+        return estimates
+
+    def _buffer_nbytes(self, buffer: Optional[dict]) -> int:
+        if buffer is None:
+            return 0
+
+        total = 0
+        for value in buffer.values():
+            if isinstance(value, torch.Tensor):
+                total += value.numel() * value.element_size()
+            elif isinstance(value, dict):
+                total += self._buffer_nbytes(value)
+        return total
+
+    def _guard_allocation(self, trajectory: dict, total_samples: int) -> None:
+        estimates = self._collect_allocation_estimates(trajectory, total_samples)
+        requested_bytes = sum(size for _, size in estimates)
+        peak_bytes = requested_bytes + self._buffer_nbytes(self._buffer)
+        available_bytes = psutil.virtual_memory().available
+        if peak_bytes <= available_bytes:
+            return
+
+        largest_field, largest_bytes = max(estimates, key=lambda item: item[1])
+        raise MemoryError(
+            "Replay buffer allocation exceeds available host memory: "
+            f"requested={requested_bytes / (1024**3):.2f} GiB, "
+            f"peak={peak_bytes / (1024**3):.2f} GiB, "
+            f"available={available_bytes / (1024**3):.2f} GiB, "
+            f"largest_field={largest_field} "
+            f"({largest_bytes / (1024**3):.2f} GiB). "
+            "Reduce replay_buffer.sample_window_size/cache_size or drop image "
+            "observations from replay."
+        )
 
     def _get_key_lengths(self, trajectory: dict) -> dict:
         lengths: dict = {}
@@ -152,6 +203,7 @@ class TrajectoryCache:
         if self._traj_num_samples is None:
             self._traj_num_samples = max_num_samples
             total_samples = self.max_size * self._traj_num_samples
+            self._guard_allocation(trajectory, total_samples)
             self._buffer = self._alloc_buffer_like(trajectory, total_samples)
             return
         if max_num_samples <= self._traj_num_samples:
@@ -161,6 +213,7 @@ class TrajectoryCache:
         old_slot_len = self._traj_num_samples
         new_slot_len = max_num_samples
         new_total_samples = self.max_size * new_slot_len
+        self._guard_allocation(trajectory, new_total_samples)
         new_buffer = self._alloc_buffer_like(trajectory, new_total_samples)
 
         if self._buffer is not None:
@@ -240,6 +293,7 @@ class TrajectoryReplayBuffer:
         auto_save: bool = False,
         auto_save_path: str = "",
         trajectory_format: str = "pt",
+        trajectory_projection: Optional[dict[str, tuple[str, ...]]] = None,
     ):
         """
         Initialize trajectory-based replay buffer.
@@ -258,6 +312,15 @@ class TrajectoryReplayBuffer:
         self.sample_window_size = sample_window_size
         self.auto_save = auto_save
         self.logger = get_logger()
+        self.trajectory_projection = (
+            {
+                key: tuple(value)
+                for key, value in trajectory_projection.items()
+                if value is not None
+            }
+            if trajectory_projection is not None
+            else None
+        )
 
         if not self.auto_save:
             self.logger.warning(
@@ -730,23 +793,40 @@ class TrajectoryReplayBuffer:
                         tensor = tensor.reshape(traj_len, *tensor.shape[2:])
                 flat[field] = tensor.reshape(-1, *tensor.shape[2:])
 
-        if trajectory.curr_obs:
-            flat["curr_obs"] = {}
-            for key, tensor in trajectory.curr_obs.items():
+        def _flatten_tensor_dict(
+            tensor_dict: dict[str, torch.Tensor],
+            projection_key: str,
+        ) -> dict[str, torch.Tensor]:
+            if self.trajectory_projection is None:
+                keys = tensor_dict.keys()
+            else:
+                keys = self.trajectory_projection.get(projection_key, ())
+
+            flattened = {}
+            for key in keys:
+                if key not in tensor_dict:
+                    continue
+                tensor = tensor_dict[key]
                 if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
-                    flat["curr_obs"][key] = tensor.reshape(-1, *tensor.shape[2:])
+                    flattened[key] = tensor.reshape(-1, *tensor.shape[2:])
+            return flattened
+
+        if trajectory.curr_obs:
+            flat_curr_obs = _flatten_tensor_dict(trajectory.curr_obs, "curr_obs")
+            if flat_curr_obs:
+                flat["curr_obs"] = flat_curr_obs
 
         if trajectory.next_obs:
-            flat["next_obs"] = {}
-            for key, tensor in trajectory.next_obs.items():
-                if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
-                    flat["next_obs"][key] = tensor.reshape(-1, *tensor.shape[2:])
+            flat_next_obs = _flatten_tensor_dict(trajectory.next_obs, "next_obs")
+            if flat_next_obs:
+                flat["next_obs"] = flat_next_obs
 
         if trajectory.forward_inputs:
-            flat["forward_inputs"] = {}
-            for key, tensor in trajectory.forward_inputs.items():
-                if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
-                    flat["forward_inputs"][key] = tensor.reshape(-1, *tensor.shape[2:])
+            flat_forward_inputs = _flatten_tensor_dict(
+                trajectory.forward_inputs, "forward_inputs"
+            )
+            if flat_forward_inputs:
+                flat["forward_inputs"] = flat_forward_inputs
 
         return flat
 

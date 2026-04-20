@@ -59,6 +59,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.alpha_optimizer = None
         self.update_step = 0
         self.enable_drq = bool(getattr(self.cfg.actor, "enable_drq", False))
+        self.replay_buffer_projection = None
 
     def init_worker(self):
         self.setup_model_and_optimizer(initialize_target=True)
@@ -80,6 +81,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         """Setup model, lr_scheduler, optimizer and grad_scaler."""
         """Add initializing target model logic."""
         module = self.model_provider_func()
+        if hasattr(module, "get_replay_buffer_projection"):
+            self.replay_buffer_projection = module.get_replay_buffer_projection()
         if initialize_target:
             target_module = self.model_provider_func()
 
@@ -186,6 +189,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             trajectory_format=self.cfg.algorithm.replay_buffer.get(
                 "trajectory_format", "pt"
             ),
+            trajectory_projection=self.replay_buffer_projection,
         )
 
         min_demo_buffer_size = 0
@@ -749,6 +753,17 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         """
         return {}
 
+    def _should_save_replay_buffer_checkpoint(self) -> bool:
+        return bool(self.cfg.algorithm.replay_buffer.get("save_checkpoint", True))
+
+    def _should_load_replay_buffer_checkpoint(self) -> bool:
+        return bool(
+            self.cfg.algorithm.replay_buffer.get(
+                "load_checkpoint",
+                self._should_save_replay_buffer_checkpoint(),
+            )
+        )
+
     def save_checkpoint(self, save_base_path, step):
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
@@ -794,10 +809,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
 
         # save replay buffer
-        buffer_save_path = os.path.join(
-            save_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
-        )
-        self.replay_buffer.save_checkpoint(buffer_save_path)
+        if self._should_save_replay_buffer_checkpoint():
+            buffer_save_path = os.path.join(
+                save_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
+            )
+            self.replay_buffer.save_checkpoint(buffer_save_path)
 
     def load_checkpoint(self, load_base_path):
         # load model
@@ -825,9 +841,17 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         target_model_load_path = os.path.join(
             load_base_path, "sac_components/target_model"
         )
-        target_model_state_dict = torch.load(
-            os.path.join(target_model_load_path, f"checkpoint_rank_{self._rank}.pt")
+        target_model_rank_path = os.path.join(
+            target_model_load_path, f"checkpoint_rank_{self._rank}.pt"
         )
+        if not os.path.exists(target_model_rank_path):
+            # State-only SAC warmup commonly runs on a smaller actor world size.
+            # The saved target model is a full state dict per rank, so it is safe
+            # to reuse rank 0's checkpoint when resuming on more ranks.
+            target_model_rank_path = os.path.join(
+                target_model_load_path, "checkpoint_rank_0.pt"
+            )
+        target_model_state_dict = torch.load(target_model_rank_path)
         self._strategy.load_model_with_state_dict(
             self.target_model,
             target_model_state_dict,
@@ -836,7 +860,13 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
 
         # load replay buffer
-        buffer_load_path = os.path.join(
-            load_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
-        )
-        self.replay_buffer.load_checkpoint(buffer_load_path)
+        if self._should_load_replay_buffer_checkpoint():
+            buffer_load_path = os.path.join(
+                load_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
+            )
+            if not os.path.exists(buffer_load_path):
+                raise FileNotFoundError(
+                    "Replay buffer checkpoint is enabled for SAC resume, but "
+                    f"{buffer_load_path} does not exist."
+                )
+            self.replay_buffer.load_checkpoint(buffer_load_path)
