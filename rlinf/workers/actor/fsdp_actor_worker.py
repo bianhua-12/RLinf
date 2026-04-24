@@ -86,6 +86,10 @@ from rlinf.utils.utils import (
     reshape_entropy,
     retrieve_model_state_dict_in_cpu,
 )
+from rlinf.workers.actor.reward_transform import (
+    add_success_bonus_from_info_successes,
+    transform_rewards_with_gae_delta_sign,
+)
 from rlinf.workers.rollout.utils import RankMapper
 
 
@@ -1211,6 +1215,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Compute the advantages and returns.
         """
+        self._apply_reward_transform_to_rollout_batch()
+
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
@@ -1236,6 +1242,47 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
         self._maybe_dump_rollout_batch()
         return rollout_metrics
+
+    def _apply_reward_transform_to_rollout_batch(self) -> None:
+        """Apply optional reward transforms before advantage computation."""
+        reward_transform = self.cfg.algorithm.get("reward_transform", None)
+        if reward_transform is None:
+            return
+
+        rewards = self.rollout_batch["rewards"]
+        if reward_transform == "gae_delta_sign_5":
+            rewards = transform_rewards_with_gae_delta_sign(
+                rewards=rewards,
+                dones=self.rollout_batch["dones"],
+                gamma=self.cfg.algorithm.get("gamma", 1),
+                gae_lambda=self.cfg.algorithm.get("gae_lambda", 1),
+                history_steps=5,
+            )
+        elif reward_transform == "gae_delta_sign_5_plus_success10":
+            rewards = transform_rewards_with_gae_delta_sign(
+                rewards=rewards,
+                dones=self.rollout_batch["dones"],
+                gamma=self.cfg.algorithm.get("gamma", 1),
+                gae_lambda=self.cfg.algorithm.get("gae_lambda", 1),
+                history_steps=5,
+            )
+            successes = self.rollout_batch.get("successes", None)
+            if successes is None:
+                raise ValueError(
+                    "reward_transform=gae_delta_sign_5_plus_success10 requires "
+                    "rollout_batch['successes']."
+                )
+            rewards = add_success_bonus_from_info_successes(
+                rewards=rewards,
+                successes=successes,
+                success_bonus=10.0,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported reward_transform={reward_transform!r} for PPO actor."
+            )
+
+        self.rollout_batch["rewards"] = rewards
 
     def _maybe_dump_rollout_batch(self) -> None:
         dump_cfg = self.cfg.actor.get("rollout_dump", None)

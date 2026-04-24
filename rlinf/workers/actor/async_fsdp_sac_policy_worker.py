@@ -73,6 +73,7 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
         if not recv_list:
             return
 
+        recv_list = self._prepare_rollout_trajectories_for_replay(recv_list)
         self.replay_buffer.add_trajectories(recv_list)
 
         if self.demo_buffer is not None:
@@ -152,6 +153,19 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
         torch.distributed.barrier()
         torch.cuda.empty_cache()
         return mean_metric_dict
+
+    def get_replay_buffer_stats(self) -> dict[str, float]:
+        """Flush queued trajectories before reporting local replay buffer stats."""
+        self._drain_received_trajectories(
+            max_trajectories=self.cfg.actor.get("recv_drain_max_trajectories", 256)
+        )
+        stats = super().get_replay_buffer_stats()
+        stats["recv_queue"] = (
+            self._recv_queue.qsize()
+            if getattr(self, "_recv_queue", None) is not None
+            else 0
+        )
+        return stats
 
     async def stop(self):
         self.should_stop = True

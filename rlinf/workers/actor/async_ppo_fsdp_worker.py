@@ -62,6 +62,8 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
     @torch.inference_mode()
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
+        self._apply_reward_transform_to_rollout_batch()
+
         proximal_values = self.rollout_batch.get("proximal_values", None)
         prev_values = self.rollout_batch.get("prev_values", None)
 

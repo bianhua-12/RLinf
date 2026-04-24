@@ -45,6 +45,10 @@ from rlinf.utils.nested_dict_process import (
 )
 from rlinf.utils.utils import clear_memory
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+from rlinf.workers.actor.reward_transform import (
+    SUPPORTED_REWARD_TRANSFORMS,
+    apply_reward_transform_to_trajectories,
+)
 
 
 class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
@@ -250,6 +254,31 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             f"{self.target_update_type=} is not suppported!"
         )
 
+    def _prepare_rollout_trajectories_for_replay(
+        self, trajectories: list[Trajectory]
+    ) -> list[Trajectory]:
+        reward_transform = self.cfg.algorithm.get("reward_transform", None)
+        if reward_transform is None:
+            for trajectory in trajectories:
+                trajectory.successes = None
+            return trajectories
+
+        if reward_transform not in SUPPORTED_REWARD_TRANSFORMS:
+            raise ValueError(
+                f"Unsupported reward_transform={reward_transform!r}. "
+                f"Supported: {sorted(SUPPORTED_REWARD_TRANSFORMS)}"
+            )
+
+        return apply_reward_transform_to_trajectories(
+            trajectories,
+            reward_transform=reward_transform,
+            gamma=self.cfg.algorithm.get("gamma", 1.0),
+            gae_lambda=self.cfg.algorithm.get("gae_lambda", 1.0),
+            history_steps=5,
+            success_bonus=10.0,
+            clear_successes=True,
+        )
+
     def _init_target_shadow(self):
         """Create persistent float32 shadow of target model parameters.
 
@@ -330,6 +359,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
             recv_list.append(trajectory)
 
+        recv_list = self._prepare_rollout_trajectories_for_replay(recv_list)
         self.replay_buffer.add_trajectories(recv_list)
 
         if self.demo_buffer is not None:
@@ -745,6 +775,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         torch.distributed.barrier()
         torch.cuda.empty_cache()
         return mean_metric_dict
+
+    def get_replay_buffer_stats(self) -> dict[str, float]:
+        """Return local replay buffer statistics for diagnostics/prefill."""
+        return self.replay_buffer.get_stats()
 
     def compute_advantages_and_returns(self):
         """
