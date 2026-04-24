@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import h5py
+import numpy as np
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-dataset-dir", required=True)
     parser.add_argument("--traj-path", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--label-mode",
+        choices=("threshold", "global_tercile"),
+        default="threshold",
+    )
     parser.add_argument("--delta-threshold", type=float, default=0.2)
     parser.add_argument("--primary-view-index", type=int, default=0)
     parser.add_argument(
@@ -62,6 +68,19 @@ def ternary_label(delta: float, threshold: float) -> str:
     if delta > threshold:
         return "positive"
     if delta < -threshold:
+        return "negative"
+    return "unchanged"
+
+
+def tercile_label(
+    delta: float,
+    *,
+    lower_cutoff: float,
+    upper_cutoff: float,
+) -> str:
+    if delta >= upper_cutoff:
+        return "positive"
+    if delta <= lower_cutoff:
         return "negative"
     return "unchanged"
 
@@ -106,6 +125,33 @@ def group_rows_by_window(
     return grouped
 
 
+def compute_window_delta(
+    *,
+    key: tuple[int, int, int],
+    gae_values: list[float],
+) -> dict[str, float]:
+    _, start_step, end_step = key
+    start_gae = float(gae_values[start_step])
+    end_gae = float(gae_values[end_step])
+    gae_delta = end_gae - start_gae
+    return {
+        "start_gae": start_gae,
+        "end_gae": end_gae,
+        "gae_delta": gae_delta,
+    }
+
+
+def compute_global_tercile_cutoffs(
+    delta_by_key: dict[tuple[int, int, int], float],
+) -> tuple[float, float]:
+    if not delta_by_key:
+        raise ValueError("No unique windows were found for quantile labeling")
+    deltas = np.asarray(list(delta_by_key.values()), dtype=np.float64)
+    lower_cutoff = float(np.quantile(deltas, 1.0 / 3.0))
+    upper_cutoff = float(np.quantile(deltas, 2.0 / 3.0))
+    return lower_cutoff, upper_cutoff
+
+
 def build_dualview_prompt(task: str, window_size: int) -> str:
     return (
         f"You are currently performing the task: {task}. "
@@ -121,8 +167,11 @@ def build_dualview_record(
     primary_row: dict[str, Any],
     secondary_row: dict[str, Any],
     source_dataset_dir: Path,
-    gae_values: list[float],
-    delta_threshold: float,
+    start_gae: float,
+    end_gae: float,
+    gae_delta: float,
+    label: str,
+    score_metadata: dict[str, Any],
 ) -> dict[str, Any]:
     primary_meta = primary_row["segment_metadata"]
     secondary_meta = secondary_row["segment_metadata"]
@@ -131,11 +180,6 @@ def build_dualview_record(
     end_step = int(primary_meta["end_step"])
     window_size = int(primary_meta["window_size"])
     success = bool(primary_meta["success"])
-
-    start_gae = float(gae_values[start_step])
-    end_gae = float(gae_values[end_step])
-    gae_delta = end_gae - start_gae
-    label = ternary_label(gae_delta, delta_threshold)
 
     primary_clip_path = absolutize_clip_path(
         source_dataset_dir, primary_row["clip_path"]
@@ -185,13 +229,13 @@ def build_dualview_record(
             "score": gae_delta,
             "score_name": "gae_delta_window",
             "score_source": "ppo_gae_target",
-            "delta_threshold": float(delta_threshold),
             "start_gae": start_gae,
             "end_gae": end_gae,
             "start_value": start_gae,
             "end_value": end_gae,
             "alignment": base_supervision.get("alignment", "pre_action"),
             "checkpoint_path": base_supervision.get("checkpoint_path"),
+            **score_metadata,
         },
     }
 
@@ -215,6 +259,13 @@ def main() -> None:
     split_counts: dict[str, int] = {}
     label_counts: dict[str, dict[str, int]] = {}
     unique_window_counts: dict[str, int] = {}
+    unique_window_label_counts: dict[str, dict[str, int]] = {}
+    grouped_rows_by_split: dict[
+        str, dict[tuple[int, int, int], dict[int, dict[str, Any]]]
+    ] = {}
+    delta_stats_by_key: dict[tuple[int, int, int], dict[str, float]] = {}
+    window_label_by_key: dict[tuple[int, int, int], str] = {}
+    quantile_info: dict[str, Any] = {}
 
     with h5py.File(traj_path, "r") as traj_file:
         gae_cache: dict[int, list[float]] = {}
@@ -222,11 +273,52 @@ def main() -> None:
             input_manifest = source_dataset_dir / split / "segments.jsonl"
             rows = load_jsonl(input_manifest)
             grouped_rows = group_rows_by_window(rows)
+            grouped_rows_by_split[split] = grouped_rows
             unique_window_counts[split] = len(grouped_rows)
-            converted: list[dict[str, Any]] = []
 
             for key in sorted(grouped_rows):
                 episode_id, _, _ = key
+                if episode_id not in gae_cache:
+                    gae_cache[episode_id] = load_episode_gae(traj_file, episode_id)
+                if key not in delta_stats_by_key:
+                    delta_stats_by_key[key] = compute_window_delta(
+                        key=key,
+                        gae_values=gae_cache[episode_id],
+                    )
+
+        if args.label_mode == "global_tercile":
+            lower_cutoff, upper_cutoff = compute_global_tercile_cutoffs(
+                {key: stats["gae_delta"] for key, stats in delta_stats_by_key.items()}
+            )
+            quantile_info = {
+                "label_mode": "global_tercile_quantile",
+                "quantile_population": "unique_windows",
+                "lower_quantile": 1.0 / 3.0,
+                "upper_quantile": 2.0 / 3.0,
+                "lower_cutoff": lower_cutoff,
+                "upper_cutoff": upper_cutoff,
+            }
+            for key, stats in delta_stats_by_key.items():
+                window_label_by_key[key] = tercile_label(
+                    stats["gae_delta"],
+                    lower_cutoff=lower_cutoff,
+                    upper_cutoff=upper_cutoff,
+                )
+        else:
+            quantile_info = {
+                "label_mode": "threshold",
+                "delta_threshold": float(args.delta_threshold),
+            }
+            for key, stats in delta_stats_by_key.items():
+                window_label_by_key[key] = ternary_label(
+                    stats["gae_delta"], args.delta_threshold
+                )
+
+        for split in ("train", "eval"):
+            grouped_rows = grouped_rows_by_split[split]
+            converted: list[dict[str, Any]] = []
+            window_labels: list[str] = []
+            for key in sorted(grouped_rows):
                 views = grouped_rows[key]
                 if primary_view_index not in views:
                     raise ValueError(
@@ -238,9 +330,18 @@ def main() -> None:
                             f"Missing secondary view {secondary_view_index} for {key}"
                         )
 
-                if episode_id not in gae_cache:
-                    gae_cache[episode_id] = load_episode_gae(traj_file, episode_id)
-
+                score_stats = delta_stats_by_key[key]
+                label = window_label_by_key[key]
+                score_metadata = (
+                    {"delta_threshold": float(args.delta_threshold)}
+                    if args.label_mode == "threshold"
+                    else {
+                        "label_mode": "global_tercile_quantile",
+                        "quantile_population": "unique_windows",
+                        "lower_cutoff": quantile_info["lower_cutoff"],
+                        "upper_cutoff": quantile_info["upper_cutoff"],
+                    }
+                )
                 primary_row = views[primary_view_index]
                 for secondary_view_index in secondary_view_indices:
                     converted.append(
@@ -248,14 +349,22 @@ def main() -> None:
                             primary_row=primary_row,
                             secondary_row=views[secondary_view_index],
                             source_dataset_dir=source_dataset_dir,
-                            gae_values=gae_cache[episode_id],
-                            delta_threshold=args.delta_threshold,
+                            start_gae=score_stats["start_gae"],
+                            end_gae=score_stats["end_gae"],
+                            gae_delta=score_stats["gae_delta"],
+                            label=label,
+                            score_metadata=score_metadata,
                         )
                     )
+                window_labels.append(label)
 
             split_rows[split] = converted
             split_counts[split] = len(converted)
             label_counts[split] = summarize_labels(converted)
+            unique_window_label_counts[split] = {
+                label: int(count)
+                for label, count in sorted(Counter(window_labels).items())
+            }
 
     for split, rows in split_rows.items():
         write_jsonl(output_dir / split / "segments.jsonl", rows)
@@ -266,13 +375,14 @@ def main() -> None:
         "output_dir": str(output_dir),
         "target_field": "ppo_gae_target",
         "score_name": "gae_delta_window",
-        "delta_threshold": float(args.delta_threshold),
         "video_mode": "reuse_absolute_paths_dualview",
         "primary_view_index": primary_view_index,
         "secondary_view_indices": secondary_view_indices,
         "unique_window_counts": unique_window_counts,
+        "unique_window_label_counts": unique_window_label_counts,
         "split_counts": split_counts,
         "label_counts": label_counts,
+        **quantile_info,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "dataset_info.json").write_text(
