@@ -99,8 +99,7 @@ def _process_video_prompt_inputs(
             )
         except Exception:
             rendered_prompt = (
-                f"<|im_start|>user\n{user_content}<|im_end|>\n"
-                f"<|im_start|>assistant\n"
+                f"<|im_start|>user\n{user_content}<|im_end|>\n<|im_start|>assistant\n"
             )
 
         rendered_prompts.append(rendered_prompt)
@@ -514,9 +513,7 @@ class ThreeViewRobochallengeInputBuilder(RobochanallengeInputBuilder):
         main_clip_videos = self.extract_videos(history_window, ["main_images"])
         extra_clip_videos = self.extract_videos(history_window, ["extra_view_images"])
 
-        if not (
-            len(full_videos) == len(main_clip_videos) == len(extra_clip_videos)
-        ):
+        if not (len(full_videos) == len(main_clip_videos) == len(extra_clip_videos)):
             raise ValueError(
                 "Mismatched three-view history buffer batch sizes: "
                 f"full_history={len(full_videos)}, "

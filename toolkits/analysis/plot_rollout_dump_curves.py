@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """Plot per-step reward, cumulative return, and GAE target from rollout dumps."""
 
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import argparse
@@ -76,10 +90,18 @@ def plot(series: dict[str, torch.Tensor], png_path: Path, title: str) -> None:
     fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
     ax = axes[0]
     ax.plot(x, series["return"].numpy(), label="cumulative return", linewidth=1.8)
-    ax.plot(x, series["gae_target"].numpy(), label="GAE target (returns)", linewidth=1.5)
+    ax.plot(
+        x, series["gae_target"].numpy(), label="GAE target (returns)", linewidth=1.5
+    )
     ax.plot(x, series["value"].numpy(), label="old value", linewidth=1.2, alpha=0.8)
     ax2 = ax.twinx()
-    ax2.plot(x, series["reward"].numpy(), label="step reward", color="tab:green", linewidth=1.2)
+    ax2.plot(
+        x,
+        series["reward"].numpy(),
+        label="step reward",
+        color="tab:green",
+        linewidth=1.2,
+    )
     ax.set_ylabel("return / GAE target / value")
     ax2.set_ylabel("step reward")
     for pos in done_x:

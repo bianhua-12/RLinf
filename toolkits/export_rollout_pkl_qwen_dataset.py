@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """Export Qwen dual-view value-judge data from RLinf rollout dump pkl files."""
 
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import argparse
@@ -15,7 +29,6 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
-
 
 DEFAULT_TASK = "Pick up the red cube and place it on the green spot on the table."
 
@@ -283,13 +296,17 @@ def write_manifest(path: Path, samples: list[dict[str, Any]]) -> None:
             f.write(json.dumps(clean, ensure_ascii=False) + "\n")
 
 
-def materialize_clips(output_dir: Path, samples: list[dict[str, Any]], fps: int) -> None:
+def materialize_clips(
+    output_dir: Path, samples: list[dict[str, Any]], fps: int
+) -> None:
     by_dump: dict[Path, list[dict[str, Any]]] = defaultdict(list)
     for sample in samples:
         by_dump[Path(sample["_dump_path"])].append(sample)
 
     written = 0
-    for dump_idx, (dump_path, dump_samples) in enumerate(sorted(by_dump.items()), start=1):
+    for dump_idx, (dump_path, dump_samples) in enumerate(
+        sorted(by_dump.items()), start=1
+    ):
         with dump_path.open("rb") as f:
             payload = pickle.load(f)
         obs = payload["batch"]["curr_obs"]
@@ -334,7 +351,9 @@ def materialize_pkl_samples(output_dir: Path, samples: list[dict[str, Any]]) -> 
         by_dump[Path(sample["_dump_path"])].append(sample)
 
     written = 0
-    for dump_idx, (dump_path, dump_samples) in enumerate(sorted(by_dump.items()), start=1):
+    for dump_idx, (dump_path, dump_samples) in enumerate(
+        sorted(by_dump.items()), start=1
+    ):
         with dump_path.open("rb") as f:
             payload = pickle.load(f)
         obs = payload["batch"]["curr_obs"]
@@ -477,7 +496,9 @@ def collect_candidates(args: argparse.Namespace) -> dict[str, list[dict[str, Any
         main = to_numpy(batch["curr_obs"]["main_images"])
         third = get_extra_view(to_numpy(batch["curr_obs"]["extra_view_images"]))
         if main.shape[:2] != third.shape[:2]:
-            raise ValueError(f"View shape mismatch in {dump_path}: {main.shape} vs {third.shape}")
+            raise ValueError(
+                f"View shape mismatch in {dump_path}: {main.shape} vs {third.shape}"
+            )
         num_steps, num_envs = int(main.shape[0]), int(main.shape[1])
         rank = int(payload.get("rank", -1))
         global_step = int(payload.get("global_step", -1))
@@ -493,14 +514,18 @@ def collect_candidates(args: argparse.Namespace) -> dict[str, list[dict[str, Any
                 segments = episode_segments_from_dones(dones, num_steps, env_idx)
             else:
                 segments = [(0, num_steps - 1)]
-            for episode_segment_idx, (segment_start, segment_end) in enumerate(segments):
+            for episode_segment_idx, (segment_start, segment_end) in enumerate(
+                segments
+            ):
                 if segment_end - segment_start + 1 < args.window_size:
                     continue
                 max_start = segment_end - args.window_size + 1
                 for start in range(segment_start, max_start + 1, args.stride):
                     end = start + args.window_size - 1
                     delta = float(scores[end] - scores[start])
-                    label = label_from_delta(delta, positive_threshold, negative_threshold)
+                    label = label_from_delta(
+                        delta, positive_threshold, negative_threshold
+                    )
                     key = f"{dump_path.name}:env{env_idx}:s{start}:e{end}"
                     split = split_name(key, args.eval_ratio, args.seed)
                     base = (
@@ -518,7 +543,11 @@ def collect_candidates(args: argparse.Namespace) -> dict[str, list[dict[str, Any
                         "prompt": prompt,
                         "answer": label,
                         "messages": build_messages(
-                            prompt, str(main_rel), str(third_rel), label, args.window_size
+                            prompt,
+                            str(main_rel),
+                            str(third_rel),
+                            label,
+                            args.window_size,
                         ),
                         "main_clip_path": str(main_rel),
                         "third_clip_path": str(third_rel),
@@ -582,9 +611,7 @@ def collect_candidates(args: argparse.Namespace) -> dict[str, list[dict[str, Any
                             "stage": "early_stop",
                             "dump_idx": dump_i,
                             "num_dumps": len(dump_paths),
-                            "raw_counts": {
-                                k: dict(v) for k, v in raw_counts.items()
-                            },
+                            "raw_counts": {k: dict(v) for k, v in raw_counts.items()},
                         },
                         ensure_ascii=False,
                     ),
@@ -631,7 +658,11 @@ def main() -> None:
     }
     print(
         json.dumps(
-            {"stage": "materialize", "raw_counts": raw_counts, "final_counts": final_counts},
+            {
+                "stage": "materialize",
+                "raw_counts": raw_counts,
+                "final_counts": final_counts,
+            },
             ensure_ascii=False,
         ),
         flush=True,

@@ -21,7 +21,6 @@ from pathlib import Path
 
 import h5py
 
-
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[2]
     / "toolkits"

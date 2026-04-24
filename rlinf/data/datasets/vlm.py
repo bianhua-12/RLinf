@@ -1120,4 +1120,9 @@ class QwenVlVideoSFTDataset(RoboChallengeProgressSFTDataset):
             .strip()
             .lower()
         )
-        return prompt_text, answer_text, [main_clip, third_clip], [main_clip, third_clip]
+        return (
+            prompt_text,
+            answer_text,
+            [main_clip, third_clip],
+            [main_clip, third_clip],
+        )

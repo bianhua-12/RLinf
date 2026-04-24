@@ -148,25 +148,37 @@ class FSDPVlmSftWorker(FSDPSftWorker):
 
         flip_loss = logits.new_zeros(())
         if answers is not None:
-            selected_answers = [answers[int(i)] for i in batch_idx.detach().cpu().tolist()]
+            selected_answers = [
+                answers[int(i)] for i in batch_idx.detach().cpu().tolist()
+            ]
             positive_mask = torch.tensor(
-                [str(answer).strip().lower() == "positive" for answer in selected_answers],
+                [
+                    str(answer).strip().lower() == "positive"
+                    for answer in selected_answers
+                ],
                 dtype=torch.bool,
                 device=answer_logits.device,
             )
             negative_mask = torch.tensor(
-                [str(answer).strip().lower() == "negative" for answer in selected_answers],
+                [
+                    str(answer).strip().lower() == "negative"
+                    for answer in selected_answers
+                ],
                 dtype=torch.bool,
                 device=answer_logits.device,
             )
             flip_terms = []
             if positive_mask.any():
                 neg_ids = self._get_label_token_ids("negative")
-                neg_log_mass = torch.logsumexp(log_probs[positive_mask][:, neg_ids], dim=-1)
+                neg_log_mass = torch.logsumexp(
+                    log_probs[positive_mask][:, neg_ids], dim=-1
+                )
                 flip_terms.append(neg_log_mass.exp())
             if negative_mask.any():
                 pos_ids = self._get_label_token_ids("positive")
-                pos_log_mass = torch.logsumexp(log_probs[negative_mask][:, pos_ids], dim=-1)
+                pos_log_mass = torch.logsumexp(
+                    log_probs[negative_mask][:, pos_ids], dim=-1
+                )
                 flip_terms.append(pos_log_mass.exp())
             if flip_terms:
                 flip_loss = torch.cat(flip_terms).mean()

@@ -24,8 +24,8 @@ from rlinf.workers.actor.reward_transform import (
     add_success_bonus_from_info_successes,
     apply_reward_transform_to_trajectory,
     broadcast_success_once_to_episode_steps,
-    transform_trajectory_rewards_with_gae_delta_sign,
     transform_rewards_with_gae_delta_sign,
+    transform_trajectory_rewards_with_gae_delta_sign,
 )
 
 

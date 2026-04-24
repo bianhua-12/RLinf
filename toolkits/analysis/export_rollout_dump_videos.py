@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """Export rollout dump env videos with reward/return/GAE curves."""
 
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import argparse
@@ -35,7 +49,9 @@ def load_env_series(dump_path: Path, env_idx: int) -> dict[str, np.ndarray]:
     return out
 
 
-def draw_curve_panel(series: dict[str, np.ndarray], t: int, width: int, height: int) -> np.ndarray:
+def draw_curve_panel(
+    series: dict[str, np.ndarray], t: int, width: int, height: int
+) -> np.ndarray:
     panel = np.full((height, width, 3), 255, dtype=np.uint8)
     margin_l, margin_r, margin_t, margin_b = 55, 20, 28, 42
     x0, y0 = margin_l, margin_t
@@ -93,8 +109,18 @@ def draw_curve_panel(series: dict[str, np.ndarray], t: int, width: int, height: 
     for done_idx in np.where(series["done"])[0]:
         dx, _ = xy(int(done_idx), y_min)
         cv2.line(panel, (dx, y0), (dx, y1), (120, 120, 120), 1)
-    cv2.putText(panel, f"{y_max:.2f}", (5, y0 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
-    cv2.putText(panel, f"{y_min:.2f}", (5, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
+    cv2.putText(
+        panel,
+        f"{y_max:.2f}",
+        (5, y0 + 5),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.35,
+        (80, 80, 80),
+        1,
+    )
+    cv2.putText(
+        panel, f"{y_min:.2f}", (5, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1
+    )
     return panel
 
 
@@ -119,8 +145,24 @@ def export_video(dump_path: Path, env_idx: int, out_path: Path, fps: int) -> Non
     for t in range(n):
         top = np.concatenate([main[t], extra[t]], axis=1)
         top = np.ascontiguousarray(top)
-        cv2.putText(top, "main view", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(top, "extra/third view", (w + 10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(
+            top,
+            "main view",
+            (10, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            top,
+            "extra/third view",
+            (w + 10, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+        )
         panel = draw_curve_panel(series, t, frame_w, curve_h)
         frame = np.concatenate([top, panel], axis=0)
         writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))

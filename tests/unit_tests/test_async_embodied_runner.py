@@ -14,7 +14,6 @@
 
 import asyncio
 import os
-import queue
 import sys
 
 from omegaconf import OmegaConf

@@ -336,7 +336,9 @@ class EmbodiedRewardWorker(Worker):
 
         batches: list[dict[str, Any]] = []
         last_run_count = 0
-        for (src_rank, expected_size), queue_key in zip(src_ranks_and_sizes, queue_keys):
+        for (src_rank, expected_size), queue_key in zip(
+            src_ranks_and_sizes, queue_keys
+        ):
             data = input_channel.get(key=queue_key)
             actual_size = self._infer_reward_batch_size(data)
             assert actual_size == expected_size, (

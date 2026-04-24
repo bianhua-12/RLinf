@@ -20,7 +20,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-
 LOCAL_CRITIC_PREFIX = "critic."
 RLINF_VALUE_HEAD_PREFIX = "value_head.mlp."
 

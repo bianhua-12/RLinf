@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """Plot env return, env reward, and PPO GAE target from RLinf logs."""
 
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import argparse
@@ -99,11 +113,15 @@ def plot(rows: list[dict[str, float | int]], png_path: Path, title: str) -> None
 
     ax = axes[0]
     ax.plot(steps, env_returns, label="Environment/return", linewidth=1.8)
-    ax.plot(steps, gae_targets, label="Rollout/returns_mean (GAE target)", linewidth=1.8)
+    ax.plot(
+        steps, gae_targets, label="Rollout/returns_mean (GAE target)", linewidth=1.8
+    )
     ax.set_ylabel("return / GAE target")
     ax.grid(True, alpha=0.25)
     ax2 = ax.twinx()
-    ax2.plot(steps, env_rewards, label="Environment/reward", color="tab:green", linewidth=1.5)
+    ax2.plot(
+        steps, env_rewards, label="Environment/reward", color="tab:green", linewidth=1.5
+    )
     ax2.set_ylabel("env reward")
     lines, labels = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
@@ -127,14 +145,18 @@ def plot(rows: list[dict[str, float | int]], png_path: Path, title: str) -> None
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log", type=Path, required=True, help="Path to run_embodiment.log")
+    parser.add_argument(
+        "--log", type=Path, required=True, help="Path to run_embodiment.log"
+    )
     parser.add_argument("--out-dir", type=Path, default=None)
     args = parser.parse_args()
 
     out_dir = args.out_dir or args.log.parent / "analysis"
     rows = parse_log(args.log)
     if not rows:
-        raise SystemExit(f"No aligned return/reward/GAE target metrics found in {args.log}")
+        raise SystemExit(
+            f"No aligned return/reward/GAE target metrics found in {args.log}"
+        )
 
     csv_path = out_dir / "return_reward_gae_target.csv"
     png_path = out_dir / "return_reward_gae_target.png"

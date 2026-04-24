@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -275,7 +274,7 @@ def label_from_qwen_score(score: float) -> str:
 
 
 def _confusion_from_records(records: list[AuditRecord]) -> dict[str, dict[str, int]]:
-    matrix = {label: {target: 0 for target in LABELS} for label in LABELS}
+    matrix = {label: dict.fromkeys(LABELS, 0) for label in LABELS}
     for record in records:
         matrix[record.oracle_label][record.qwen_label] += 1
     return matrix

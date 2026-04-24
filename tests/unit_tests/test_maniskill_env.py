@@ -103,14 +103,13 @@ def _get_allowed_secondary_pose_raws(base_env) -> list[np.ndarray]:
         azimuth_views=base_env.orbit_azimuth_views,
         reference_pose=reference_pose,
     )
-    return [
-        np.concatenate([pose.p, pose.q]).astype(np.float32)
-        for pose in poses[1:]
-    ]
+    return [np.concatenate([pose.p, pose.q]).astype(np.float32) for pose in poses[1:]]
 
 
 def _get_orbit_camera_pose_raw(base_env) -> np.ndarray:
-    return common.to_numpy(base_env.orbit_camera_mount.pose.raw_pose)[0].astype(np.float32)
+    return common.to_numpy(base_env.orbit_camera_mount.pose.raw_pose)[0].astype(
+        np.float32
+    )
 
 
 def test_wrap_obs_uses_render_camera_when_no_extra_sensor_view():
@@ -161,7 +160,9 @@ def test_pickcube_dualview_env_exposes_orbit_camera_and_allowed_pose():
         )
 
         base_extrinsic = np.asarray(obs["sensor_param"]["base_camera"]["extrinsic_cv"])
-        orbit_extrinsic = np.asarray(obs["sensor_param"]["orbit_camera"]["extrinsic_cv"])
+        orbit_extrinsic = np.asarray(
+            obs["sensor_param"]["orbit_camera"]["extrinsic_cv"]
+        )
         assert not np.allclose(base_extrinsic, orbit_extrinsic)
 
         base_env = env.unwrapped
@@ -269,7 +270,9 @@ def test_pickcube_dualview_real_env_produces_sensor_extra_view_images():
         )
         history_input = {
             "history_window": {
-                "main_images": [[obs["main_images"][0].cpu(), next_obs["main_images"][0].cpu()]],
+                "main_images": [
+                    [obs["main_images"][0].cpu(), next_obs["main_images"][0].cpu()]
+                ],
                 "extra_view_images": [
                     [
                         obs["extra_view_images"][0].cpu(),

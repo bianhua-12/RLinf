@@ -239,7 +239,9 @@ class ManiskillEnv(gym.Env):
 
         render_rgb_array_fn = getattr(self.env.unwrapped, "render_rgb_array", None)
         if callable(render_rgb_array_fn):
-            return self._normalize_extra_view_images(render_rgb_array_fn("render_camera"))
+            return self._normalize_extra_view_images(
+                render_rgb_array_fn("render_camera")
+            )
 
         render_fn = getattr(self.env, "render", None)
         if callable(render_fn):
