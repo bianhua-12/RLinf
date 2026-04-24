@@ -127,8 +127,8 @@ def test_env_pending_reward_drain_preserves_fifo_order():
     worker.reward_pending_step_window = 2
 
     finalized = []
-    worker.recv_pending_reward_output = (
-        lambda recv_channel, env_output: torch.tensor([1.0], dtype=torch.float32)
+    worker.recv_pending_reward_output = lambda recv_channel, env_output: torch.tensor(
+        [1.0], dtype=torch.float32
     )
     worker.finalize_pending_rollout_step = (
         lambda pending_step, reward_model_output, env_metrics: finalized.append(
@@ -218,6 +218,51 @@ def test_env_bootstrap_pending_step_does_not_append_actions():
     assert rollout_result.forward_inputs == []
     assert len(rollout_result.prev_values) == 1
     assert rollout_result.prev_values[0].shape == (2, 1)
+
+
+def test_env_finalize_pending_step_tracks_reward_successes_from_success_flags():
+    worker = object.__new__(EnvWorker)
+    worker.collect_prev_infos = True
+    worker.reward_mode = "per_step"
+    worker.history_reward_assign = False
+    worker.rollout_results = [EmbodiedRolloutResult(max_episode_length=8)]
+    worker.compute_bootstrap_rewards = (
+        lambda env_output, bootstrap_values, reward_model_output: torch.ones((2, 1))
+    )
+
+    pending_step = PendingRolloutStep(
+        stage_id=0,
+        env_output=EnvOutput(
+            obs={"state": torch.zeros((2, 1), dtype=torch.float32)},
+            dones=torch.tensor([[False], [True]], dtype=torch.bool),
+            terminations=torch.tensor([[False], [True]], dtype=torch.bool),
+            truncations=torch.zeros((2, 1), dtype=torch.bool),
+            rewards=torch.zeros((2, 1), dtype=torch.float32),
+            successes=torch.tensor([[True], [False]], dtype=torch.bool),
+        ),
+        rollout_result=RolloutResult(
+            actions=torch.zeros((2, 8), dtype=torch.float32),
+            prev_logprobs=torch.zeros((2, 8), dtype=torch.float32),
+            prev_values=torch.zeros((2, 1), dtype=torch.float32),
+            bootstrap_values=torch.zeros((2, 1), dtype=torch.float32),
+            forward_inputs={"action": torch.zeros((2, 1, 8), dtype=torch.float32)},
+            versions=torch.zeros((2, 1), dtype=torch.float32),
+        ),
+        reward_required=False,
+        append_rollout_payload=False,
+    )
+
+    worker.finalize_pending_rollout_step(
+        pending_step=pending_step,
+        reward_model_output=None,
+        env_metrics=defaultdict(list),
+    )
+
+    rollout_result = worker.rollout_results[0]
+    assert torch.equal(
+        rollout_result.reward_successes[0],
+        torch.tensor([[True], [False]], dtype=torch.bool),
+    )
 
 
 def test_env_update_last_logical_step_prefers_pending_step():

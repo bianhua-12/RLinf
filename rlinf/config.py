@@ -869,6 +869,22 @@ def validate_embodied_cfg(cfg):
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)
         assert weight_sync_interval > 0, "weight_sync_interval must be greater than 0"
         cfg.runner.weight_sync_interval = weight_sync_interval
+        reward_transform = cfg.algorithm.get("reward_transform", None)
+        if reward_transform is not None:
+            assert reward_transform in {
+                "episode_success_once_only",
+                "gae_delta_sign_1_plus_episode_success10",
+                "gae_delta_sign_5",
+                "gae_delta_sign_5_plus_episode_success10",
+                "gae_delta_sign_5_plus_success10",
+            }, (
+                "algorithm.reward_transform must be one of "
+                "{episode_success_once_only, "
+                "gae_delta_sign_1_plus_episode_success10, "
+                "gae_delta_sign_5, "
+                "gae_delta_sign_5_plus_episode_success10, "
+                "gae_delta_sign_5_plus_success10}"
+            )
         if cfg.algorithm.loss_type == "embodied_sac":
             pending_step_window = int(cfg.reward.get("pending_step_window", 1))
             assert pending_step_window > 0, (
@@ -890,6 +906,71 @@ def validate_embodied_cfg(cfg):
                     "Async embodied runs with external reward workers only support "
                     "reward.use_output_step=0"
                 )
+            oracle_delta_gae_enable = bool(
+                cfg.get("reward", {}).get("oracle_delta_gae", {}).get("enable", False)
+            )
+            assert not (
+                oracle_delta_gae_enable
+                and cfg.get("reward", {}).get("use_reward_model", False)
+            ), (
+                "reward.oracle_delta_gae.enable and reward.use_reward_model cannot "
+                "be enabled at the same time"
+            )
+            cfg.reward.normalize_total_reward = bool(
+                cfg.reward.get("normalize_total_reward", False)
+            )
+            cfg.reward.normalization_mode = cfg.reward.get(
+                "normalization_mode", "batch_zscore"
+            )
+            cfg.reward.normalization_eps = float(
+                cfg.reward.get("normalization_eps", 1.0e-6)
+            )
+            assert cfg.reward.normalization_eps > 0.0, (
+                "reward.normalization_eps must be greater than 0"
+            )
+            if cfg.reward.normalize_total_reward:
+                assert cfg.reward.normalization_mode == "batch_zscore", (
+                    "Only reward.normalization_mode=batch_zscore is supported"
+                )
+            cfg.reward.success_bonus = float(cfg.reward.get("success_bonus", 0.0))
+            if oracle_delta_gae_enable:
+                assert cfg.reward.reward_mode == "history_buffer", (
+                    "Oracle delta-GAE reward currently requires reward.reward_mode="
+                    "history_buffer"
+                )
+                assert cfg.actor.model.num_action_chunks == 1, (
+                    "Oracle delta-GAE reward currently only supports "
+                    "actor.model.num_action_chunks == 1"
+                )
+                assert cfg.env.train.reward_mode == "raw", (
+                    "Oracle delta-GAE reward expects env.train.reward_mode=raw so "
+                    "the PPO GAE target is computed from raw environment rewards"
+                )
+                oracle_cfg = cfg.reward.oracle_delta_gae
+                assert oracle_cfg.get("value_checkpoint_path", None), (
+                    "reward.oracle_delta_gae.value_checkpoint_path must be set "
+                    "when oracle delta-GAE reward is enabled"
+                )
+                oracle_cfg.label_mode = oracle_cfg.get("label_mode", "threshold")
+                assert oracle_cfg.label_mode in {"threshold", "batch_tercile"}, (
+                    "reward.oracle_delta_gae.label_mode must be one of "
+                    "{threshold, batch_tercile}"
+                )
+                oracle_cfg.gamma = float(oracle_cfg.get("gamma", 0.8))
+                oracle_cfg.gae_lambda = float(oracle_cfg.get("gae_lambda", 0.9))
+                oracle_cfg.delta_threshold = float(
+                    oracle_cfg.get("delta_threshold", 0.2)
+                )
+                oracle_cfg.positive_reward = float(
+                    oracle_cfg.get("positive_reward", 1.0)
+                )
+                oracle_cfg.unchanged_reward = float(
+                    oracle_cfg.get("unchanged_reward", 0.0)
+                )
+                oracle_cfg.negative_reward = float(
+                    oracle_cfg.get("negative_reward", -0.5)
+                )
+                oracle_cfg.device = oracle_cfg.get("device", "cpu")
             replay_save_checkpoint = bool(
                 cfg.algorithm.replay_buffer.get("save_checkpoint", True)
             )
