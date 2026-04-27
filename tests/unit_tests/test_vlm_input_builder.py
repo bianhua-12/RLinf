@@ -15,6 +15,7 @@
 import os
 import sys
 
+import numpy as np
 import pytest
 import torch
 
@@ -86,14 +87,7 @@ def test_extract_videos_keeps_env_and_timestep_axes():
     assert [frame.getpixel((0, 0))[0] for frame in videos[3][0]] == [30, 31]
 
 
-@pytest.mark.parametrize(
-    ("singleton_batch", "num_views"),
-    [(True, 1), (False, 2)],
-    ids=["singleton_bhwc", "multiview"],
-)
-def test_extract_videos_rejects_unsupported_frame_shapes(
-    singleton_batch: bool, num_views: int
-):
+def test_extract_videos_squeezes_singleton_frame_axes():
     builder = VideoVLMInputBuilder(
         _processor=None,
         history_buffer_names=["history_window"],
@@ -101,12 +95,47 @@ def test_extract_videos_rejects_unsupported_frame_shapes(
     history = _make_history_buffer(
         batch_size=1,
         env_ids=[0],
-        singleton_batch=singleton_batch,
-        num_views=num_views,
+        singleton_batch=True,
     )
+
+    videos = builder.extract_videos(history)
+
+    assert len(videos) == 1
+    assert len(videos[0]) == 1
+    assert len(videos[0][0]) == 2
+    assert videos[0][0][0].size == (2, 2)
+
+
+def test_extract_videos_rejects_unsupported_multiview_frame_shapes():
+    builder = VideoVLMInputBuilder(
+        _processor=None,
+        history_buffer_names=["history_window"],
+    )
+    history = _make_history_buffer(batch_size=1, env_ids=[0], num_views=2)
 
     with pytest.raises(TypeError, match="Cannot handle this data type"):
         builder.extract_videos(history)
+
+
+def test_extract_videos_accepts_numpy_history_frames():
+    builder = VideoVLMInputBuilder(
+        _processor=None,
+        history_buffer_names=["history_window"],
+    )
+    history = {
+        "main_images": [
+            [
+                np.zeros((2, 2, 3), dtype=np.uint8),
+                np.ones((2, 2, 3), dtype=np.uint8),
+            ]
+        ]
+    }
+
+    videos = builder.extract_videos(history)
+
+    assert len(videos) == 1
+    assert len(videos[0][0]) == 2
+    assert [frame.getpixel((0, 0))[0] for frame in videos[0][0]] == [0, 1]
 
 
 def test_robochallenge_prepare_inputs_aligns_selected_envs_and_video_order():

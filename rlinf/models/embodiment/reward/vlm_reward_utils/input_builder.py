@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
+import numpy as np
 import torch
 from PIL import Image
 from transformers import AutoProcessor
@@ -30,22 +31,50 @@ logger = logging.getLogger(__name__)
 
 
 def _to_pil_images(
-    images: Union[torch.Tensor, list[torch.Tensor]],
+    images: Union[torch.Tensor, np.ndarray, list[Any]],
 ) -> list[Image.Image]:
     """Convert EnvOutput image tensors to per-sample PIL image lists.
 
-    Expected EnvOutput image formats: [B, H, W, C]
+    Expected EnvOutput image formats: [B, H, W, C].
+    Some envs keep singleton view/batch axes in history frames, for example
+    [T, 1, H, W, C]. Those axes are folded away before PIL conversion.
     """
     if isinstance(images, torch.Tensor):
         arr = images.detach().cpu().numpy()
+    elif isinstance(images, np.ndarray):
+        arr = images
     elif isinstance(images, list):
         if len(images) == 0:
             return []
-        arr = torch.stack(images).cpu().numpy()
+        if isinstance(images[0], Image.Image):
+            return [image.convert("RGB") for image in images]
+        arrays = []
+        for image in images:
+            if isinstance(image, torch.Tensor):
+                arrays.append(image.detach().cpu().numpy())
+            else:
+                arrays.append(np.asarray(image))
+        arr = np.stack(arrays, axis=0)
+    else:
+        arr = np.asarray(images)
+
+    while arr.ndim > 4:
+        singleton_axes = [
+            axis for axis in range(1, arr.ndim - 3) if arr.shape[axis] == 1
+        ]
+        if not singleton_axes:
+            break
+        arr = arr.squeeze(axis=singleton_axes[0])
+
+    if arr.ndim == 3:
+        arr = arr[None, ...]
 
     per_sample: list[Image.Image] = []
     for i in range(arr.shape[0]):
-        per_sample.append(Image.fromarray(arr[i][..., :3]).convert("RGB"))
+        image = arr[i][..., :3]
+        if image.dtype != np.uint8:
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        per_sample.append(Image.fromarray(image).convert("RGB"))
     return per_sample  # [B, H, W, C]
 
 

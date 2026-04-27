@@ -392,7 +392,8 @@ class MultiStepRolloutWorker(Worker):
         self.update_dagger_beta()
         for _ in range(self.n_train_chunk_steps):
             for _ in range(self.num_pipeline_stages):
-                env_output = await self.recv_env_output(input_channel)
+                with self.worker_timer("recv_env_output"):
+                    env_output = await self.recv_env_output(input_channel)
                 actions, result = self.predict(env_output["obs"])
 
                 save_flags = None
@@ -422,9 +423,13 @@ class MultiStepRolloutWorker(Worker):
                         dtype=torch.float32,
                     ),
                 )
-                self.send_rollout_result(output_channel, rollout_result, mode="train")
+                with self.worker_timer("send_rollout_result"):
+                    self.send_rollout_result(
+                        output_channel, rollout_result, mode="train"
+                    )
         for _ in range(self.num_pipeline_stages):
-            env_output = await self.recv_env_output(input_channel)
+            with self.worker_timer("recv_env_output"):
+                env_output = await self.recv_env_output(input_channel)
             actions, result = self.predict(env_output["obs"])
 
             rollout_result = RolloutResult(
@@ -434,7 +439,8 @@ class MultiStepRolloutWorker(Worker):
                     env_output.get("final_obs", None)
                 ),
             )
-            self.send_rollout_result(output_channel, rollout_result, mode="train")
+            with self.worker_timer("send_rollout_result"):
+                self.send_rollout_result(output_channel, rollout_result, mode="train")
 
     async def generate(
         self,

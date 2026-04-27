@@ -268,6 +268,31 @@ def test_history_vlm_reward_model_keeps_micro_batch_order():
     assert model.input_builder.calls == [[10, 11], [12, 13]]
 
 
+def test_history_vlm_reward_model_reports_profile_metrics():
+    model = _TestHistoryVLMRewardModel(_make_cfg(infer_micro_batch_size=2))
+
+    rewards = model.compute_reward(_make_reward_input([10, 11, 12, 13]))
+    metrics = model.pop_profile_metrics()
+
+    assert torch.equal(rewards, torch.tensor([10.0, 11.0, 12.0, 13.0]))
+    assert metrics["reward/vlm/input_batch_size"] == 4.0
+    assert metrics["reward/vlm/micro_batch_count"] == 2.0
+    for key in [
+        "reward/vlm/total",
+        "reward/vlm/get_valid_input_ids",
+        "reward/vlm/prepare_inputs",
+        "reward/vlm/process_inputs",
+        "reward/vlm/to_device",
+        "reward/vlm/generate",
+        "reward/vlm/decode",
+        "reward/vlm/parse",
+    ]:
+        assert key in metrics
+        assert metrics[key] >= 0.0
+
+    assert model.pop_profile_metrics() == {}
+
+
 def test_history_vlm_reward_model_writes_sparse_valid_envs_back_to_slots():
     model = _TestHistoryVLMRewardModel(_make_cfg(infer_micro_batch_size=2))
 

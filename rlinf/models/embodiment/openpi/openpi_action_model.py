@@ -486,7 +486,18 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             processed_obs["observation/state_ee_rot"] = state[:, 3:6]
             processed_obs["observation/state_gripper"] = state[:, 6:7]
         else:
-            processed_obs["observation/state"] = env_obs["states"]
+            state = env_obs["states"]
+            expected_state_dim = self.config.dsrl_state_dim
+            if (
+                "maniskill" in self.config.config_name
+                and state.shape[-1] != expected_state_dim
+            ):
+                if state.shape[-1] > expected_state_dim:
+                    state = state[..., :expected_state_dim]
+                else:
+                    pad_width = expected_state_dim - state.shape[-1]
+                    state = torch.nn.functional.pad(state, (0, pad_width))
+            processed_obs["observation/state"] = state
         # wrist image observation
         if env_obs["wrist_images"] is not None:
             processed_obs["observation/wrist_image"] = env_obs["wrist_images"]

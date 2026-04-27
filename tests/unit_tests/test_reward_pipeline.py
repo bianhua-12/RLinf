@@ -15,7 +15,9 @@
 import asyncio
 from collections import defaultdict, deque
 
+import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
@@ -23,6 +25,7 @@ from rlinf.data.embodied_io_struct import (
     EnvOutput,
     RolloutResult,
 )
+from rlinf.envs.realworld.franka.franka_env import FrankaEnv, FrankaRobotConfig
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.workers.env.env_worker import EnvWorker, PendingRolloutStep
 from rlinf.workers.reward.reward_worker import EmbodiedRewardWorker
@@ -54,6 +57,29 @@ class _FakeKeyedChannel:
         self.puts.append((key, item, async_op))
 
 
+class _FakeStandaloneRewardModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.compute_reward_input = None
+        self.to_device = None
+        self.eval_called = False
+
+    def to(self, device):
+        self.to_device = device
+        return self
+
+    def eval(self):
+        self.eval_called = True
+        return self
+
+    def compute_reward(self, observations):
+        self.compute_reward_input = observations
+        return torch.tensor([0.75], dtype=torch.float32)
+
+    def pop_profile_metrics(self):
+        return {"reward/vlm/generate": 0.2}
+
+
 def _build_reward_input(batch_size: int, *, mark_last_run: bool = False) -> dict:
     reward_input = {
         "main_images": torch.zeros((batch_size, 2, 2, 3), dtype=torch.uint8),
@@ -61,6 +87,120 @@ def _build_reward_input(batch_size: int, *, mark_last_run: bool = False) -> dict
     if mark_last_run:
         reward_input["last_run"] = torch.ones((batch_size, 1), dtype=torch.bool)
     return reward_input
+
+
+def test_standalone_realworld_reward_worker_initializes_model():
+    worker = object.__new__(EmbodiedRewardWorker)
+    model = _FakeStandaloneRewardModel()
+    worker._standalone_realworld = True
+    worker.device = torch.device("cpu")
+    worker.cfg = OmegaConf.create(
+        {"reward": {"model": {"model_type": "fake", "precision": "fp32"}}}
+    )
+    worker.model_provider_func = lambda: model
+
+    worker.init_worker()
+
+    assert worker.local_num_train_envs == 1
+    assert worker.model is model
+    assert model.to_device == torch.device("cpu")
+    assert model.eval_called
+
+
+def test_compute_image_rewards_accepts_qwen_style_dict_input():
+    worker = object.__new__(EmbodiedRewardWorker)
+    model = _FakeStandaloneRewardModel()
+    worker.model = model
+    worker._timer_metrics = {}
+
+    reward_input = {
+        "main_images": np.zeros((1, 2, 2, 3), dtype=np.uint8),
+        "task_descriptions": ["pick the cube"],
+        "history_input": {"history_window": {"main_images": [["frame"]]}},
+    }
+
+    rewards = worker.compute_image_rewards(reward_input)
+    metrics = worker.pop_profile_metrics()
+
+    assert torch.equal(rewards, torch.tensor([0.75]))
+    assert model.compute_reward_input is not reward_input
+    assert model.compute_reward_input["task_descriptions"] == ["pick the cube"]
+    assert "time/reward/compute_reward" in metrics
+    assert metrics["reward/vlm/generate"] == 0.2
+
+
+def test_franka_builds_dualview_history_reward_input():
+    env = object.__new__(FrankaEnv)
+    env.config = FrankaRobotConfig(
+        reward_worker_cfg={
+            "model": {
+                "model_type": "history_vlm",
+                "history_buffers": {
+                    "history_window": {
+                        "history_size": 5,
+                    }
+                },
+            }
+        },
+        reward_image_key="wrist_1",
+        task_description="pick the cube",
+    )
+    env._reward_history = env._make_reward_history_buffers()
+
+    for step_idx in range(6):
+        main_image = np.full((2, 2, 3), step_idx, dtype=np.uint8)
+        extra_image = np.full((2, 2, 3), step_idx + 10, dtype=np.uint8)
+        reward_input = env._build_reward_model_input(
+            {"frames": {"wrist_1": main_image, "wrist_2": extra_image}}
+        )
+
+    assert reward_input is not None
+    assert reward_input["main_images"].shape == (1, 2, 2, 3)
+    assert reward_input["extra_view_images"].shape == (1, 2, 2, 3)
+    assert reward_input["task_descriptions"] == ["pick the cube"]
+    history_window = reward_input["history_input"]["history_window"]
+    assert len(history_window["main_images"][0]) == 5
+    assert len(history_window["extra_view_images"][0]) == 5
+    assert int(history_window["main_images"][0][0][0, 0, 0]) == 1
+    assert int(history_window["main_images"][0][-1][0, 0, 0]) == 5
+
+
+def test_franka_history_reward_input_returns_none_without_extra_view(caplog):
+    env = object.__new__(FrankaEnv)
+    env.config = FrankaRobotConfig(
+        reward_worker_cfg={"model": {"model_type": "history_vlm"}},
+        reward_image_key="wrist_1",
+        task_description="pick the cube",
+    )
+    env._logger = __import__("logging").getLogger(__name__)
+    env._reward_history = env._make_reward_history_buffers()
+
+    reward_input = env._build_reward_model_input(
+        {"frames": {"wrist_1": np.zeros((2, 2, 3), dtype=np.uint8)}}
+    )
+
+    assert reward_input is None
+    assert "requires a second camera view" in caplog.text
+
+
+def test_env_worker_copies_standalone_reward_profile_info_metrics():
+    worker = object.__new__(EnvWorker)
+    env_info = {}
+
+    worker.copy_prefixed_info_metrics(
+        env_info,
+        {
+            "time/reward/compute_reward": torch.tensor([0.1]),
+            "reward/vlm/generate": [0.2],
+            "ignored": torch.tensor([1.0]),
+        },
+    )
+
+    assert torch.equal(
+        env_info["time/reward/compute_reward"], torch.tensor([0.1])
+    )
+    assert torch.equal(env_info["reward/vlm/generate"], torch.tensor([0.2]))
+    assert "ignored" not in env_info
 
 
 def test_reward_worker_aggregates_multiple_requests_before_inference():

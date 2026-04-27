@@ -232,28 +232,33 @@ class EmbodiedRewardWorker(Worker):
         model_cfg = self.cfg.reward.model
         with open_dict(model_cfg):
             model_cfg.num_envs = self.local_num_train_envs
+            if self.cfg.get("profile", None) is not None:
+                model_cfg.profile_sync_cuda = bool(
+                    self.cfg.profile.get("sync_cuda", False)
+                )
         model = reward_cls(model_cfg)
 
         return model
 
     def init_worker(self):
         """Initialize the reward worker for inference."""
-        # build model
-
         if self._standalone_realworld:
-            return
-
-        self.dst_ranks = {
-            "train": self._setup_dst_ranks(
-                self.total_num_train_envs // self.num_pipeline_stages
-            ),
-        }
-        self.src_ranks = {
-            "train": self._setup_src_ranks(
-                self.total_num_train_envs // self.num_pipeline_stages
-            ),
-        }
-        self.local_num_train_envs = sum(size for _, size in self.src_ranks["train"])
+            self.local_num_train_envs = 1
+            self._last_profile_metrics: dict[str, float] = {}
+        else:
+            self.dst_ranks = {
+                "train": self._setup_dst_ranks(
+                    self.total_num_train_envs // self.num_pipeline_stages
+                ),
+            }
+            self.src_ranks = {
+                "train": self._setup_src_ranks(
+                    self.total_num_train_envs // self.num_pipeline_stages
+                ),
+            }
+            self.local_num_train_envs = sum(
+                size for _, size in self.src_ranks["train"]
+            )
 
         self.model = self.model_provider_func()
 
@@ -376,13 +381,31 @@ class EmbodiedRewardWorker(Worker):
         return batch_size
 
     def compute_image_rewards(
-        self, images: torch.Tensor | np.ndarray
+        self, images: torch.Tensor | np.ndarray | dict[str, Any]
     ) -> torch.Tensor | np.ndarray:
         """Run one-shot reward inference and return CPU results."""
-        rewards = self._compute_image_rewards(images)
+        observations = (
+            dict(images) if isinstance(images, dict) else {"main_images": images}
+        )
+        with self.worker_timer("compute_reward"):
+            rewards = self.model.compute_reward(observations)
+        time_metrics = {
+            f"time/reward/{key}": value
+            for key, value in self.pop_execution_times().items()
+        }
+        reward_metrics = {}
+        if hasattr(self.model, "pop_profile_metrics"):
+            reward_metrics.update(self.model.pop_profile_metrics())
+        self._last_profile_metrics = {**time_metrics, **reward_metrics}
         if isinstance(rewards, torch.Tensor):
             return rewards.detach().cpu()
         return rewards
+
+    def pop_profile_metrics(self) -> dict[str, float]:
+        """Return and clear standalone one-shot reward inference metrics."""
+        metrics = dict(getattr(self, "_last_profile_metrics", {}))
+        self._last_profile_metrics = {}
+        return metrics
 
     def _setup_dst_ranks(self, batch_size: int) -> list[tuple[int, int]]:
         """Compute env peer ranks for this reward worker.
@@ -498,30 +521,64 @@ class EmbodiedRewardWorker(Worker):
             self.send_reward_output(output_channel, reward_split)
 
     async def compute_rewards_async(
-        self, input_channel: Channel, output_channel: Channel
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        metric_channel: Channel | None = None,
     ):
         assert self._interact_task is None or self._interact_task.done(), (
             "Previous interact task is still running while a new interact call is made."
         )
         self._interact_task = asyncio.create_task(
-            self._compute_rewards(input_channel, output_channel)
+            self._compute_rewards(input_channel, output_channel, metric_channel)
         )
         try:
             await self._interact_task
         except asyncio.CancelledError:
             pass
 
-    async def _compute_rewards(self, input_channel: Channel, output_channel: Channel):
+    async def _compute_rewards(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        metric_channel: Channel | None,
+    ):
         while True:
-            observations, batch_sizes, _ = await self.recv_aggregated_reward_inputs(
-                input_channel, mode="train"
-            )
-            rewards = self.model.compute_reward(observations)
+            with self.worker_timer("recv_inputs"):
+                observations, batch_sizes, _ = await self.recv_aggregated_reward_inputs(
+                    input_channel, mode="train"
+                )
+
+            with self.worker_timer("compute_reward"):
+                rewards = self.model.compute_reward(observations)
 
             if rewards is not None and rewards.dim() == 1:
                 rewards = rewards.unsqueeze(-1)
 
-            self.send_aggregated_reward_output(output_channel, rewards, batch_sizes)
+            with self.worker_timer("send_outputs"):
+                self.send_aggregated_reward_output(output_channel, rewards, batch_sizes)
+
+            if metric_channel is not None:
+                time_metrics = {
+                    f"time/reward/{key}": value
+                    for key, value in self.pop_execution_times().items()
+                }
+                reward_metrics = {
+                    "reward/batch_size": float(sum(batch_sizes)),
+                    "reward/request_count": float(len(batch_sizes)),
+                }
+                if hasattr(self.model, "pop_profile_metrics"):
+                    reward_metrics.update(self.model.pop_profile_metrics())
+                metric_channel.put(
+                    {
+                        "rank": self._rank,
+                        "time": time_metrics,
+                        "reward": reward_metrics,
+                    },
+                    async_op=True,
+                )
+            else:
+                self.pop_execution_times()
 
     async def stop(self):
         if self._interact_task is not None and not self._interact_task.done():

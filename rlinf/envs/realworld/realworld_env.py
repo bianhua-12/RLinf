@@ -227,6 +227,11 @@ class RealWorldEnv(gym.Env):
         episode_info["success_no_intervened"] = self.success_once.copy() & (
             ~self.intervened_once
         )
+        for key, value in infos.items():
+            if key.startswith("_"):
+                continue
+            if key.startswith(("time/", "reward/")):
+                episode_info[key] = value
         infos["episode"] = to_tensor(episode_info)
         return infos
 

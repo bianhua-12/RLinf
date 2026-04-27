@@ -15,6 +15,7 @@
 import copy
 import queue
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from itertools import cycle
 from typing import Any, Optional
@@ -61,6 +62,7 @@ class FrankaRobotConfig:
     reward_worker_node_rank: Optional[int] = None
     reward_worker_node_group: Optional[str] = None
     reward_image_key: Optional[str] = None
+    reward_extra_view_key: Optional[str] = None
 
     # Positions are stored in eular angles (xyz for position, rzryrx for orientation)
     # It will be converted to quaternions internally
@@ -147,6 +149,8 @@ class FrankaEnv(gym.Env):
 
         self._success_hold_counter = 0  # Initialize the success hold counter
         self._reward_worker = None
+        self._last_reward_profile_metrics: dict[str, float] = {}
+        self._reward_history = self._make_reward_history_buffers()
 
         if not self.config.is_dummy:
             self._setup_hardware()
@@ -312,7 +316,13 @@ class FrankaEnv(gym.Env):
 
         truncated = self._num_steps >= self.config.max_num_steps
         reward *= self.config.reward_scale
-        return observation, reward, terminated, truncated, {}
+        return (
+            observation,
+            reward,
+            terminated,
+            truncated,
+            self._pop_reward_profile_info(),
+        )
 
     @property
     def num_steps(self):
@@ -391,10 +401,44 @@ class FrankaEnv(gym.Env):
         if self._reward_worker is None:
             raise RuntimeError("Reward worker is not initialized.")
 
-        frames = observation.get("frames", {})
-        if not frames:
-            raise ValueError("No frames available for reward model inference.")
+        reward_input = self._build_reward_model_input(observation)
+        if reward_input is None:
+            self._last_reward_profile_metrics = {}
+            return 0.0
 
+        reward_output = self._reward_worker.compute_image_rewards(reward_input).wait()[
+            0
+        ]
+        self._last_reward_profile_metrics = (
+            self._reward_worker.pop_profile_metrics().wait()[0]
+        )
+        if hasattr(reward_output, "detach"):
+            reward_output = reward_output.detach().cpu().numpy()
+        reward_array = np.asarray(reward_output).reshape(-1)
+        return float(reward_array[0])
+
+    def _get_reward_model_type(self) -> str:
+        reward_worker_cfg = self.config.reward_worker_cfg or {}
+        model_cfg = reward_worker_cfg.get("model", {})
+        return str(model_cfg.get("model_type", "resnet"))
+
+    def _get_reward_history_size(self) -> int:
+        reward_worker_cfg = self.config.reward_worker_cfg or {}
+        model_cfg = reward_worker_cfg.get("model", {})
+        history_buffers = model_cfg.get("history_buffers", {})
+        history_window = history_buffers.get("history_window", {})
+        return int(history_window.get("history_size", 5))
+
+    def _make_reward_history_buffers(self) -> dict[str, deque[np.ndarray]]:
+        history_size = self._get_reward_history_size()
+        return {
+            "main_images": deque(maxlen=history_size),
+            "extra_view_images": deque(maxlen=history_size),
+        }
+
+    def _resolve_reward_image_keys(
+        self, frames: dict[str, np.ndarray]
+    ) -> tuple[str, str | None]:
         image_key = self.config.reward_image_key
         if image_key is None:
             image_key = sorted(frames.keys())[0]
@@ -404,12 +448,76 @@ class FrankaEnv(gym.Env):
                 f"Available keys: {list(frames.keys())}"
             )
 
-        image_batch = np.expand_dims(frames[image_key], axis=0)
-        reward_output = self._reward_worker.compute_image_rewards(image_batch).wait()[0]
-        if hasattr(reward_output, "detach"):
-            reward_output = reward_output.detach().cpu().numpy()
-        reward_array = np.asarray(reward_output).reshape(-1)
-        return float(reward_array[0])
+        extra_view_key = self.config.reward_extra_view_key
+        if extra_view_key is None:
+            extra_view_keys = [
+                key for key in sorted(frames.keys()) if key != image_key
+            ]
+            extra_view_key = extra_view_keys[0] if extra_view_keys else None
+        elif extra_view_key not in frames:
+            self._logger.warning(
+                "reward_extra_view_key '%s' not found in frames. Available keys: %s",
+                extra_view_key,
+                list(frames.keys()),
+            )
+            extra_view_key = None
+
+        return image_key, extra_view_key
+
+    def _build_reward_model_input(
+        self, observation: dict[str, np.ndarray | FrankaRobotState]
+    ) -> dict[str, Any] | None:
+        frames = observation.get("frames", {})
+        if not frames:
+            raise ValueError("No frames available for reward model inference.")
+
+        reward_model_type = self._get_reward_model_type()
+        image_key, extra_view_key = self._resolve_reward_image_keys(frames)
+        main_image = np.asarray(frames[image_key])
+
+        if reward_model_type == "resnet":
+            return {"main_images": np.expand_dims(main_image, axis=0)}
+
+        task_description = str(self.config.task_description or "").strip()
+        if not task_description:
+            self._logger.warning(
+                "Reward model input is missing task_description; returning 0 reward."
+            )
+            return None
+
+        reward_input: dict[str, Any] = {
+            "main_images": np.expand_dims(main_image, axis=0),
+            "task_descriptions": [task_description],
+        }
+        if reward_model_type != "history_vlm":
+            return reward_input
+
+        if extra_view_key is None:
+            self._logger.warning(
+                "History VLM reward requires a second camera view, but only found "
+                "frames keys: %s. Returning 0 reward.",
+                list(frames.keys()),
+            )
+            return None
+
+        extra_view_image = np.asarray(frames[extra_view_key])
+        self._reward_history["main_images"].append(main_image.copy())
+        self._reward_history["extra_view_images"].append(extra_view_image.copy())
+        reward_input["extra_view_images"] = np.expand_dims(extra_view_image, axis=0)
+        reward_input["history_input"] = {
+            "history_window": {
+                "main_images": [list(self._reward_history["main_images"])],
+                "extra_view_images": [
+                    list(self._reward_history["extra_view_images"])
+                ],
+            }
+        }
+        return reward_input
+
+    def _pop_reward_profile_info(self) -> dict[str, float]:
+        metrics = dict(self._last_reward_profile_metrics)
+        self._last_reward_profile_metrics = {}
+        return metrics
 
     def reset(self, joint_reset=False, seed=None, options=None):
         if self.config.is_dummy:
@@ -417,6 +525,7 @@ class FrankaEnv(gym.Env):
             return observation, {}
 
         self._success_hold_counter = 0  # Reset hold counter at the start of the episode
+        self._reward_history = self._make_reward_history_buffers()
 
         self._controller.reconfigure_compliance_params(
             self.config.compliance_param

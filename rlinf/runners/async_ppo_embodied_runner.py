@@ -62,6 +62,7 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         )
         self.env_metric_channel = Channel.create("EnvMetric")
         self.rollout_metric_channel = Channel.create("RolloutMetric")
+        self.reward_metric_channel = Channel.create("RewardMetric")
         self.recompute_logprobs = bool(self.cfg.rollout.get("recompute_logprobs", True))
 
         if self.cfg.runner.val_check_interval > 0:
@@ -85,6 +86,31 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
             results, metric_field="time"
         )
         return time_metrics, ranked_time_metrics_list
+
+    def get_reward_metrics(self) -> tuple[dict, list[dict], dict, list[dict]]:
+        results: list[dict] = []
+        while True:
+            try:
+                result = self.reward_metric_channel.get_nowait()
+                results.append(result)
+            except asyncio.QueueEmpty:
+                break
+
+        if not results:
+            return {}, [], {}, []
+
+        time_metrics, ranked_time_metrics_list = self._process_ranked_numeric_results(
+            results, metric_field="time"
+        )
+        reward_metrics, ranked_reward_metrics_list = (
+            self._process_ranked_numeric_results(results, metric_field="reward")
+        )
+        return (
+            time_metrics,
+            ranked_time_metrics_list,
+            reward_metrics,
+            ranked_reward_metrics_list,
+        )
 
     def get_env_metrics(self) -> tuple[dict, list[dict], list[dict]]:
         results: list[dict] = []
@@ -128,6 +154,7 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         return self.reward.compute_rewards_async(
             input_channel=self.reward_channel,
             output_channel=self.env_channel,
+            metric_channel=self.reward_metric_channel,
         )
 
     def run(self) -> None:
@@ -204,11 +231,21 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
             rollout_time_metrics, rollout_time_metrics_per_rank = (
                 self.get_rollout_metrics()
             )
+            (
+                reward_time_metrics,
+                reward_time_metrics_per_rank,
+                reward_profile_metrics,
+                reward_profile_metrics_per_rank,
+            ) = self.get_reward_metrics()
             self.metric_logger.log(train_metrics, self.global_step)
             if env_metrics:
                 self.metric_logger.log(env_metrics, self.global_step)
             if rollout_time_metrics:
                 self.metric_logger.log(rollout_time_metrics, self.global_step)
+            if reward_time_metrics:
+                self.metric_logger.log(reward_time_metrics, self.global_step)
+            if reward_profile_metrics:
+                self.metric_logger.log(reward_profile_metrics, self.global_step)
             self.metric_logger.log(rollout_metrics, self.global_step)
             self.metric_logger.log(time_metrics, self.global_step)
             self._log_ranked_metrics(
@@ -250,10 +287,31 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
                 worker_group_name=self.rollout.worker_group_name,
                 add_prefix=False,
             )
+            if self.reward is not None:
+                self._log_ranked_metrics(
+                    metrics_list=reward_time_metrics_per_rank,
+                    step=self.global_step,
+                    prefix="time/reward",
+                    worker_group_name=self.reward.worker_group_name,
+                    add_prefix=False,
+                )
+                self._log_ranked_metrics(
+                    metrics_list=reward_profile_metrics_per_rank,
+                    step=self.global_step,
+                    prefix="reward",
+                    worker_group_name=self.reward.worker_group_name,
+                    add_prefix=False,
+                )
 
             logging_metrics = {**time_metrics, **train_metrics, **rollout_metrics}
             if env_metrics:
                 logging_metrics.update(env_metrics)
+            if rollout_time_metrics:
+                logging_metrics.update(rollout_time_metrics)
+            if reward_time_metrics:
+                logging_metrics.update(reward_time_metrics)
+            if reward_profile_metrics:
+                logging_metrics.update(reward_profile_metrics)
 
             self.print_metrics_table_async(
                 self.global_step - 1,

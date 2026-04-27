@@ -503,6 +503,7 @@ class EnvWorker(Worker):
             if "intervene_action" in infos["final_info"]:
                 intervene_actions = infos["final_info"]["intervene_action"]
                 intervene_flags = infos["final_info"]["intervene_flag"]
+        self.copy_prefixed_info_metrics(env_info, infos)
 
         env_output = EnvOutput(
             obs=extracted_obs,
@@ -1389,6 +1390,20 @@ class EnvWorker(Worker):
                     env_metrics[key].append(value)
             else:
                 env_metrics[key].append(value)
+
+    def copy_prefixed_info_metrics(
+        self, env_info: dict[str, Any], infos: dict[str, Any] | None
+    ) -> None:
+        if not isinstance(infos, dict):
+            return
+        for key, value in infos.items():
+            if not isinstance(key, str) or not key.startswith(("time/", "reward/")):
+                continue
+            if isinstance(value, torch.Tensor):
+                metric_value = value.detach().float().cpu().reshape(-1)
+            else:
+                metric_value = torch.as_tensor(value, dtype=torch.float32).reshape(-1)
+            env_info[key] = metric_value.cpu()
 
     def store_last_obs_and_intervened_info(self, env_output_list: list[EnvOutput]):
         self.last_obs_list = [env_output.obs for env_output in env_output_list]

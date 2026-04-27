@@ -1,0 +1,273 @@
+defaults:
+  - env/maniskill_pick_cube_prompt@env.train
+  - env/maniskill_pick_cube_prompt@env.eval
+  - model/cnn_policy@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+profile:
+  enabled: true
+  warmup_steps: 2
+  measure_steps: 10
+  sync_cuda: true
+  summary_path: ${runner.logger.log_path}/async_ppo_profile_summary.json
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout:
+      node_group: openpi
+      placement: 0
+    reward:
+      node_group: qwen
+      placement: 0
+  node_groups:
+    - label: openpi
+      node_ranks: 0
+      env_configs:
+        - node_ranks: 0
+          python_interpreter_path: /home/shchen/envs/host/openpi/bin/python
+    - label: qwen
+      node_ranks: 0
+      env_configs:
+        - node_ranks: 0
+          python_interpreter_path: /home/shchen/envs/host/openvla/bin/python
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results/maniskill_async_ppo_resnet_profile"
+    project_name: rlinf
+    experiment_name: "maniskill_async_ppo_resnet_profile"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 12
+  max_steps: 12
+  only_eval: false
+  val_check_interval: -1
+  save_interval: -1
+  weight_sync_interval: 1
+
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  normalize_advantages: true
+  kl_penalty: kl
+  group_size: 1
+  reward_coef: 1.0
+  staleness_threshold: 1
+  behave_weight_threshold: 2
+
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
+  reward_type: action_level
+  logprob_type: action_level
+  entropy_type: action_level
+  update_epoch: 1
+
+  adv_type: gae
+  loss_type: decoupled_actor_critic
+  loss_agg_func: token-mean
+  kl_beta: 0.0
+  entropy_bonus: 0.005
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+
+  gamma: 0.99
+  gae_lambda: 0.95
+
+  filter_rewards: false
+  rewards_lower_bound: 0.0
+  rewards_upper_bound: 1.0
+
+  sampling_params:
+    do_sample: true
+    temperature_train: 1.0
+    temperature_eval: 0.6
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.0
+    add_BOS: false
+
+  length_params:
+    max_new_token: 1
+    max_length: 1
+    min_length: 1
+
+env:
+  group_name: EnvGroup
+  train:
+    obs_format: tensor
+    total_num_envs: 1
+    wrap_obs_mode: simple_prompt
+    use_full_state: true
+    auto_reset: true
+    ignore_terminations: false
+    group_size: ${algorithm.group_size}
+    max_steps_per_rollout_epoch: 20
+    max_episode_steps: 50
+    init_params:
+      id: PickCubeDualView-v1
+      obs_mode: rgb
+      control_mode: pd_ee_delta_pos
+      sim_backend: gpu
+      sim_config:
+        sim_freq: 100
+        control_freq: 20
+      sensor_configs:
+        shader_pack: default
+        width: 224
+        height: 224
+      human_render_camera_configs:
+        shader_pack: default
+        width: 224
+        height: 224
+      render_mode: all
+    video_cfg:
+      save_video: false
+      info_on_video: false
+      video_base_dir: ${runner.logger.log_path}/video/train
+  eval:
+    obs_format: tensor
+    total_num_envs: 1
+    wrap_obs_mode: simple_prompt
+    use_full_state: true
+    auto_reset: true
+    ignore_terminations: true
+    use_fixed_reset_state_ids: true
+    is_eval: true
+    group_size: ${algorithm.group_size}
+    max_steps_per_rollout_epoch: 20
+    max_episode_steps: 50
+    init_params:
+      id: PickCubeDualView-v1
+      obs_mode: rgb
+      control_mode: pd_ee_delta_pos
+      sim_backend: gpu
+      sim_config:
+        sim_freq: 100
+        control_freq: 20
+      sensor_configs:
+        shader_pack: default
+        width: 224
+        height: 224
+      human_render_camera_configs:
+        shader_pack: default
+        width: 224
+        height: 224
+      render_mode: all
+    video_cfg:
+      save_video: false
+      info_on_video: false
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: RolloutGroup
+  backend: huggingface
+  generation_backend: huggingface
+  recompute_logprobs: false
+  enable_offload: false
+  pipeline_stage_num: 1
+  collect_prev_infos: true
+  model:
+    model_path: ${oc.env:RESNET_MODEL_PATH,"/path/to/RLinf-ResNet10-pretrained"}
+    state_dim: 42
+    action_dim: 4
+    num_q_heads: 10
+    precision: ${actor.model.precision}
+    image_num: 1
+  enable_torch_compile: true
+  enable_cuda_graph: false
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 4
+  global_batch_size: 4
+  seed: 1234
+  enable_offload: false
+  model:
+    model_path: ${oc.env:RESNET_MODEL_PATH,"/path/to/RLinf-ResNet10-pretrained"}
+    model_type: cnn_policy
+    policy_setup: panda-ee-dpos
+    image_size: [3, 224, 224]
+    state_dim: 42
+    action_dim: 4
+    num_action_chunks: 1
+    hidden_dim: 256
+    precision: "32"
+    add_value_head: true
+    add_q_head: false
+    backbone: resnet
+    image_num: 1
+    encoder_config:
+      ckpt_name: resnet10_pretrained.pt
+  optim:
+    lr: 5e-5
+    value_lr: 2e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-05
+    clip_grad: 1.0
+    critic_warmup_steps: 0
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: no_shard
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: true
+  group_name: RewardGroup
+  reward_mode: history_buffer
+  history_reward_assign: true
+  reward_threshold: 0.5
+  reward_weight: 1.0
+  env_reward_weight: 0.0
+  aggregate_request_count: 1
+  model:
+    model_type: history_vlm
+    model_path: ${oc.env:QWEN_VL_MODEL_PATH,"/path/to/qwen-vl"}
+    lora_path: ${oc.env:QWEN_VL_LORA_PATH,""}
+    precision: bf16
+    input_builder_name: simple_dualview_ternary_input_builder
+    input_builder_params:
+      strict_min_frames: 5
+    reward_parser_name: weighted_ternary_reward_parser
+    reward_parser_params:
+      positive_reward: 1.0
+      unchanged_reward: -0.05
+      negative_reward: -1.0
+    history_buffers:
+      history_window:
+        history_size: 5
+        input_interval: 1
+        history_keys: ["main_images", "extra_view_images"]
+        input_on_done: false
+    enable_history_offload: true
+    infer_micro_batch_size: 1
+    debug_dump_first_inference: false
+    debug_dump_first_inference_dir: ${runner.logger.log_path}/reward_first_inference_inputs
+    subprocessor_kwargs:
+      video_processor:
+        do_sample_frames: true
+    max_new_tokens: 8
+    do_sample: false
+    temperature: 0.0
+    use_chat_template: true
+
+critic:
+  use_critic_model: false

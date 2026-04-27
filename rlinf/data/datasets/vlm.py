@@ -1078,8 +1078,17 @@ class QwenVlVideoSFTDataset(RoboChallengeProgressSFTDataset):
                 .strip()
                 .lower()
             )
-            main_frames = _frames_to_pil_list(payload["main_frames"])
-            third_frames = _frames_to_pil_list(payload["third_frames"])
+            main_frames_raw = payload.get("main_frames", payload.get("main_images"))
+            third_frames_raw = payload.get(
+                "third_frames", payload.get("third_view_images")
+            )
+            if main_frames_raw is None or third_frames_raw is None:
+                raise ValueError(
+                    f"Sample {idx} pkl missing dual-view frames: "
+                    "expected main_frames/third_frames or main_images/third_view_images"
+                )
+            main_frames = _frames_to_pil_list(main_frames_raw)
+            third_frames = _frames_to_pil_list(third_frames_raw)
             return (
                 prompt_text,
                 answer_text,

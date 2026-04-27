@@ -169,16 +169,19 @@ class _FakeEnv:
 
 
 class _FakeReward:
+    worker_group_name = "RewardGroup"
+
     def __init__(self):
         self.compute_calls = []
         self.stop_calls = 0
         self.handle = _FakeHandle()
 
-    def compute_rewards_async(self, input_channel, output_channel):
+    def compute_rewards_async(self, input_channel, output_channel, metric_channel=None):
         self.compute_calls.append(
             {
                 "input_channel": input_channel,
                 "output_channel": output_channel,
+                "metric_channel": metric_channel,
             }
         )
         return self.handle
@@ -274,6 +277,7 @@ def test_async_ppo_runner_starts_reward_worker_and_wires_reward_channel(
     assert reward_channel is runner.reward_channel
     assert reward_channel is env.interact_calls[0]["reward_channel"]
     assert reward.compute_calls[0]["output_channel"] is runner.env_channel
+    assert reward.compute_calls[0]["metric_channel"] is runner.reward_metric_channel
 
     assert reward.stop_calls == 1
     assert reward.handle.wait_calls == 1

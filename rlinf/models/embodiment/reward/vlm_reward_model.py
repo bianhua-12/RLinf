@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+from contextlib import contextmanager
 from typing import Any, Optional
 
 import torch
@@ -197,6 +199,8 @@ class VLMRewardModel(BaseRewardModel):
 
         self.dtype = torch_dtype_from_precision(cfg.precision)
         self.checkpoint_metadata: Optional[dict[str, str]] = None
+        self.profile_sync_cuda = bool(cfg.get("profile_sync_cuda", False))
+        self._profile_metrics: dict[str, float] = {}
 
         self.setup_processor()
         self.setup_model()
@@ -209,6 +213,33 @@ class VLMRewardModel(BaseRewardModel):
             "do_sample": bool(cfg.get("do_sample", True)),
             "temperature": float(cfg.get("temperature", 0.0)),
         }
+
+    def _sync_profile_device(self) -> None:
+        if not self.profile_sync_cuda or not torch.cuda.is_available():
+            return
+        device = getattr(self._model, "device", None)
+        if device is None:
+            return
+        device = torch.device(f"cuda:{device}") if isinstance(device, int) else device
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize(torch.device(device))
+
+    @contextmanager
+    def profile_timer(self, name: str):
+        self._sync_profile_device()
+        start_time = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._sync_profile_device()
+            duration = time.perf_counter() - start_time
+            key = f"reward/vlm/{name}"
+            self._profile_metrics[key] = self._profile_metrics.get(key, 0.0) + duration
+
+    def pop_profile_metrics(self) -> dict[str, float]:
+        metrics = dict(self._profile_metrics)
+        self._profile_metrics.clear()
+        return metrics
 
     def setup_processor(self) -> None:
         self._processor = AutoProcessor.from_pretrained(
@@ -270,17 +301,24 @@ class VLMRewardModel(BaseRewardModel):
         self,
         observations: Any,
     ) -> torch.Tensor:
-        batched_inputs = self.input_builder.build_inputs(
-            observations, self._model.device
-        )
-        prompt_length = batched_inputs["input_ids"].shape[-1]
-        output_ids = self._model.generate(**batched_inputs, **self.gen_kwargs)
-        del batched_inputs
-        outputs = self._processor.batch_decode(
-            output_ids[..., prompt_length:], skip_special_tokens=True
-        )
-        del output_ids
-        return self.reward_parser.parse_rewards(outputs)
+        with self.profile_timer("total"):
+            with self.profile_timer("build_inputs"):
+                batched_inputs = self.input_builder.build_inputs(
+                    observations, self._model.device
+                )
+            prompt_length = batched_inputs["input_ids"].shape[-1]
+            with self.profile_timer("generate"):
+                output_ids = self._model.generate(**batched_inputs, **self.gen_kwargs)
+            del batched_inputs
+            with self.profile_timer("decode"):
+                outputs = self._processor.batch_decode(
+                    output_ids[..., prompt_length:], skip_special_tokens=True
+                )
+            del output_ids
+            with self.profile_timer("parse"):
+                rewards = self.reward_parser.parse_rewards(outputs)
+            del outputs
+        return rewards
 
 
 class HistoryVLMRewardModel(VLMRewardModel):
@@ -435,56 +473,82 @@ class HistoryVLMRewardModel(VLMRewardModel):
 
         reward_chunks: list[torch.Tensor] = []
         did_infer = False
-        for start in range(0, input_batch_size, infer_micro_batch_size):
-            end = min(start + infer_micro_batch_size, input_batch_size)
-            micro_observations = self.slice_observations(observations, start, end)
-            micro_history_input = self.slice_history_input(history_input, start, end)
-            reward_chunk = torch.zeros((end - start,), dtype=torch.float32)
-
-            valid_input_ids = self.input_builder.get_valid_input_ids(
-                micro_observations,
-                micro_history_input,
-            )
-            if len(valid_input_ids) == 0:
-                reward_chunks.append(reward_chunk)
-                continue
-
-            prepared_inputs = self.input_builder.prepare_inputs(
-                micro_observations,
-                micro_history_input,
-                valid_input_ids,
-            )
-            batched_inputs = self.input_builder.process_inputs(prepared_inputs)
-            batched_inputs = {
-                key: value.to(self._model.device)
-                if isinstance(value, torch.Tensor)
-                else value
-                for key, value in batched_inputs.items()
-            }
-
-            prompt_length = batched_inputs["input_ids"].shape[-1]
-            output_ids = self._model.generate(**batched_inputs, **self.gen_kwargs)
-            del batched_inputs
-
-            outputs = self._processor.batch_decode(
-                output_ids[..., prompt_length:], skip_special_tokens=True
-            )
-            del output_ids
-            did_infer = True
-
-            if not self._debug_dump_first_inference_done:
-                self._dump_first_inference_inputs(
-                    prepared_inputs=prepared_inputs,
-                    valid_input_ids=valid_input_ids,
-                    outputs=outputs,
-                    start=start,
+        with self.profile_timer("total"):
+            for start in range(0, input_batch_size, infer_micro_batch_size):
+                end = min(start + infer_micro_batch_size, input_batch_size)
+                micro_observations = self.slice_observations(observations, start, end)
+                micro_history_input = self.slice_history_input(
+                    history_input, start, end
                 )
+                reward_chunk = torch.zeros((end - start,), dtype=torch.float32)
 
-            reward_chunk[valid_input_ids] = self.reward_parser.parse_rewards(
-                outputs
-            ).to(dtype=torch.float32)
-            reward_chunks.append(reward_chunk)
-            del outputs
+                with self.profile_timer("get_valid_input_ids"):
+                    valid_input_ids = self.input_builder.get_valid_input_ids(
+                        micro_observations,
+                        micro_history_input,
+                    )
+                if len(valid_input_ids) == 0:
+                    reward_chunks.append(reward_chunk)
+                    continue
+
+                with self.profile_timer("prepare_inputs"):
+                    prepared_inputs = self.input_builder.prepare_inputs(
+                        micro_observations,
+                        micro_history_input,
+                        valid_input_ids,
+                    )
+                with self.profile_timer("process_inputs"):
+                    batched_inputs = self.input_builder.process_inputs(prepared_inputs)
+                with self.profile_timer("to_device"):
+                    batched_inputs = {
+                        key: value.to(self._model.device)
+                        if isinstance(value, torch.Tensor)
+                        else value
+                        for key, value in batched_inputs.items()
+                    }
+
+                prompt_length = batched_inputs["input_ids"].shape[-1]
+                with self.profile_timer("generate"):
+                    output_ids = self._model.generate(
+                        **batched_inputs, **self.gen_kwargs
+                    )
+                del batched_inputs
+
+                with self.profile_timer("decode"):
+                    outputs = self._processor.batch_decode(
+                        output_ids[..., prompt_length:], skip_special_tokens=True
+                    )
+                del output_ids
+                did_infer = True
+
+                if not self._debug_dump_first_inference_done:
+                    self._dump_first_inference_inputs(
+                        prepared_inputs=prepared_inputs,
+                        valid_input_ids=valid_input_ids,
+                        outputs=outputs,
+                        start=start,
+                    )
+
+                with self.profile_timer("parse"):
+                    parsed_rewards = self.reward_parser.parse_rewards(outputs).to(
+                        dtype=torch.float32
+                    )
+                reward_chunk[valid_input_ids] = parsed_rewards
+                reward_chunks.append(reward_chunk)
+                del outputs
+
+        if input_batch_size > 0:
+            self._profile_metrics["reward/vlm/input_batch_size"] = (
+                self._profile_metrics.get("reward/vlm/input_batch_size", 0.0)
+                + float(input_batch_size)
+            )
+            self._profile_metrics["reward/vlm/micro_batch_count"] = (
+                self._profile_metrics.get("reward/vlm/micro_batch_count", 0.0)
+                + float(
+                    (input_batch_size + infer_micro_batch_size - 1)
+                    // infer_micro_batch_size
+                )
+            )
 
         if did_infer:
             self._debug_dump_first_inference_done = True
