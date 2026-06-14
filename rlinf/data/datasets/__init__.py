@@ -247,12 +247,18 @@ def sft_collate_fn(data_list: list["DatasetItem"]) -> dict[str, Any]:
             if k == "pixel_values":
                 # pixel_values is a list of torch.Tensor, for get_iterator_k_split to divide
                 multi_modal_inputs[k] = vals
-            elif k == "image_grid_thw":
+            elif k == "pixel_values_videos":
+                # Qwen3-VL video pixel values: list of torch.Tensor
+                multi_modal_inputs[k] = vals
+            elif k in ("image_grid_thw", "video_grid_thw"):
                 multi_modal_inputs[k] = (
                     torch.cat(vals, dim=0)
                     if isinstance(vals[0], torch.Tensor)
                     else vals
                 )
+            elif k == "second_per_grid_ts":
+                # Qwen3-VL temporal grid: list, keep as-is
+                multi_modal_inputs[k] = vals
             else:
                 raise ValueError(f"Unsupported multi_modal_input key: {k}")
 
