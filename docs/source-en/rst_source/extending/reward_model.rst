@@ -853,3 +853,17 @@ Inside ``TeleopWorker``:
 Compared with the full RL pipeline in :doc:`../examples/embodied/franka_reward_model`,
 the teleop script runs no policy, no actor, and no rollout worker — it is purely
 human-in-the-loop evaluation of the reward model.
+
+Real-World Reinforcement Learning + Reward Model Online Inference
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+This project implements real-world reinforcement learning using the RLPD algorithm and a Qwen VLM-based reward model. The primary objective is to leverage the Qwen VLM as a reward model to accelerate the convergence of the `rlpd_cnn` training task. The classic peg-insertion task is used for this experiment.
+
+In this real-world reinforcement learning setup, the Qwen VLM outputs one of four states—Positive, Unclear, Negative, or Invalidate—and uses these states to guide the robotic arm toward the correct output.
+
+Execution Steps:
+^^^^^^^^^^^^^^^
+
+1. Data Collection
+2. Supervised Fine-tuning
+3. Real-world Reinforcement Learning
