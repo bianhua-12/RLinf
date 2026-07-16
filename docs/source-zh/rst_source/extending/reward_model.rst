@@ -829,16 +829,400 @@ SpaceMouse 控制说明：
 与 :doc:`../examples/embodied/franka_reward_model` 中的完整 RL 流程相比，
 遥操作脚本不运行策略、actor 或 rollout worker——它纯粹是人在回路的 reward model 评估。
 
-真机强化学习 +  Reward Model 在线推理
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+真机强化学习 + Qwen VLM Reward Model 在线推理
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-本项目基于RLPD算法实现 Qwen VLM reward model的真机强化学习，该实验的主要目的是使用Qwen VLM 作为reward model，加快rlpd_cnn训练任务的收敛速度。在本实验中，使用了经典的peginsertion任务。
+本实验基于 RLPD 算法，在 Franka 真机平台上使用 Qwen3-VL 作为 VLM reward model，
+完成 Peg Insertion 任务的强化学习训练。
 
-在真机强化学习中，Qwen VLM将会输出四种状态: Positive, Unclear, Negative 和Invalidate，并基于这四种状态引导机械臂正确输出。
+与仿真场景中 VLM reward 一次性判断整段视频的"成功/失败"不同，真机场景下的 Qwen VLM
+reward model 通过**动作趋势判断**来引导机械臂：每 5 帧构成一个历史窗口，VLM
+会判断窗口内机械臂的运动趋势是 ``positive``（正向目标靠近）、``negative``（远离目标）
+还是 ``unclear``（无法判断），并将趋势标签转换为标量 reward 参与 RL 训练。
 
-运行步骤:
-^^^^^^^
+.. code-block:: text
 
-1. 数据采集
-2. 监督微调
-3. 真机强化学习
+   VLM 输出          Reward 值        含义
+   ─────────────────────────────────────────
+   positive          1.0              动作趋势正确，正向奖励
+   negative          -0.2             动作趋势错误，轻微惩罚
+   unclear           0.0              趋势不明确，不给信号
+   invalid           0.0              模型输出无法解析，不给信号
+
+此外，当机械臂成功到达目标位姿并保持一定步数后（``terminated=True``），
+环境会在 ``infos`` 中写入 ``success`` 标志，``gt_success_bonus`` 会在此基础上
+额外追加 +20.0 的巨大奖励，帮助强化模型对"成功状态"的认知。
+
+.. important::
+
+   与仿真场景（ManiSkill）不同，真机 Franka 环境的 ``step()`` 原本返回空 ``infos``
+   字典（``{}``），导致 ``gt_success_bonus`` 无法从环境中读取成功信号。
+   需要在 Franka env 的 ``step()`` 中将成功状态写入 ``infos`` ——
+   详见下方 :ref:`realworld-franka-infos-fix`。
+
+运行步骤概览
+""""""""""""
+
+完整流程包含三个阶段：
+
+1. **数据采集** — 在真机上采集双视角 episode 数据，用于后续 VLM 微调。
+2. **监督微调（SFT）** — 将采集数据预处理为 QwenTrend 格式，微调 Qwen3-VL-4B 作为趋势判断 reward model。
+3. **真机强化学习** — 在 RLPD 训练中接入微调后的 VLM reward model，在线推理并引导策略学习。
+
+----
+
+阶段一：数据采集
+""""""""""""""""
+
+数据采集的目标是获取包含双视角（腕部相机 + 第三视角相机）图像序列的 episode 数据，
+用于后续训练 VLM 判断机械臂动作趋势。
+
+采集方式
+~~~~~~~
+
+使用 :doc:`../examples/embodied/franka` 中的真机训练流程采集 episode 数据。
+建议开启 ``data_collection``，将每个 episode 保存为 ``.pkl`` 文件：
+
+.. code-block:: yaml
+
+   env:
+     train:
+       data_collection:
+         enabled: True
+         save_dir: /path/to/collected_data
+         export_format: "pickle"
+         only_success: False
+
+采集技巧
+~~~~~~~~
+
+- 尽量缓慢移动机械臂，使采集数据包含丰富的中间状态，便于 VLM 学习趋势判断。
+- 确保两个相机视角（``main_images`` 和 ``extra_view_images``）都能清晰看到机械臂末端
+  和目标孔位。
+- 采集足够数量的 episode（建议 50+ 条），覆盖成功和失败两种结局。
+- 在 YAML 中正确配置 ``camera_names``，确保 ``SERIAL1`` 和 ``SERIAL2`` 与实际
+  相机序列号一致：
+
+  .. code-block:: yaml
+
+     env:
+       train:
+         override_cfg:
+           camera_names:
+             "SERIAL1": "317622072022"
+             "SERIAL2": "254322070894"
+
+----
+
+阶段二：监督微调（SFT）
+""""""""""""""""""""""
+
+2.1 预处理为 QwenTrend 数据集
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+采集到的 ``.pkl`` episode 需要通过 ``preprocess_qwentrend_reward_dataset.py``
+转换为 QwenTrend SFT 格式。该脚本将 episode 按滑动窗口切分为 5 帧片段，
+提取双视角图像，并根据 GAE 或 TCP 距离变化自动标注 ``positive`` / ``negative`` / ``unclear``：
+
+.. code-block:: bash
+
+   python examples/reward/preprocess_qwentrend_reward_dataset.py \
+       --raw-data-path /path/to/collected_data \
+       --output-dir /path/to/processed_qwentrend_data \
+       --window-size 5 \
+       --task-description "Pick up the peg and insert it into the hole."
+
+如果需要使用 TCP-to-target 距离作为趋势信号（当采集数据没有 GAE/reward 时），
+可以通过 ``--target-ee-pose`` 指定目标位姿：
+
+.. code-block:: bash
+
+   python examples/reward/preprocess_qwentrend_reward_dataset.py \
+       --raw-data-path /path/to/collected_data \
+       --output-dir /path/to/processed_qwentrend_data \
+       --window-size 5 \
+       --target-ee-pose "0.490,0.0,0.076,3.131,0.019,-0.063"
+
+输出目录结构：
+
+.. code-block:: text
+
+   processed_qwentrend_data/
+   ├── dataset_info.json
+   ├── train/
+   │   ├── segments.jsonl
+   │   └── pkl/
+   └── eval/
+       ├── segments.jsonl
+       └── pkl/
+
+2.2 微调 Qwen3-VL-4B
+~~~~~~~~~~~~~~~~~~~~
+
+修改 SFT 配置文件 ``examples/sft/config/qwen3vl_sft_qwentrend.yaml`` 中的数据路径和模型路径：
+
+.. code-block:: yaml
+
+   data:
+     type: vlm
+     dataset_name: "qwentrend_progress_sft"
+     train_data_paths: "${oc.env:DUALVIEW_SFT_DATA_ROOT}/train/segments.jsonl"
+     val_data_paths: "${oc.env:DUALVIEW_SFT_DATA_ROOT}/eval/segments.jsonl"
+     video_root: "${oc.env:DUALVIEW_SFT_DATA_ROOT}"
+
+   actor:
+     model:
+       model_type: qwen3_vl
+       model_path: /path/to/Qwen3-VL-4B-Instruct
+       is_lora: true
+       lora_rank: 16
+
+设置环境变量并启动训练：
+
+.. code-block:: bash
+
+   export DUALVIEW_SFT_DATA_ROOT=/path/to/processed_qwentrend_data
+   bash examples/sft/run_vlm_sft.sh qwen3vl_sft_qwentrend
+
+训练完成后，记录 LoRA checkpoint 路径（如 ``checkpoints/global_step_3000``），
+后续 RL 训练中通过 ``reward.model.lora_path`` 引用。
+
+----
+
+阶段三：真机强化学习
+""""""""""""""""""""
+
+3.1 配置文件
+~~~~~~~~~~~
+
+使用 ``examples/embodiment/config/realworld_peginsertion_rlpd_cnn_async_sglang_reward.yaml``
+作为 RL 训练配置。该配置基于 RLPD CNN 异步训练模板，并在其基础上添加了 VLM reward model。
+
+.. code-block:: yaml
+
+   reward:
+     use_reward_model: true            # 启用 reward model
+     worker_type: model                # 本地 HuggingFace 推理（非 API）
+     group_name: "RewardGroup"
+     standalone_realworld: False
+     reward_mode: history_buffer       # 基于历史窗口的趋势判断
+     history_reward_assign: true       # 将 VLM 奖励反向分配给历史步
+     reward_weight: 1.0                # VLM 奖励权重
+     env_reward_weight: 0.0            # 原生环境奖励权重（纯 VLM）
+     reward_threshold: 0.5
+
+     model:
+       model_path: "/path/to/Qwen3-VL-4B-Instruct"
+       model_type: "history_vlm"
+       lora_path: "/path/to/sft_output/checkpoints/global_step_3000"
+       gt_success_bonus: 20.0          # 成功时额外追加的奖励
+       precision: "bf16"
+
+       input_builder_name: qwentrend_input_builder
+       input_builder_params:
+         default_task_description: "Pick up the peg and insert it into the hole."
+         video_keys:
+           - main_images
+           - extra_view_images
+
+       reward_parser_name: qwentrend_reward_parser
+       reward_parser_params:
+         positive_reward: 1.0
+         negative_reward: -0.2
+         unclear_reward: 0.0
+         invalid_reward: 0.0
+
+       history_buffers:
+         history_window:
+           history_size: 5             # 窗口大小：5 帧
+           min_history_size: 5         # 最少需要 5 帧才开始推理
+           input_interval: 1           # 每 1 帧采样一次
+           history_keys:
+             - main_images
+             - extra_view_images
+           input_on_done: false
+
+       interval_reward: 0.0            # 历史不足时的默认奖励
+       max_new_tokens: 16
+       do_sample: false
+       temperature: 0.0
+
+   cluster:
+     component_placement:
+       reward:
+         node_group: "4090"            # Reward worker 部署在 GPU 节点
+         placement: 0
+
+3.2 关键配置字段说明
+~~~~~~~~~~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+
+   * - 字段
+     - 说明
+   * - ``reward_mode: history_buffer``
+     - 使用历史窗口模式。Env worker 维护每个环境的滑动窗口，积累到
+       ``min_history_size`` 帧后才发送给 VLM 推理。
+   * - ``history_reward_assign: true``
+     - 将 VLM 返回的趋势奖励反向分配到历史窗口内的每一步，使早期动作
+       也能获得趋势信号。
+   * - ``env_reward_weight: 0.0``
+     - 真机场景中 Franka 原生 reward 为稀疏信号（只有到达目标位姿时=1.0），
+       训练主要依赖 VLM 趋势判断。到达目标时由 ``gt_success_bonus`` 提供奖励。
+   * - ``gt_success_bonus: 20.0``
+     - 当环境报告成功（``infos["success"] = True``）时，
+       在当前步的 VLM 奖励基础上追加 +20.0。这个巨大奖励让 Agent 明确知道
+       "到达目标 = 好的"。
+   * - ``history_buffers.history_window``
+     - 定义名为 ``history_window`` 的历史缓冲区：缓存最近 5 帧的
+       ``main_images`` 和 ``extra_view_images``，最少积累 5 帧后才触发推理。
+   * - ``input_builder_name: qwentrend_input_builder``
+     - 将历史窗口中的双视角帧拼接为 Qwen3-VL 的多图输入格式，
+       并构造提示词让模型判断动作趋势。
+   * - ``reward_parser_name: qwentrend_reward_parser``
+     - 解析 VLM 生成的文本（``positive`` / ``negative`` / ``unclear``），
+       映射为标量 reward。
+   * - ``worker_type: model``
+     - 在 reward worker 进程中直接加载模型进行本地 HuggingFace 推理。
+       如需使用 SGLang API 推理，改为 ``api`` 并配置 ``router_server_args``。
+
+3.3 奖励计算流程
+~~~~~~~~~~~~~~~
+
+每一步 RL 训练中，最终奖励由以下流程合成：
+
+.. code-block:: text
+
+   FrankaEnv.step()
+     │
+     ├─ 原生环境 reward（稀疏：0.0 或 1.0）
+     │
+     └─ infos = {"success": True}   ← 到达目标时写入
+          │
+          v
+   EnvWorker.get_reward_model_output()
+     │
+     ├─ HistoryManager 累积帧，构建 history_input
+     ├─ 发送 reward_input（含 history_input + env_infos）给 Reward worker
+     │
+     v
+   EmbodiedRewardWorker.compute_image_rewards()
+     │
+     ├─ HistoryVLMRewardModel.compute_reward()
+     │    ├─ min_history_size 未满足 → 返回 interval_reward (0.0)
+     │    └─ 满足 → Qwen3-VL 推理 → 解析为 ±1.0 / -0.2 / 0.0
+     │
+     └─ apply_gt_success_bonus()
+          └─ 若 infos["success"] == True → +20.0
+          │
+          v
+   compute_bootstrap_rewards()
+     │
+     └─ final_reward = env_reward_weight * env_reward
+                      + reward_weight * vlm_reward_with_bonus
+
+3.4 奖励时间线示例
+~~~~~~~~~~~~~~~~~
+
+假设机械臂从远离目标的位置开始，逐步接近并最终到达目标（共 100 步）：
+
+.. code-block:: text
+
+   步数    VLM 趋势      VLM Reward    gt_success_bonus    最终 Reward
+   ───────────────────────────────────────────────────────────────────
+   1-4     无（历史不足）   0.0             0                  0.0
+   5-20    unclear         0.0             0                  0.0
+   21-40   positive        1.0             0                  1.0
+   41-80   positive        1.0             0                  1.0
+   81-95   unclear         0.0             0                  0.0
+   96-100  positive        1.0             0                  1.0
+   100     positive        1.0            +20.0               21.0  ← 成功！
+
+由于 ``history_reward_assign: true``，每个 VLM 推理结果会反向分配到该历史窗口的
+每一步上，使早期动作也能获得趋势信号。
+
+.. _realworld-franka-infos-fix:
+
+3.5 关键修改：Franka env 写入 success 信息
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+仿真场景（ManiSkill）中，环境的 ``step()`` 返回的 ``infos`` 字典包含
+``final_info.episode.success``，``gt_success_bonus`` 可以直接读取并触发加分。
+
+但真机 Franka 环境的 ``step()`` 原本返回空字典 ``{}``，导致 ``gt_success_bonus``
+永远无法生效。需要在 ``franka_env.py`` 的 ``step()`` 方法中增加 success 信息的写入：
+
+.. code-block:: python
+   :emphasize-lines: 5-7
+
+   # rlinf/envs/realworld/franka/franka_env.py
+
+   truncated = self._num_steps >= self.config.max_num_steps
+   reward *= self.config.reward_scale
+
+   infos: dict = {}
+   if terminated:
+       infos["success"] = True
+
+   return observation, reward, terminated, truncated, infos
+
+``terminated`` 条件在 Franka env 中定义为：机械臂到达目标位姿
+（``reward == 1.0``）且保持足够步数（``success_hold_steps``）。
+
+.. note::
+
+   该修改不影响 Franka env 的其他行为，仅增加了一个 ``infos`` 字段。
+   对于不使用 ``gt_success_bonus`` 的配置（如纯 ResNet reward 场景），
+   此修改也是安全的——reward model 的 ``apply_gt_success_bonus``
+   在找不到 success 标志时会直接跳过。
+
+3.6 启动训练
+~~~~~~~~~~~~
+
+确认硬件部署和配置无误后，在 Ray head 节点执行：
+
+.. code-block:: bash
+
+   bash examples/embodiment/run_realworld_async.sh \
+       realworld_peginsertion_rlpd_cnn_async_sglang_reward
+
+训练启动后，日志中可以看到：
+
+- **VLM 推理输出**：每步 reward worker 会打印 VLM 的原始输出和解析后的 reward 值。
+- **Reward 分布**：``env/reward_model_output`` 指标展示 VLM reward 的分布。
+- **成功信号**：当机械臂到达目标时，日志会显示 reward 突增（+20.0）。
+
+3.7 与仿真场景的差异
+~~~~~~~~~~~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+
+   * -
+     - 仿真（ManiSkill）
+     - 真机（Franka）
+   * - **Reward 来源**
+     - VLM 趋势 + gt_success_bonus (simulator 自动提供 success)
+     - VLM 趋势 + gt_success_bonus (需手动在 env 中写入)
+   * - **并行环境数**
+     - 32（大量样本，高探索效率）
+     - 1（单机器人，样本有限）
+   * - **env_reward_weight**
+     - 0.0（纯 VLM，靠 gt_success_bonus 补偿）
+     - 0.0（纯 VLM，靠 gt_success_bonus 补偿）
+   * - **gt_success_bonus 来源**
+     - simulator infos 自动包含 success
+     - Franka env step() 手动写入 ``infos["success"]``
+   * - **VLM 推理方式**
+     - SGLang API（``worker_type: api``）
+     - 本地 HuggingFace（``worker_type: model``）
+   * - **任务难度**
+     - PickCube（简单）
+     - Peg Insertion（困难）
+
+.. tip::
+
+   如果训练初期机械臂难以探索到成功状态，可以临时将 ``env_reward_weight``
+   设为一个小值（如 0.5），让原生稀疏成功信号辅助引导。待策略有一定成功率后
+   再恢复为 ``0.0``。
