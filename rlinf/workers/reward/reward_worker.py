@@ -339,8 +339,11 @@ class EmbodiedRewardWorker(Worker):
         if rewards is not None and rewards.dim() == 1:
             rewards = rewards.unsqueeze(-1)
         if isinstance(rewards, torch.Tensor):
-            return rewards.detach().cpu()
-        return rewards
+            result = rewards.detach().cpu()
+        else:
+            result = rewards
+        self.log_info(f"VLM reward: parsed={float(result.mean().item()):.3f}")
+        return result
 
     async def compute_rewards_async(
         self, input_channel: Channel, output_channel: Channel

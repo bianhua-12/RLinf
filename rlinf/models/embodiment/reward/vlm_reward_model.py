@@ -158,6 +158,11 @@ class VLMRewardModel(BaseRewardModel):
         )
         rewards = self.reward_parser.parse_rewards(outputs)
 
+        import logging
+
+        logging.getLogger("rlinf").info(
+            "VLM reward: outputs=%s parsed=%s", outputs, rewards.tolist()
+        )
         return rewards
 
     def setup_model(self) -> None:
