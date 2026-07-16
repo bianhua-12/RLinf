@@ -828,3 +828,17 @@ SpaceMouse 控制说明：
 
 与 :doc:`../examples/embodied/franka_reward_model` 中的完整 RL 流程相比，
 遥操作脚本不运行策略、actor 或 rollout worker——它纯粹是人在回路的 reward model 评估。
+
+真机强化学习 +  Reward Model 在线推理
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+本项目基于RLPD算法实现 Qwen VLM reward model的真机强化学习，该实验的主要目的是使用Qwen VLM 作为reward model，加快rlpd_cnn训练任务的收敛速度。在本实验中，使用了经典的peginsertion任务。
+
+在真机强化学习中，Qwen VLM将会输出四种状态: Positive, Unclear, Negative 和Invalidate，并基于这四种状态引导机械臂正确输出。
+
+运行步骤:
+^^^^^^^
+
+1. 数据采集
+2. 监督微调
+3. 真机强化学习
