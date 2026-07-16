@@ -114,7 +114,7 @@ algorithm:
     cache_size: 200
     min_buffer_size: 1
     sample_window_size: 200
-    load_path: "/home/zhonghaoyang/reward_qwen_data/demo_data/demos"
+    load_path: "/path/to/your/demo/data"
     auto_save: False
 
   target_update_freq: 1
@@ -144,7 +144,7 @@ env:
       reward_scale: 1.0
       success_bonus: 20.0
       max_num_steps: 50
-      target_ee_pose: [ 4.90206450e-01, -1.98167609e-03, 7.56991953e-02, 3.13119937e+00, 1.87242712e-02, -6.33608643e-02]
+      target_ee_pose:  TARGET_EE_POSE # Replace with your target end-effector pose
       camera_names:
         "SERIAL1": "317622072022"
         "SERIAL2": "254322070894"
@@ -154,7 +154,7 @@ env:
     total_num_envs: 1
     override_cfg:
       is_dummy: False
-      target_ee_pose: [ 4.90206450e-01, -1.98167609e-03, 7.56991953e-02, 3.13119937e+00, 1.87242712e-02, -6.33608643e-02]
+      target_ee_pose:  TARGET_EE_POSE # Replace with your target end-effector pose
       camera_names:
         "SERIAL1": "317622072022"
         "SERIAL2": "254322070894"
@@ -169,7 +169,7 @@ rollout:
   collect_prev_infos: False
 
   model:
-    model_path: "/home/zhonghaoyang/reward_qwen_data/RLinf-ResNet10-pretrained"
+    model_path: "/path/to/RLinf-ResNet10-pretrained" # https://huggingface.co/RLinf/RLinf-ResNet10-pretrained
     precision: ${actor.model.precision}
     num_q_heads: 10
 
@@ -186,7 +186,7 @@ actor:
   enable_offload: False
 
   model:
-    model_path: "/home/zhonghaoyang/reward_qwen_data/RLinf-ResNet10-pretrained"
+    model_path: "/path/to/RLinf-ResNet10-pretrained" # https://huggingface.co/RLinf/RLinf-ResNet10-pretrained
     state_dim: 19
     action_dim: 6
     num_q_heads: 10
@@ -230,9 +230,9 @@ reward:
       temperature: 0.0
 
   model:
-    model_path: "/home/zhonghaoyang/reward_qwen_data/Qwen3-VL-4B-Instruct"
+    model_path: "/path/to/Qwen3-VL-4B-Instruct"
     model_type: "history_vlm"
-    lora_path: "/home/zhonghaoyang/reward_qwen_data/qwen3-vl-lora-checkpoint"
+    lora_path: "/path/to/qwen3-vl-lora-checkpoint"
     gt_success_bonus: 0.0
     precision: "bf16"
 
