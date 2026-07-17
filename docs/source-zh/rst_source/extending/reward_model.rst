@@ -869,7 +869,6 @@ reward model 通过**动作趋势判断**来引导机械臂：每 5 帧构成一
 2. **监督微调（SFT）** — 将采集数据预处理为 QwenTrend 格式，微调 Qwen3-VL-4B 作为趋势判断 reward model。
 3. **真机强化学习** — 在 RLPD 训练中接入微调后的 VLM reward model，在线推理并引导策略学习。
 
-----
 
 阶段一：数据采集
 """"""""""""""""
@@ -878,7 +877,7 @@ reward model 通过**动作趋势判断**来引导机械臂：每 5 帧构成一
 用于后续训练 VLM 判断机械臂动作趋势。
 
 采集方式
-~~~~~~~
+.......
 
 使用 :doc:`../examples/embodied/franka` 中的真机训练流程采集 episode 数据。
 建议开启 ``data_collection``，将每个 episode 保存为 ``.pkl`` 文件：
@@ -894,7 +893,7 @@ reward model 通过**动作趋势判断**来引导机械臂：每 5 帧构成一
          only_success: False
 
 采集技巧
-~~~~~~~~
+........
 
 - 尽量缓慢移动机械臂，使采集数据包含丰富的中间状态，便于 VLM 学习趋势判断。
 - 确保两个相机视角（``main_images`` 和 ``extra_view_images``）都能清晰看到机械臂末端
@@ -912,13 +911,12 @@ reward model 通过**动作趋势判断**来引导机械臂：每 5 帧构成一
              "SERIAL1": "317622072022"
              "SERIAL2": "254322070894"
 
-----
 
 阶段二：监督微调（SFT）
 """"""""""""""""""""""
 
 2.1 预处理为 QwenTrend 数据集
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.............................
 
 采集到的 ``.pkl`` episode 需要通过 ``preprocess_qwentrend_reward_dataset.py``
 转换为 QwenTrend SFT 格式。该脚本将 episode 按滑动窗口切分为 5 帧片段，
@@ -957,7 +955,7 @@ reward model 通过**动作趋势判断**来引导机械臂：每 5 帧构成一
        └── pkl/
 
 2.2 微调 Qwen3-VL-4B
-~~~~~~~~~~~~~~~~~~~~
+....................
 
 修改 SFT 配置文件 ``examples/sft/config/qwen3vl_sft_qwentrend.yaml`` 中的数据路径和模型路径：
 
@@ -987,13 +985,12 @@ reward model 通过**动作趋势判断**来引导机械臂：每 5 帧构成一
 训练完成后，记录 LoRA checkpoint 路径（如 ``checkpoints/global_step_3000``），
 后续 RL 训练中通过 ``reward.model.lora_path`` 引用。
 
-----
 
 阶段三：真机强化学习
 """"""""""""""""""""
 
 3.1 配置文件
-~~~~~~~~~~~
+...........
 
 使用 ``examples/embodiment/config/realworld_peginsertion_rlpd_cnn_async_sglang_reward.yaml``
 作为 RL 训练配置。该配置基于 RLPD CNN 异步训练模板，并在其基础上添加了 VLM reward model。
@@ -1054,7 +1051,7 @@ reward model 通过**动作趋势判断**来引导机械臂：每 5 帧构成一
          placement: 0
 
 3.2 关键配置字段说明
-~~~~~~~~~~~~~~~~~~~
+...................
 
 .. list-table::
    :header-rows: 1
@@ -1088,7 +1085,7 @@ reward model 通过**动作趋势判断**来引导机械臂：每 5 帧构成一
        如需使用 SGLang API 推理，改为 ``api`` 并配置 ``router_server_args``。
 
 3.3 奖励计算流程
-~~~~~~~~~~~~~~~
+...............
 
 每一步 RL 训练中，最终奖励由以下流程合成：
 
@@ -1123,7 +1120,7 @@ reward model 通过**动作趋势判断**来引导机械臂：每 5 帧构成一
                       + reward_weight * vlm_reward_with_bonus
 
 3.4 奖励时间线示例
-~~~~~~~~~~~~~~~~~
+.................
 
 假设机械臂从远离目标的位置开始，逐步接近并最终到达目标（共 100 步）：
 
@@ -1145,7 +1142,7 @@ reward model 通过**动作趋势判断**来引导机械臂：每 5 帧构成一
 .. _realworld-franka-infos-fix:
 
 3.5 关键修改：Franka env 写入 success 信息
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+..........................................
 
 仿真场景（ManiSkill）中，环境的 ``step()`` 返回的 ``infos`` 字典包含
 ``final_info.episode.success``，``gt_success_bonus`` 可以直接读取并触发加分。
@@ -1154,7 +1151,7 @@ reward model 通过**动作趋势判断**来引导机械臂：每 5 帧构成一
 永远无法生效。需要在 ``franka_env.py`` 的 ``step()`` 方法中增加 success 信息的写入：
 
 .. code-block:: python
-   :emphasize-lines: 5-7
+
 
    # rlinf/envs/realworld/franka/franka_env.py
 
@@ -1178,7 +1175,7 @@ reward model 通过**动作趋势判断**来引导机械臂：每 5 帧构成一
    在找不到 success 标志时会直接跳过。
 
 3.6 启动训练
-~~~~~~~~~~~~
+............
 
 确认硬件部署和配置无误后，在 Ray head 节点执行：
 
@@ -1194,7 +1191,7 @@ reward model 通过**动作趋势判断**来引导机械臂：每 5 帧构成一
 - **成功信号**：当机械臂到达目标时，日志会显示 reward 突增（+20.0）。
 
 3.7 与仿真场景的差异
-~~~~~~~~~~~~~~~~~~~~
+....................
 
 .. list-table::
    :header-rows: 1

@@ -899,7 +899,6 @@ The full pipeline has three stages:
 2. **Supervised Fine-Tuning (SFT)** — Preprocess collected data into QwenTrend format and fine-tune Qwen3-VL-4B as a trend-judgment reward model.
 3. **Real-World RL Training** — Integrate the fine-tuned VLM reward model into RLPD training for online inference and policy guidance.
 
-----
 
 Stage 1: Data Collection
 """"""""""""""""""""""""
@@ -909,7 +908,7 @@ The goal of data collection is to obtain episodes containing dual-view
 to judge robot motion trends.
 
 Collection Method
-~~~~~~~~~~~~~~~~~
+.................
 
 Use the real-world training pipeline described in
 :doc:`../examples/embodied/franka` to collect episode data. Enable
@@ -926,7 +925,7 @@ Use the real-world training pipeline described in
          only_success: False
 
 Collection Tips
-~~~~~~~~~~~~~~~
+...............
 
 - Move the robot arm slowly so the collected data contains rich intermediate
   states, making it easier for the VLM to learn trend judgment.
@@ -946,13 +945,12 @@ Collection Tips
              "SERIAL1": "317622072022"
              "SERIAL2": "254322070894"
 
-----
 
 Stage 2: Supervised Fine-Tuning (SFT)
 """""""""""""""""""""""""""""""""""""
 
 2.1 Preprocess into QwenTrend Dataset
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.....................................
 
 The collected ``.pkl`` episodes must be converted to QwenTrend SFT format using
 ``preprocess_qwentrend_reward_dataset.py``. This script slices episodes into
@@ -992,7 +990,7 @@ Output directory structure:
        └── pkl/
 
 2.2 Fine-Tune Qwen3-VL-4B
-~~~~~~~~~~~~~~~~~~~~~~~~~
+.........................
 
 Update the data and model paths in the SFT config file
 ``examples/sft/config/qwen3vl_sft_qwentrend.yaml``:
@@ -1024,13 +1022,12 @@ After training, note the LoRA checkpoint path (e.g.,
 ``checkpoints/global_step_3000``), which will be referenced via
 ``reward.model.lora_path`` in the RL config.
 
-----
 
 Stage 3: Real-World Reinforcement Learning
 """"""""""""""""""""""""""""""""""""""""""
 
 3.1 Configuration File
-~~~~~~~~~~~~~~~~~~~~~~
+......................
 
 Use ``examples/embodiment/config/realworld_peginsertion_rlpd_cnn_async_sglang_reward.yaml``
 as the RL training config. It is based on the RLPD CNN async training template
@@ -1092,7 +1089,7 @@ with the VLM reward model added.
          placement: 0
 
 3.2 Key Configuration Fields
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+............................
 
 .. list-table::
    :header-rows: 1
@@ -1131,7 +1128,7 @@ with the VLM reward model added.
        and configure ``router_server_args``.
 
 3.3 Reward Computation Flow
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+...........................
 
 At each RL training step, the final reward is composed through the following
 pipeline:
@@ -1167,7 +1164,7 @@ pipeline:
                       + reward_weight * vlm_reward_with_bonus
 
 3.4 Reward Timeline Example
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+...........................
 
 Assuming the robot arm starts far from the target, gradually approaches, and
 eventually reaches it (100 steps total):
@@ -1191,7 +1188,7 @@ receive the trend signal.
 .. _realworld-franka-infos-fix-en:
 
 3.5 Critical Modification: Franka Env Writes Success Info
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.........................................................
 
 In simulation (ManiSkill), the environment's ``step()`` returns ``infos``
 containing ``final_info.episode.success``, which ``gt_success_bonus`` reads
@@ -1203,7 +1200,7 @@ empty dict ``{}``, meaning ``gt_success_bonus`` could never fire. The
 status:
 
 .. code-block:: python
-   :emphasize-lines: 5-7
+
 
    # rlinf/envs/realworld/franka/franka_env.py
 
@@ -1229,7 +1226,7 @@ target pose (``reward == 1.0``) AND holds it for enough steps
    is found.
 
 3.6 Starting Training
-~~~~~~~~~~~~~~~~~~~~~
+.....................
 
 Once hardware deployment and configuration are verified, run on the Ray head
 node:
@@ -1249,7 +1246,7 @@ After training starts, the logs will show:
   a reward spike (+20.0).
 
 3.7 Differences from Simulation
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+...............................
 
 .. list-table::
    :header-rows: 1
