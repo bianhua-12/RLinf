@@ -77,7 +77,9 @@ def _validate_teleop_mode(**modes: bool) -> None:
         )
 
 
-def _apply_keyboard_wrapper(env: gym.Env, mode: Optional[str]) -> gym.Env:
+def _apply_keyboard_wrapper(
+    env: gym.Env, mode: Optional[str], fifo_path: str | None = None
+) -> gym.Env:
     config = env.get_wrapper_attr("config")
     if config.is_dummy or not mode:
         return env
@@ -86,7 +88,7 @@ def _apply_keyboard_wrapper(env: gym.Env, mode: Optional[str]) -> gym.Env:
     if mode == "single_stage":
         return KeyboardRewardDoneWrapper(env)
     if mode == "start_end":
-        return KeyboardStartEndWrapper(env)
+        return KeyboardStartEndWrapper(env, fifo_path=fifo_path)
     if mode == "eval_control":
         return KeyboardEvalControlWrapper(env)
     if mode == "rlt_policy_switch":
@@ -147,7 +149,11 @@ def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
         pico_cfg = dict(cfg.get("pico", {}))
         env = PicoIntervention(env, gripper_enabled=gripper_enabled, **pico_cfg)
 
-    env = _apply_keyboard_wrapper(env, cfg.get("keyboard_reward_wrapper", None))
+    env = _apply_keyboard_wrapper(
+        env,
+        cfg.get("keyboard_reward_wrapper", None),
+        cfg.get("keyboard_fifo_path", None),
+    )
 
     if cfg.get("use_relative_frame", True):
         env = RelativeFrame(env)
@@ -240,5 +246,13 @@ def apply_dual_franka_joint_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gy
             **pico_cfg,
         )
 
-    env = _apply_keyboard_wrapper(env, cfg.get("keyboard_reward_wrapper", None))
+    try:
+        env = _apply_keyboard_wrapper(
+            env,
+            cfg.get("keyboard_reward_wrapper", None),
+            cfg.get("keyboard_fifo_path", None),
+        )
+    except Exception:
+        env.close()
+        raise
     return env
