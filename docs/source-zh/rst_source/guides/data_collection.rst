@@ -28,7 +28,7 @@ Episode 数据采集
 支持保存为两种格式：
 
 - **pickle** — 保存完整原始 buffer，适合自定义离线处理。
-- **lerobot** — 保存结构化 Parquet + 元数据，可直接接入 LeRobot 训练流程。
+- **lerobot** — 保存结构化 Parquet 和元数据，并可选保存 MP4 相机视频，可直接接入 LeRobot 训练流程。
 
 核心特性
 ~~~~~~~~
@@ -38,7 +38,8 @@ Episode 数据采集
   将重置后的初始观测带入下一 episode。
 - 写入操作在独立后台线程异步执行，不阻塞 RL 训练主循环。
 - LeRobot writer 在第一条 episode 写入时懒初始化，自动推断图像尺寸、状态维度、动作维度。
-- LeRobot 导出支持保存 ``image`` 与 ``extra_view_image``；当 ``extra_view_images``
+- 设置 ``use_videos=True`` 可将 ``image`` 与 ``extra_view_image`` 保存为 MP4 视频流；当
+  ``extra_view_images``
   为 ``[N, H, W, C]`` 多视角堆叠时，会自动按索引展开成 ``extra_view_image-0``、
   ``extra_view_image-1`` …… 等列。
 - ``only_success=True`` 可过滤失败 episode，节省磁盘空间。
@@ -86,6 +87,10 @@ Episode 数据采集
      - ``int``
      - ``10``
      - 数据集帧率，写入 LeRobot 元数据（仅 lerobot 格式有效）
+   * - ``use_videos``
+     - ``bool``
+     - ``False``
+     - 将 LeRobot 相机特征编码为 MP4 视频
    * - ``only_success``
      - ``bool``
      - ``False``
@@ -300,6 +305,10 @@ wrapper 从 info 字典中按以下优先级推断 episode 是否成功（从最
    * - ``runner.num_data_episodes``
      - ``20``
      - 目标成功轨迹数量，达到后自动停止
+   * - ``runner.save_demos``
+     - ``True``
+     - 是否将 ``TrajectoryReplayBuffer`` 轨迹写入 ``demos/``；仅需配置的
+       episode 导出时可将其关闭
    * - ``cluster.node_groups.hardware.configs.robot_ip``
      - —
      - Franka 机器人 IP 地址
@@ -371,6 +380,9 @@ wrapper 从 info 字典中按以下优先级推断 episode 是否成功（从最
 
 - ``logs/{timestamp}/demos/``：``TrajectoryReplayBuffer`` 轨迹，用于 RLPD
 - ``logs/{timestamp}/collected_data/``：``pickle`` 或 LeRobot 格式的 episode 数据
+
+设置 ``runner.save_demos=False`` 可跳过 replay buffer 输出，同时保留已配置的
+``collected_data/`` 导出。
 
 若希望在收集真机 replay buffer 的同时额外导出 LeRobot 数据集，可保留如下配置：
 
