@@ -107,8 +107,20 @@ class DataCollector(Worker):
             total_num_processes=1,
             worker_info=self.worker_info,
         )
+        self._hardware_env = self.env
+        try:
+            self._initialize_collection_storage()
+        except Exception:
+            try:
+                self._hardware_env.close()
+            finally:
+                if self.env is not self._hardware_env:
+                    self.env.close()
+            raise
 
-        dc_cfg = cfg.env.eval.get("data_collection")
+    def _initialize_collection_storage(self):
+        self.save_demos = bool(self.cfg.runner.get("save_demos", True))
+        dc_cfg = self.cfg.env.eval.get("data_collection")
         if dc_cfg and getattr(dc_cfg, "enabled", False):
             from rlinf.envs.wrappers import CollectEpisode
 
@@ -137,16 +149,19 @@ class DataCollector(Worker):
         # Read from the wrapped action space so GripperCloseEnv / dual-arm all just work.
         self.action_dim = int(self.env.action_space.shape[-1])
 
-        buffer_path = os.path.join(self.cfg.runner.logger.log_path, "demos")
-        self.log_info(f"Initializing ReplayBuffer at: {buffer_path}")
-
-        self.buffer = TrajectoryReplayBuffer(
-            seed=self.cfg.seed if hasattr(self.cfg, "seed") else 1234,
-            enable_cache=False,
-            auto_save=True,
-            auto_save_path=buffer_path,
-            trajectory_format="pt",
-        )
+        self.buffer = None
+        if self.save_demos:
+            buffer_path = os.path.join(self.cfg.runner.logger.log_path, "demos")
+            self.log_info(f"Initializing ReplayBuffer at: {buffer_path}")
+            self.buffer = TrajectoryReplayBuffer(
+                seed=self.cfg.seed if hasattr(self.cfg, "seed") else 1234,
+                enable_cache=False,
+                auto_save=True,
+                auto_save_path=buffer_path,
+                trajectory_format="pt",
+            )
+        else:
+            self.log_info("ReplayBuffer demo saving is disabled.")
 
         # Outer rate limiter for envs that don't self-pace (e.g. direct-stream).
         fps = dc_cfg.get("fps") if dc_cfg else None
@@ -169,12 +184,25 @@ class DataCollector(Worker):
         return ret_obs
 
     def run(self):
+        try:
+            self._run_collection()
+        finally:
+            try:
+                self._hardware_env.close()
+            finally:
+                try:
+                    if self.buffer is not None:
+                        self.buffer.close()
+                finally:
+                    if self.env is not self._hardware_env:
+                        self.env.close()
+
+    def _run_collection(self):
         obs, _ = self.env.reset()
         # Seed from preexisting episodes so resume bar + stop target line up.
         success_cnt = self._preexisting_success
         if success_cnt >= self.num_data_episodes:
             self.log_info(f"[resume] target {self.num_data_episodes} already met.")
-            self.env.close()
             return
         progress_bar = tqdm(
             total=self.num_data_episodes,
@@ -267,11 +295,12 @@ class DataCollector(Worker):
                         f"Total: {success_cnt}/{self.num_data_episodes}"
                     )
 
-                    trajectory = current_rollout.to_trajectory()
-                    trajectory.intervene_flags = torch.ones_like(
-                        trajectory.intervene_flags
-                    )
-                    self.buffer.add_trajectories([trajectory])
+                    if self.save_demos:
+                        trajectory = current_rollout.to_trajectory()
+                        trajectory.intervene_flags = torch.ones_like(
+                            trajectory.intervene_flags
+                        )
+                        self.buffer.add_trajectories([trajectory])
 
                     progress_bar.update(1)
                 else:
@@ -296,11 +325,13 @@ class DataCollector(Worker):
                 if sleep_for > 0:
                     time.sleep(sleep_for)
 
-        self.buffer.close()
-        self.log_info(
-            f"Finished. Demos saved in: {os.path.join(self.cfg.runner.logger.log_path, 'demos')}"
-        )
-        self.env.close()
+        if self.save_demos:
+            self.log_info(
+                "Finished. Demos saved in: "
+                f"{os.path.join(self.cfg.runner.logger.log_path, 'demos')}"
+            )
+        else:
+            self.log_info("Finished. ReplayBuffer demo saving was disabled.")
 
 
 @hydra.main(
