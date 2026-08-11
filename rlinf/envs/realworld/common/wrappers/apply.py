@@ -181,6 +181,39 @@ def apply_dual_franka_joint_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gy
                 "use_gello_joint=True requires both "
                 "'left_gello_port' and 'right_gello_port' in the env config."
             )
+        expert_kwargs = {}
+        if cfg.get("left_gello_joint_signs") is not None:
+            from rlinf.envs.realworld.common.gello.dynamixel_reader import (
+                GelloDynamixelReader,
+            )
+            from rlinf.envs.realworld.common.gello.gello_joint_expert import (
+                GelloJointExpert,
+            )
+
+            experts = []
+            try:
+                for side, port in (("left", left_port), ("right", right_port)):
+                    reader = GelloDynamixelReader(
+                        port=port,
+                        joint_signs=cfg[f"{side}_gello_joint_signs"],
+                        joint_offsets=cfg[f"{side}_gello_joint_offsets"],
+                        gripper_id=cfg.get("gello_gripper_id", 8),
+                        gripper_range_rad=cfg[f"{side}_gello_gripper_range_rad"],
+                    )
+                    experts.append(
+                        GelloJointExpert(
+                            action_source=reader.read_with_gripper,
+                            close_action_source=reader.close,
+                            joint_limits_lower=config.joint_position_limits_lower,
+                            joint_limits_upper=config.joint_position_limits_upper,
+                        )
+                    )
+            except Exception:
+                for expert in experts:
+                    expert.close()
+                raise
+            expert_kwargs = {"left_expert": experts[0], "right_expert": experts[1]}
+
         env = DualGelloJointIntervention(
             env,
             left_port=left_port,
@@ -190,6 +223,8 @@ def apply_dual_franka_joint_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gy
             action_scale=getattr(config, "joint_action_scale", 0.1),
             direct_stream=getattr(config, "teleop_direct_stream", False),
             stream_period=cfg.get("gello_joint_stream_period", 0.001),
+            ready_timeout=cfg.get("gello_ready_timeout", 10.0),
+            **expert_kwargs,
         )
 
     if not config.is_dummy and use_pico:
