@@ -15,9 +15,7 @@
 #include <rlinf_franka_controller/joint_impedance_controller.hpp>
 
 #include <Eigen/Eigen>
-#include <cassert>
 #include <cmath>
-#include <exception>
 #include <string>
 
 using std::placeholders::_1;
@@ -74,8 +72,6 @@ JointImpedanceController::update(const rclcpp::Time &time,
       control_state_ = ControlState::HOLDING;
       command_epoch_ = time;
       motion_target_positions_ = q_goal;
-      RCLCPP_INFO(get_node()->get_logger(),
-                  "Controlled joint motion complete; holding target.");
     }
   } else if (new_target || control_state_ == ControlState::TRACKING) {
     const double command_age = (time - joint_target.received_time).seconds();
@@ -84,10 +80,6 @@ JointImpedanceController::update(const rclcpp::Time &time,
       for (int i = 0; i < num_joints; ++i) {
         command_interfaces_[i].set_value(0.0);
       }
-      RCLCPP_FATAL(get_node()->get_logger(),
-                   "RLinf joint command timed out (age %.6f s, limit %.3f s).",
-                   command_age, command_timeout_);
-      rclcpp::shutdown();
       return controller_interface::return_type::ERROR;
     }
     if (new_target) {
@@ -112,9 +104,6 @@ JointImpedanceController::update(const rclcpp::Time &time,
 void JointImpedanceController::jointStateCallback_(
     const sensor_msgs::msg::JointState msg) {
   if (msg.position.size() != static_cast<std::size_t>(num_joints)) {
-    RCLCPP_WARN(get_node()->get_logger(),
-                "Received joint target size %zu; expected %d.",
-                msg.position.size(), num_joints);
     return;
   }
 
@@ -129,9 +118,6 @@ void JointImpedanceController::jointStateCallback_(
     target.valid = target.valid && std::isfinite(position);
   }
   if (!target.valid) {
-    RCLCPP_WARN(get_node()->get_logger(),
-                "RLinf joint target is invalid or stale; message age: %.6f s.",
-                message_age);
     return;
   }
   // Use publisher time as the epoch so a delayed pre-reset command cannot
@@ -143,9 +129,6 @@ void JointImpedanceController::jointStateCallback_(
 void JointImpedanceController::resetTargetCallback_(
     const sensor_msgs::msg::JointState msg) {
   if (msg.position.size() != static_cast<std::size_t>(num_joints)) {
-    RCLCPP_WARN(get_node()->get_logger(),
-                "Received controlled-motion target size %zu; expected %d.",
-                msg.position.size(), num_joints);
     return;
   }
 
@@ -156,8 +139,6 @@ void JointImpedanceController::resetTargetCallback_(
     target.valid = target.valid && std::isfinite(position);
   }
   if (!target.valid) {
-    RCLCPP_WARN(get_node()->get_logger(),
-                "Controlled-motion target contains a non-finite position.");
     return;
   }
   reset_target_buffer_.writeFromNonRT(target);
@@ -165,20 +146,14 @@ void JointImpedanceController::resetTargetCallback_(
 }
 
 CallbackReturn JointImpedanceController::on_init() {
-  try {
-    auto_declare<std::string>("arm_id", "");
-    auto_declare<std::vector<double>>("k_gains", {});
-    auto_declare<std::vector<double>>("d_gains", {});
-    auto_declare<double>("k_alpha", 0.99);
-    auto_declare<double>("reset_speed_factor", 0.012);
-    auto_declare<double>("command_timeout", 0.5);
-    auto_declare<std::string>("command_topic", "rlinf/joint_targets");
-    auto_declare<std::string>("reset_topic", "rlinf/reset_joint_target");
-  } catch (const std::exception &e) {
-    fprintf(stderr, "Exception thrown during init stage with message: %s \n",
-            e.what());
-    return CallbackReturn::ERROR;
-  }
+  auto_declare<std::string>("arm_id", "");
+  auto_declare<std::vector<double>>("k_gains", {});
+  auto_declare<std::vector<double>>("d_gains", {});
+  auto_declare<double>("k_alpha", 0.99);
+  auto_declare<double>("reset_speed_factor", 0.012);
+  auto_declare<double>("command_timeout", 0.5);
+  auto_declare<std::string>("command_topic", "rlinf/joint_targets");
+  auto_declare<std::string>("reset_topic", "rlinf/reset_joint_target");
   return CallbackReturn::SUCCESS;
 }
 
@@ -200,8 +175,7 @@ CallbackReturn JointImpedanceController::on_configure(
       get_node()->get_parameter("reset_speed_factor").as_double();
   command_timeout_ = get_node()->get_parameter("command_timeout").as_double();
 
-  if (!validateGains_(k_gains, "k_gains") ||
-      !validateGains_(d_gains, "d_gains")) {
+  if (!validateGains_(k_gains) || !validateGains_(d_gains)) {
     return CallbackReturn::FAILURE;
   }
 
@@ -210,18 +184,12 @@ CallbackReturn JointImpedanceController::on_configure(
     k_gains_(i) = k_gains.at(i);
   }
   if (k_alpha < 0.0 || k_alpha > 1.0) {
-    RCLCPP_FATAL(get_node()->get_logger(),
-                 "k_alpha should be in the range [0, 1]");
     return CallbackReturn::FAILURE;
   }
   if (reset_speed_factor_ <= 0.0 || reset_speed_factor_ > 1.0) {
-    RCLCPP_FATAL(get_node()->get_logger(),
-                 "reset_speed_factor must be in the range (0, 1]");
     return CallbackReturn::FAILURE;
   }
   if (command_timeout_ <= 0.0) {
-    RCLCPP_FATAL(get_node()->get_logger(),
-                 "command_timeout must be positive");
     return CallbackReturn::FAILURE;
   }
 
@@ -275,31 +243,15 @@ auto JointImpedanceController::calculateTauDGains_(const Vector7d &q_goal)
   return tau_d_calculated;
 }
 
-bool JointImpedanceController::validateGains_(const std::vector<double> &gains,
-                                              const std::string &gains_name) {
-  if (gains.empty()) {
-    RCLCPP_FATAL(get_node()->get_logger(), "%s parameter not set",
-                 gains_name.c_str());
-    return false;
-  }
-
-  if (gains.size() != static_cast<uint>(num_joints)) {
-    RCLCPP_FATAL(get_node()->get_logger(),
-                 "%s should be of size %d but is of size %ld",
-                 gains_name.c_str(), num_joints, gains.size());
-    return false;
-  }
-
-  return true;
+bool JointImpedanceController::validateGains_(
+    const std::vector<double> &gains) {
+  return gains.size() == static_cast<std::size_t>(num_joints);
 }
 
 void JointImpedanceController::updateJointStates_() {
   for (auto i = 0; i < num_joints; ++i) {
     const auto &position_interface = state_interfaces_.at(2 * i);
     const auto &velocity_interface = state_interfaces_.at(2 * i + 1);
-
-    assert(position_interface.get_interface_name() == "position");
-    assert(velocity_interface.get_interface_name() == "velocity");
 
     q_(i) = position_interface.get_value();
     dq_(i) = velocity_interface.get_value();
@@ -321,9 +273,6 @@ void JointImpedanceController::initializeResetMotion_() {
       reset_speed_factor_, q_, motion_target_positions_);
   move_to_start_position_finished_ = false;
   control_state_ = ControlState::RESETTING;
-  RCLCPP_INFO(get_node()->get_logger(),
-              "Starting controlled joint motion at speed factor %.4f.",
-              reset_speed_factor_);
 }
 
 } // namespace rlinf_franka_controller

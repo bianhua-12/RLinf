@@ -39,6 +39,7 @@ def generate_launch_description() -> LaunchDescription:
             "urdf_file": "fr3/fr3.urdf.xacro",
             "robot_ip": LaunchConfiguration("robot_ip"),
             "load_gripper": "false",
+            "load_franka_robot_state_broadcaster": "false",
             "use_fake_hardware": LaunchConfiguration("use_fake_hardware"),
             "fake_sensor_commands": LaunchConfiguration("use_fake_hardware"),
             "joint_state_rate": "30",

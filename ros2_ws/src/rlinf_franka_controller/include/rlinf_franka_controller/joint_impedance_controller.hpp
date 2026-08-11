@@ -82,8 +82,7 @@ private:
   realtime_tools::RealtimeBuffer<JointTarget> reset_target_buffer_;
 
   Vector7d calculateTauDGains_(const Vector7d &q_goal);
-  bool validateGains_(const std::vector<double> &gains,
-                      const std::string &gains_name);
+  bool validateGains_(const std::vector<double> &gains);
   void initializeResetMotion_();
   void updateJointStates_();
   void jointStateCallback_(const sensor_msgs::msg::JointState msg);
