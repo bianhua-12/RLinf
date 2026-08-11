@@ -309,14 +309,12 @@ class DataCollector(Worker):
                         f"Discarded. Total success: {success_cnt}/{self.num_data_episodes}"
                     )
 
-                reset_options = None
-                if success_cnt >= self.num_data_episodes:
-                    reset_options = {"skip_wait_for_start": True}
-                obs, _ = self.env.reset(options=reset_options)
-                current_obs_processed = self._process_obs(obs)
-                current_rollout = EmbodiedTrajectoryBuilder(
-                    max_episode_length=self.cfg.env.eval.max_episode_steps,
-                )
+                if success_cnt < self.num_data_episodes:
+                    obs, _ = self.env.reset()
+                    current_obs_processed = self._process_obs(obs)
+                    current_rollout = EmbodiedTrajectoryBuilder(
+                        max_episode_length=self.cfg.env.eval.max_episode_steps,
+                    )
 
             # Pin loop period; on ``done`` env.reset usually exceeds it → sleep_for≤0 no-ops.
             if self._target_step_period is not None:
