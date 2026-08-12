@@ -38,6 +38,27 @@ ACTION_HORIZON = 30
 CONTROL_HZ = 30.0
 TRAINING_RTC_MAX_DELAY = 10
 DEFAULT_PEDAL = "/dev/input/by-id/usb-PCsensor_FootSwitch-event-kbd"
+DEFAULT_TASK = "fold the clothes"
+DEFAULT_JOINT_RESET_QPOS = [
+    [
+        -0.02556161,
+        0.30659358,
+        -0.07418893,
+        -1.70056259,
+        -0.00549571,
+        2.11270901,
+        1.16654093,
+    ],
+    [
+        -0.09129598,
+        0.39645433,
+        0.24130687,
+        -1.49827293,
+        -0.11264549,
+        1.97891465,
+        1.86833598,
+    ],
+]
 
 
 def _encode_numpy(value: Any) -> Any:
@@ -420,14 +441,16 @@ def parse_args() -> argparse.Namespace:
         "--port", type=int, default=int(os.environ.get("GR00T_SERVER_PORT", "5555"))
     )
     parser.add_argument("--timeout-ms", type=int, default=15000)
-    parser.add_argument("--task", default=os.environ.get("RLINF_TASK_DESCRIPTION"))
+    parser.add_argument(
+        "--task", default=os.environ.get("RLINF_TASK_DESCRIPTION", DEFAULT_TASK)
+    )
     parser.add_argument(
         "--joint-reset-qpos",
         type=_joint_reset,
         default=(
             _joint_reset(os.environ["RLINF_JOINT_RESET_QPOS"])
             if "RLINF_JOINT_RESET_QPOS" in os.environ
-            else None
+            else DEFAULT_JOINT_RESET_QPOS
         ),
     )
     parser.add_argument("--left-robot-ip", default="172.16.0.1")
@@ -489,10 +512,6 @@ def main() -> None:
         return
     if not args.enable_policy:
         raise SystemExit("Refusing to open hardware without --enable-policy")
-    if not args.task:
-        raise SystemExit("Set RLINF_TASK_DESCRIPTION or pass --task")
-    if args.joint_reset_qpos is None:
-        raise SystemExit("Set RLINF_JOINT_RESET_QPOS or pass --joint-reset-qpos")
     if not 1 <= args.port <= 65535 or args.timeout_ms <= 0 or args.max_steps <= 0:
         raise SystemExit("port, timeout-ms, and max-steps must be positive and valid")
     confirmation = input("Type RUN FRANKA POLICY to open hardware: ").strip()
