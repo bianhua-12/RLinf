@@ -514,9 +514,7 @@ def main() -> None:
         raise SystemExit("Refusing to open hardware without --enable-policy")
     if not 1 <= args.port <= 65535 or args.timeout_ms <= 0 or args.max_steps <= 0:
         raise SystemExit("port, timeout-ms, and max-steps must be positive and valid")
-    confirmation = input("Type RUN FRANKA POLICY to open hardware: ").strip()
-    if confirmation != "RUN FRANKA POLICY":
-        raise SystemExit("Cancelled")
+    input("Press Enter to open hardware (Ctrl+C to cancel): ")
 
     os.environ["RLINF_KEYBOARD_DEVICE"] = args.pedal_device
     from rlinf.envs.realworld.common.keyboard.keyboard_listener import KeyboardListener
