@@ -366,8 +366,10 @@ class DualFrankaEnv(gym.Env):
         except Exception as exc:
             self._logger.warning("open_gripper during reset failed: %s", exc)
 
-        self._left_ctrl.reset_joint(self.config.joint_reset_qpos[0])
-        self._right_ctrl.reset_joint(self.config.joint_reset_qpos[1])
+        left_reset_f = self._left_ctrl.reset_joint(self.config.joint_reset_qpos[0])
+        right_reset_f = self._right_ctrl.reset_joint(self.config.joint_reset_qpos[1])
+        left_reset_f.wait()
+        right_reset_f.wait()
         time.sleep(0.5)
         self._left_state = self._left_ctrl.get_state().wait()[0]
         self._right_state = self._right_ctrl.get_state().wait()[0]

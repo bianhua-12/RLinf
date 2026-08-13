@@ -300,9 +300,13 @@ class Ros2DualFrankaBackend:
                 self._controller_health_requested[side] = now
 
             future = self._controller_health_futures[side]
-            if future is not None and (
-                now - self._controller_health_requested[side]
-                > self.config.controller_health_timeout
+            if (
+                future is not None
+                and self._controller_seen_active[side]
+                and (
+                    now - self._controller_health_requested[side]
+                    > self.config.controller_health_timeout
+                )
             ):
                 self._controller_health_errors[side] = TimeoutError(
                     "controller health response timed out"
