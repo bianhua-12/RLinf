@@ -37,6 +37,7 @@ from rlinf.scheduler import Cluster, ComponentPlacement, Worker
 
 _ARM_INDICES = np.array([*range(7), *range(8, 15)])
 _GRIPPER_INDICES = np.array([7, 15])
+_DEFAULT_DATASET_PATH = "/data/datasets/fold_clothes/franka_fold_clothes_raw_v1"
 
 
 @dataclass(frozen=True)
@@ -104,8 +105,9 @@ def load_replay_episode(dataset_path: str, episode_index: int) -> ReplayEpisode:
     joint_actions = actions[:, _ARM_INDICES]
     if np.any(joint_actions < joint_low) or np.any(joint_actions > joint_high):
         raise ValueError("Episode actions exceed FR3 joint limits")
-    if np.any(np.abs(actions[:, _GRIPPER_INDICES]) > 1.0):
-        raise ValueError("Episode gripper actions must be in [-1, 1]")
+    actions[:, _GRIPPER_INDICES] = np.clip(
+        actions[:, _GRIPPER_INDICES], -1.0, 1.0
+    )
 
     return ReplayEpisode(
         root=root,
@@ -237,9 +239,7 @@ os.environ.setdefault("RLINF_TASK_DESCRIPTION", "LeRobot episode replay")
     config_name="realworld_collect_data_ros2_gello_dual_franka_pnp",
 )
 def main(cfg) -> None:
-    dataset_path = os.environ.get("RLINF_REPLAY_DATASET")
-    if not dataset_path:
-        raise ValueError("Set RLINF_REPLAY_DATASET to a LeRobot dataset root")
+    dataset_path = os.environ.get("RLINF_REPLAY_DATASET", _DEFAULT_DATASET_PATH)
     episode_index = int(os.environ.get("RLINF_REPLAY_EPISODE", "0"))
     episode = load_replay_episode(dataset_path, episode_index)
     max_joint_step = float(
@@ -258,7 +258,8 @@ def main(cfg) -> None:
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "ROS 2 is not sourced. Run `source /opt/ros/humble/setup.bash` and "
-            "`source /data/RLinf/ros2_ws/install/setup.bash` first."
+            "`source /data/RLinf-franka/ros2_ws/install/setup.bash` "
+            "first."
         ) from exc
     if input(f"Type REPLAY {episode_index} to start hardware replay: ").strip() != (
         f"REPLAY {episode_index}"
