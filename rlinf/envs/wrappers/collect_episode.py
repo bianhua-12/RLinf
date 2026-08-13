@@ -638,9 +638,12 @@ class CollectEpisode(gym.Wrapper):
             return
         self._wait_futures()
         with self._lerobot_lock:
-            if self._lerobot_writer is not None:
+            if (
+                self._lerobot_writer is not None
+                and self._lerobot_writer.dataset is not None
+            ):
                 self._lerobot_writer.finalize()
-                self._lerobot_writer = None
+            self._lerobot_writer = None
 
     def _write_pickle(self, save_path: str, episode_data: dict) -> None:
         with open(save_path, "wb") as f:

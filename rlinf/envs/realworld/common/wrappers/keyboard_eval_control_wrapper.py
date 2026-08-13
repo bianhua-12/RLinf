@@ -64,8 +64,12 @@ class KeyboardEvalControlWrapper(gym.Wrapper):
             for key in self.listener.pop_pressed_keys():
                 if key == "a":
                     self._running = True
+                    obs = self._refresh_observation()
+                    self._last_obs = obs
                     self._log_info("Pedal 'a' pressed; starting rollout.")
                     return obs, info
+                if key == "q":
+                    raise KeyboardInterrupt
 
     def step(
         self, action: ActType
@@ -83,7 +87,10 @@ class KeyboardEvalControlWrapper(gym.Wrapper):
                 self._last_press_ts[key] = now
                 if key == "a":
                     self._running = True
+                    self._last_obs = self._refresh_observation()
                     return self._idle_response(event="start")
+                if key == "q":
+                    raise KeyboardInterrupt
             return self._idle_response(event=None)
 
         # Running: forward to the wrapped env.
@@ -111,9 +118,13 @@ class KeyboardEvalControlWrapper(gym.Wrapper):
                 result = "failure"
                 self._running = False
                 break
+            if key == "q":
+                raise KeyboardInterrupt
 
         info["eval_phase"] = "rec" if self._running else "pre"
         info["eval_result"] = result
+        if result is not None:
+            info["success"] = result == "success"
         return obs, reward, terminated, truncated, info
 
     def _idle_response(self, event: str | None):
@@ -127,3 +138,10 @@ class KeyboardEvalControlWrapper(gym.Wrapper):
 
     def _base_env(self):
         return getattr(self.env, "unwrapped", self.env)
+
+    def _refresh_observation(self):
+        return self._base_env()._get_observation()
+
+    def close(self):
+        self.listener.close()
+        return self.env.close()
