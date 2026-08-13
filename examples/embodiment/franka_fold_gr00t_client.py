@@ -20,9 +20,8 @@ import argparse
 import json
 import os
 import time
-from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any
+from typing import Any, TextIO
 
 import msgpack
 import numpy as np
@@ -151,6 +150,9 @@ class Gr00tClient:
         response = self.call("ping")
         if not isinstance(response, dict) or response.get("status") != "ok":
             raise RuntimeError(f"Unexpected GR00T ping response: {response!r}")
+        self.reset()
+
+    def reset(self) -> None:
         self.call("reset", {"options": None})
 
     def get_action(
@@ -188,6 +190,9 @@ class AsyncGr00tClient:
     def _connect(self) -> None:
         self._get_client().ping_and_reset()
 
+    def _reset(self) -> None:
+        self._get_client().reset()
+
     def _get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None
     ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
@@ -195,6 +200,9 @@ class AsyncGr00tClient:
 
     def connect(self) -> None:
         self.executor.submit(self._connect).result()
+
+    def reset(self) -> None:
+        self.executor.submit(self._reset).result()
 
     def submit(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
@@ -265,6 +273,19 @@ def flatten_actions(actions: dict[str, np.ndarray]) -> np.ndarray:
     return np.concatenate([actions[key] for key, _ in ACTION_LAYOUT], axis=-1)[0]
 
 
+def _write_diagnostic(log_file: TextIO, event: str, **values: Any) -> None:
+    def encode(value: Any) -> Any:
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        raise TypeError(f"Cannot encode diagnostic value {type(value).__name__}")
+
+    payload = {"time": time.time(), "event": event, **values}
+    log_file.write(json.dumps(payload, default=encode) + "\n")
+    log_file.flush()
+
+
 def rtc_options(
     previous: dict[str, np.ndarray], executed: int, delay: int
 ) -> dict[str, Any]:
@@ -286,79 +307,95 @@ def rtc_options(
     }
 
 
-def _fresh_observation(env) -> dict[str, Any]:
-    return env.unwrapped._get_observation()
-
-
-def _wait_for_start(listener) -> None:
-    listener.pop_pressed_keys()
-    print("Arms are homed. Arrange the clothes, then press pedal A to start.")
-    while True:
-        time.sleep(0.05)
-        for key in listener.pop_pressed_keys():
-            if key == "a":
-                return
-            if key == "q":
-                raise KeyboardInterrupt
-
-
-def _pedal_result(listener) -> str | None:
-    for key in listener.pop_pressed_keys():
-        if key == "b":
-            return "failure"
-        if key == "c":
-            return "success"
-        if key == "q":
-            raise KeyboardInterrupt
-    return None
+def collection_observation(raw_obs: dict[str, Any], task: str) -> dict[str, Any]:
+    """Add the standard LeRobot fields while preserving the GR00T observation."""
+    frames = raw_obs["frames"]
+    adapted = dict(raw_obs)
+    adapted["states"] = np.asarray(raw_obs["state"]["proprio"], dtype=np.float32)
+    adapted["main_images"] = frames["left_wrist_0_rgb"]
+    adapted["extra_view_images"] = np.stack(
+        [frames["base_0_rgb"], frames["right_wrist_0_rgb"]]
+    )
+    adapted["task_descriptions"] = task
+    return adapted
 
 
 def run_policy(
-    env, listener, policy: AsyncGr00tClient, task: str, max_steps: int
+    env,
+    policy: AsyncGr00tClient,
+    task: str,
+    diagnostic_log: TextIO,
 ) -> str:
     """Execute one rolling Training RTC episode."""
-    env.reset()
-    _wait_for_start(listener)
-    latest_obs = _fresh_observation(env)
+    latest_obs, _ = env.reset()
     observation = build_observation(latest_obs, task)
+    inference_started = time.monotonic()
     actions, _ = policy.submit(observation).result()
+    inference_seconds = time.monotonic() - inference_started
+    predicted_delay = min(
+        max(round(inference_seconds * CONTROL_HZ) + 1, 1),
+        TRAINING_RTC_MAX_DELAY,
+    )
     action_dict = validate_actions(actions)
     action_chunk = flatten_actions(action_dict)
+    _write_diagnostic(
+        diagnostic_log,
+        "bootstrap_response",
+        inference_seconds=inference_seconds,
+        predicted_delay=predicted_delay,
+        state=latest_obs["state"]["proprio"],
+        action_chunk=action_chunk,
+    )
     action_index = 0
     episode_step = 0
-    delay_history = deque([TRAINING_RTC_MAX_DELAY], maxlen=8)
     pending: Future | None = None
     request_start_step = 0
     requested_delay = 0
 
     print("Policy running. Pedal B=failure, C=success, Q=abort.")
-    while episode_step < max_steps:
-        result = _pedal_result(listener)
-        if result is not None:
-            return result
-
+    while True:
         if pending is not None and pending.done():
             actions, info = pending.result()
             observed_delay = episode_step - request_start_step
+            _write_diagnostic(
+                diagnostic_log,
+                "rtc_response",
+                episode_step=episode_step,
+                requested_delay=requested_delay,
+                observed_delay=observed_delay,
+                accepted=observed_delay <= requested_delay,
+                info=info,
+                actions=actions,
+            )
             if observed_delay > requested_delay:
-                raise RuntimeError(
-                    "GR00T response exceeded its Training RTC prefix: "
-                    f"observed={observed_delay}, conditioned={requested_delay}"
-                )
-            if info.get("training_rtc_delay_steps") != requested_delay:
+                predicted_delay = min(observed_delay + 1, TRAINING_RTC_MAX_DELAY)
+                pending = None
+            elif info.get("training_rtc_delay_steps") != requested_delay:
                 raise RuntimeError(
                     "GR00T server did not confirm the requested RTC delay"
                 )
-            action_dict = validate_actions(actions)
-            action_chunk = flatten_actions(action_dict)
-            action_index = observed_delay
-            delay_history.append(max(observed_delay, 1))
-            pending = None
+            else:
+                action_dict = validate_actions(actions)
+                action_chunk = flatten_actions(action_dict)
+                action_index = observed_delay
+                predicted_delay = min(
+                    max(observed_delay, 1) + 1, TRAINING_RTC_MAX_DELAY
+                )
+                pending = None
 
         if pending is None and action_index >= 2:
-            requested_delay = min(max(delay_history), TRAINING_RTC_MAX_DELAY)
+            requested_delay = predicted_delay
             options = rtc_options(action_dict, action_index, requested_delay)
             observation = build_observation(latest_obs, task)
+            _write_diagnostic(
+                diagnostic_log,
+                "rtc_request",
+                episode_step=episode_step,
+                action_index=action_index,
+                requested_delay=requested_delay,
+                state=latest_obs["state"]["proprio"],
+                action_prefix=options["training_rtc_action_prefix"],
+            )
             pending = policy.submit(observation, options)
             request_start_step = episode_step
 
@@ -366,11 +403,27 @@ def run_policy(
             raise RuntimeError(
                 "Action chunk exhausted before GR00T returned the next chunk"
             )
-        latest_obs, *_ = env.step(action_chunk[action_index])
+        state = np.asarray(latest_obs["state"]["proprio"], dtype=np.float32)
+        target = action_chunk[action_index]
+        left_delta = target[0:7] - state[0:7]
+        right_delta = target[8:15] - state[8:15]
+        _write_diagnostic(
+            diagnostic_log,
+            "step_command",
+            episode_step=episode_step,
+            action_index=action_index,
+            state=state,
+            target=target,
+            left_delta=left_delta,
+            right_delta=right_delta,
+            left_max_abs_delta=float(np.max(np.abs(left_delta))),
+            right_max_abs_delta=float(np.max(np.abs(right_delta))),
+        )
+        latest_obs, _, terminated, truncated, info = env.step(target)
         episode_step += 1
         action_index += 1
-
-    return "timeout"
+        if terminated or truncated:
+            return info.get("eval_result") or "timeout"
 
 
 def create_env(args: argparse.Namespace):
@@ -397,7 +450,6 @@ def create_env(args: argparse.Namespace):
         "teleop_direct_stream": False,
         "camera_fps": 30,
         "step_frequency": CONTROL_HZ,
-        "max_num_steps": args.max_steps + 100,
         "task_description": args.task,
         "controlled_motion_tolerance": 0.05,
     }
@@ -407,15 +459,33 @@ def create_env(args: argparse.Namespace):
         "use_gello": False,
         "use_pico": False,
         "use_spacemouse": False,
-        "keyboard_reward_wrapper": None,
+        "keyboard_reward_wrapper": "eval_control",
     }
-    return gym.make(
+    env = gym.make(
         "Ros2DualFrankaJointEnv-v1",
         override_cfg=override_cfg,
         worker_info=None,
         hardware_info=None,
         env_idx=0,
         env_cfg=env_cfg,
+    )
+
+    class CollectionObservationWrapper(gym.ObservationWrapper):
+        def observation(self, observation):
+            return collection_observation(observation, args.task)
+
+    from rlinf.envs.wrappers import CollectEpisode
+
+    env = CollectionObservationWrapper(env)
+    return CollectEpisode(
+        env,
+        save_dir=args.rollout_dir,
+        export_format="lerobot",
+        robot_type="dual_FR3",
+        fps=int(CONTROL_HZ),
+        only_success=False,
+        finalize_interval=1,
+        resume=True,
     )
 
 
@@ -469,7 +539,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pedal-device", default=os.environ.get("RLINF_KEYBOARD_DEVICE", DEFAULT_PEDAL)
     )
-    parser.add_argument("--max-steps", type=int, default=300)
+    parser.add_argument(
+        "--rollout-dir",
+        default=os.environ.get(
+            "RLINF_GROOT_ROLLOUT_DIR",
+            os.path.abspath(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    "..",
+                    "..",
+                    "logs",
+                    "franka_fold_gr00t_rollouts",
+                )
+            ),
+        ),
+    )
     parser.add_argument("--enable-policy", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
@@ -502,7 +586,14 @@ def self_test() -> None:
         decoded["observation"]["state"]["left_arm"],
         observation["state"]["left_arm"],
     )
-    print("Self-test passed: observation, 30x16 action, RTC prefix, and wire format.")
+    collected = collection_observation(raw_obs, "fold the clothes")
+    assert collected["states"].shape == (16,)
+    assert collected["main_images"] is raw_obs["frames"]["left_wrist_0_rgb"]
+    assert collected["extra_view_images"].shape == (2, 8, 9, 3)
+    print(
+        "Self-test passed: observation, 30x16 action, RTC prefix, wire format, "
+        "and rollout observation mapping."
+    )
 
 
 def main() -> None:
@@ -512,27 +603,36 @@ def main() -> None:
         return
     if not args.enable_policy:
         raise SystemExit("Refusing to open hardware without --enable-policy")
-    if not 1 <= args.port <= 65535 or args.timeout_ms <= 0 or args.max_steps <= 0:
-        raise SystemExit("port, timeout-ms, and max-steps must be positive and valid")
+    if not 1 <= args.port <= 65535 or args.timeout_ms <= 0:
+        raise SystemExit("port and timeout-ms must be positive and valid")
     input("Press Enter to open hardware (Ctrl+C to cancel): ")
 
     os.environ["RLINF_KEYBOARD_DEVICE"] = args.pedal_device
-    from rlinf.envs.realworld.common.keyboard.keyboard_listener import KeyboardListener
-
     policy = AsyncGr00tClient(args.host, args.port, args.timeout_ms)
     env = None
-    listener = None
+    diagnostic_log = None
     try:
         policy.connect()
         print(f"Connected to GR00T server at {args.host}:{args.port}")
-        listener = KeyboardListener()
         env = create_env(args)
-        result = run_policy(env, listener, policy, args.task, args.max_steps)
-        print(f"Episode result: {result}")
+        print(f"Saving policy rollouts to {args.rollout_dir}")
+        log_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "logs")
+        )
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(
+            log_dir,
+            f"franka_fold_inference_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.jsonl",
+        )
+        diagnostic_log = open(log_path, "w", encoding="utf-8", buffering=1)
+        while True:
+            result = run_policy(env, policy, args.task, diagnostic_log)
+            print(f"Episode result: {result}; resetting arms and policy.")
+            policy.reset()
     finally:
+        if diagnostic_log is not None:
+            diagnostic_log.close()
         policy.close()
-        if listener is not None:
-            listener.close()
         if env is not None:
             env.close()
 
