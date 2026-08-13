@@ -20,7 +20,6 @@ import argparse
 import functools
 import json
 import os
-import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
@@ -211,38 +210,22 @@ def add_rtc_prefix(
     }
 
 
-def _fresh_observation(env) -> dict[str, Any]:
-    return env.unwrapped._get_observation()
+def collection_observation(raw_obs: dict[str, Any], task: str) -> dict[str, Any]:
+    """Add the standard LeRobot fields while preserving the pi0.5 observation."""
+    frames = raw_obs["frames"]
+    adapted = dict(raw_obs)
+    adapted["states"] = build_observation(raw_obs, task)["observation.state"]
+    adapted["main_images"] = frames["base_0_rgb"]
+    adapted["extra_view_images"] = np.stack(
+        [frames["left_wrist_0_rgb"], frames["right_wrist_0_rgb"]]
+    )
+    adapted["task_descriptions"] = task
+    return adapted
 
 
-def _wait_for_start(listener) -> None:
-    listener.pop_pressed_keys()
-    print("Arms are homed. Arrange the clothes, then press pedal A to start.")
-    while True:
-        time.sleep(0.05)
-        for key in listener.pop_pressed_keys():
-            if key == "a":
-                return
-            if key == "q":
-                raise KeyboardInterrupt
-
-
-def _pedal_result(listener) -> str | None:
-    for key in listener.pop_pressed_keys():
-        if key == "b":
-            return "failure"
-        if key == "c":
-            return "success"
-        if key == "q":
-            raise KeyboardInterrupt
-    return None
-
-
-def run_policy(env, listener, policy: AsyncPi05Client, task: str, max_steps: int) -> str:
+def run_policy(env, policy: AsyncPi05Client, task: str) -> str:
     """Execute one rolling Training RTC episode at the environment's 30 Hz rate."""
-    env.reset()
-    _wait_for_start(listener)
-    latest_obs = _fresh_observation(env)
+    latest_obs, _ = env.reset()
     action_chunk = validate_actions(policy.submit(build_observation(latest_obs, task)).result())
     action_index = 0
     episode_step = 0
@@ -252,28 +235,34 @@ def run_policy(env, listener, policy: AsyncPi05Client, task: str, max_steps: int
     requested_delay = 0
 
     print("Policy running. Pedal B=failure, C=success, Q=abort.")
-    while episode_step < max_steps:
-        result = _pedal_result(listener)
-        if result is not None:
-            return result
-
+    while True:
         if pending is not None and pending.done():
             response = pending.result()
             observed_delay = episode_step - request_start_step
             if observed_delay > requested_delay:
-                raise RuntimeError(
+                print(
                     "Pi0.5 response exceeded its RTC prefix: "
-                    f"observed={observed_delay}, conditioned={requested_delay}"
+                    f"observed={observed_delay}, conditioned={requested_delay}; "
+                    "discarding the stale response."
                 )
-            if response.get("training_rtc_delay_steps") != requested_delay:
-                raise RuntimeError("Pi0.5 server did not confirm the requested RTC delay")
-            action_chunk = validate_actions(response)
-            action_index = observed_delay
-            delay_history.append(max(observed_delay, 1))
-            pending = None
+                delay_history.append(
+                    min(observed_delay + 1, TRAINING_RTC_MAX_DELAY)
+                )
+                pending = None
+            else:
+                if response.get("training_rtc_delay_steps") != requested_delay:
+                    raise RuntimeError("Pi0.5 server did not confirm the requested RTC delay")
+                action_chunk = validate_actions(response)
+                action_index = observed_delay
+                delay_history.append(
+                    min(max(observed_delay + 1, 1), TRAINING_RTC_MAX_DELAY)
+                )
+                pending = None
 
-        if pending is None and action_index >= 2:
-            requested_delay = min(max(delay_history), TRAINING_RTC_MAX_DELAY)
+        if pending is None and 2 <= action_index < ACTION_HORIZON:
+            requested_delay = min(
+                max(delay_history), ACTION_HORIZON - action_index
+            )
             observation = build_observation(latest_obs, task)
             observation = add_rtc_prefix(
                 observation, action_chunk, action_index, requested_delay
@@ -281,17 +270,17 @@ def run_policy(env, listener, policy: AsyncPi05Client, task: str, max_steps: int
             pending = policy.submit(observation)
             request_start_step = episode_step
 
-        if pending is not None and episode_step - request_start_step >= requested_delay:
-            raise RuntimeError(
-                f"Pi0.5 inference exceeded the {requested_delay}-step RTC prefix"
-            )
         if action_index >= ACTION_HORIZON:
-            raise RuntimeError("Action chunk exhausted before Pi0.5 returned the next chunk")
-        latest_obs, *_ = env.step(action_chunk[action_index])
+            print("Pi0.5 inference is still pending; holding the last joint target.")
+            action_chunk = np.repeat(action_chunk[-1:], ACTION_HORIZON, axis=0)
+            action_index = 0
+        latest_obs, _, terminated, truncated, info = env.step(
+            action_chunk[action_index]
+        )
         episode_step += 1
         action_index += 1
-
-    return "timeout"
+        if terminated or truncated:
+            return info.get("eval_result") or "timeout"
 
 
 def create_env(args: argparse.Namespace):
@@ -314,8 +303,8 @@ def create_env(args: argparse.Namespace):
         "right_gripper_connection": args.right_gripper_connection,
         "joint_reset_qpos": args.joint_reset_qpos,
         "joint_action_mode": "absolute",
+        "camera_fps": int(CONTROL_HZ),
         "step_frequency": CONTROL_HZ,
-        "max_num_steps": args.max_steps + 100,
         "task_description": args.task,
         "controlled_motion_tolerance": 0.05,
     }
@@ -325,15 +314,34 @@ def create_env(args: argparse.Namespace):
         "use_gello": False,
         "use_pico": False,
         "use_spacemouse": False,
-        "keyboard_reward_wrapper": None,
+        "keyboard_reward_wrapper": "eval_control",
     }
-    return gym.make(
+    env = gym.make(
         "Ros2DualFrankaJointEnv-v1",
         override_cfg=override_cfg,
         worker_info=None,
         hardware_info=None,
         env_idx=0,
         env_cfg=env_cfg,
+    )
+
+    class CollectionObservationWrapper(gym.ObservationWrapper):
+        def observation(self, observation):
+            return collection_observation(observation, args.task)
+
+    from rlinf.envs.wrappers import CollectEpisode
+
+    env = CollectionObservationWrapper(env)
+    return CollectEpisode(
+        env,
+        save_dir=args.rollout_dir,
+        export_format="lerobot",
+        robot_type="dual_FR3",
+        fps=int(CONTROL_HZ),
+        use_videos=True,
+        only_success=False,
+        finalize_interval=0,
+        resume=True,
     )
 
 
@@ -373,7 +381,26 @@ def parse_args() -> argparse.Namespace:
         default="/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG046F7F-if00-port0",
     )
     parser.add_argument("--pedal-device", default=DEFAULT_PEDAL)
-    parser.add_argument("--max-steps", type=int, default=300)
+    parser.add_argument(
+        "--num-episodes",
+        type=int,
+        default=int(os.environ.get("RLINF_PI05_NUM_EPISODES", "50")),
+    )
+    parser.add_argument(
+        "--rollout-dir",
+        default=os.environ.get(
+            "RLINF_PI05_ROLLOUT_DIR",
+            os.path.abspath(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    "..",
+                    "..",
+                    "logs",
+                    "franka_fold_pi05_rollouts",
+                )
+            ),
+        ),
+    )
     parser.add_argument("--enable-policy", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
@@ -411,7 +438,14 @@ def self_test() -> None:
     decoded = _unpackb(_Packer().pack(rtc_observation))
     np.testing.assert_array_equal(decoded["observation.state"], expected_state)
     assert validate_actions({"actions": actions}).shape == (30, 16)
-    print("Self-test passed: state layout, images, 30x16 actions, RTC prefix, and wire format.")
+    collected = collection_observation(raw_obs, DEFAULT_TASK)
+    np.testing.assert_array_equal(collected["states"], expected_state)
+    assert collected["main_images"] is raw_obs["frames"]["base_0_rgb"]
+    assert collected["extra_view_images"].shape == (2, 8, 9, 3)
+    print(
+        "Self-test passed: state layout, images, 30x16 actions, RTC prefix, "
+        "wire format, and rollout observation mapping."
+    )
 
 
 def main() -> None:
@@ -421,29 +455,35 @@ def main() -> None:
         return
     if not args.enable_policy:
         raise SystemExit("Refusing to open hardware without --enable-policy")
-    if not 1 <= args.port <= 65535 or args.timeout_s <= 0 or args.max_steps <= 0:
-        raise SystemExit("port, timeout-s, and max-steps must be positive and valid")
+    if (
+        not 1 <= args.port <= 65535
+        or args.timeout_s <= 0
+        or args.num_episodes <= 0
+    ):
+        raise SystemExit(
+            "port, timeout-s, and num-episodes must be positive and valid"
+        )
     input("Press Enter to open hardware (Ctrl+C to cancel): ")
 
     os.environ["RLINF_KEYBOARD_DEVICE"] = args.pedal_device
-    from rlinf.envs.realworld.common.keyboard.keyboard_listener import KeyboardListener
-
     policy = AsyncPi05Client(args.host, args.port, args.timeout_s)
     env = None
-    listener = None
     try:
         metadata = policy.connect()
         if metadata.get("config_name") != "pi05_franka_fold_full_rtc":
             raise RuntimeError(f"Unexpected OpenPI server metadata: {metadata}")
         print(f"Connected to pi0.5 server at {args.host}:{args.port}")
-        listener = KeyboardListener()
         env = create_env(args)
-        result = run_policy(env, listener, policy, args.task, args.max_steps)
-        print(f"Episode result: {result}")
+        print(f"Saving policy rollouts to {args.rollout_dir}")
+        for episode_index in range(args.num_episodes):
+            result = run_policy(env, policy, args.task)
+            print(
+                f"Episode {episode_index + 1}/{args.num_episodes} result: {result}"
+            )
+            if episode_index + 1 < args.num_episodes:
+                print("Resetting arms for the next episode.")
     finally:
         policy.close()
-        if listener is not None:
-            listener.close()
         if env is not None:
             env.close()
 
