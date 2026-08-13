@@ -143,7 +143,9 @@ class LeRobotEpisodeReplayer(Worker):
             self.cfg.env.eval.override_cfg.teleop_direct_stream = False
             self.cfg.env.eval.override_cfg.joint_action_mode = "absolute"
             self.cfg.env.eval.override_cfg.step_frequency = self.episode.fps
-            self.cfg.env.eval.override_cfg.max_num_steps = len(self.episode.actions) + 200
+            self.cfg.env.eval.override_cfg.max_num_steps = (
+                len(self.episode.actions) + 200
+            )
             self.cfg.env.eval.override_cfg.joint_reset_qpos = [
                 first_state[:7].tolist(),
                 first_state[8:15].tolist(),
@@ -177,8 +179,7 @@ class LeRobotEpisodeReplayer(Worker):
                 start_error = float(
                     np.max(
                         np.abs(
-                            current[_ARM_INDICES]
-                            - self.episode.states[0, _ARM_INDICES]
+                            current[_ARM_INDICES] - self.episode.states[0, _ARM_INDICES]
                         )
                     )
                 )
@@ -202,12 +203,10 @@ class LeRobotEpisodeReplayer(Worker):
 
             actual = np.stack(actual_states)
             tracking_error = (
-                actual[:, _ARM_INDICES]
-                - self.episode.actions[:, _ARM_INDICES]
+                actual[:, _ARM_INDICES] - self.episode.actions[:, _ARM_INDICES]
             )
             reproduction_error = (
-                actual[:-1, _ARM_INDICES]
-                - self.episode.states[1:, _ARM_INDICES]
+                actual[:-1, _ARM_INDICES] - self.episode.states[1:, _ARM_INDICES]
             )
             intervals = np.diff(np.asarray(step_starts))
             result = {

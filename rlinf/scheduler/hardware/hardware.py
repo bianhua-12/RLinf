@@ -92,7 +92,9 @@ class NodeHardwareConfig:
             else dict(config)
             for config in self.configs
         ]
-        config_strs = [yaml.safe_dump(config, sort_keys=True) for config in plain_configs]
+        config_strs = [
+            yaml.safe_dump(config, sort_keys=True) for config in plain_configs
+        ]
         assert len(config_strs) == len(set(config_strs)), (
             "Duplicate hardware configs found in node hardware config: \n"
             + "\n".join(
