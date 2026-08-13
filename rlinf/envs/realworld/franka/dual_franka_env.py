@@ -66,7 +66,6 @@ class DualFrankaRobotConfig:
     is_dummy: bool = False
     use_dense_reward: bool = False
     step_frequency: float = 10.0
-    camera_fps: int = 15
 
     # (2, 6) arrays: row 0 = left arm, row 1 = right arm
     target_ee_pose: np.ndarray = field(default_factory=lambda: np.zeros((2, 6)))
@@ -223,12 +222,7 @@ class DualFrankaEnv(gym.Env):
     def _open_cameras(self):
         self._cameras: list[BaseCamera] = []
         camera_infos = [
-            CameraInfo(
-                name=name,
-                serial_number=serial,
-                camera_type=ct,
-                fps=self.config.camera_fps,
-            )
+            CameraInfo(name=name, serial_number=serial, camera_type=ct)
             for name, serial, ct in self._all_camera_specs()
         ]
         for info in camera_infos:

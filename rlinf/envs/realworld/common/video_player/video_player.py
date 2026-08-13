@@ -34,13 +34,6 @@ class VideoPlayer:
         if self.is_running:
             self.queue.put(frame)
 
-    def stop(self):
-        if not hasattr(self, "_run_thread"):
-            return
-        self.queue.put(None)
-        self._run_thread.join()
-        self.is_running = False
-
     def _play(self):
         if os.environ.get("DISPLAY") is None:
             warnings.warn(
@@ -50,11 +43,7 @@ class VideoPlayer:
 
         self.is_running = True
         while True:
-            try:
-                img_array = self.queue.get(timeout=0.03)
-            except queue.Empty:
-                cv2.waitKey(1)
-                continue
+            img_array = self.queue.get()  # retrieve an image from the queue
             if img_array is None:  # None is our signal to exit
                 break
 

@@ -12,15 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import errno
 import os
-import select
-import sys
-import termios
-import threading
 import time
-import tty
-from pathlib import Path
 
 import hydra
 import numpy as np
@@ -34,59 +27,6 @@ from rlinf.data.schema.embodied_types import (
 from rlinf.data.storage.replay import TrajectoryReplayBuffer
 from rlinf.envs.realworld.realworld_env import RealWorldEnv
 from rlinf.scheduler import Cluster, ComponentPlacement, Worker
-
-
-def _relay_terminal_keys(fifo_path: str, stop_event: threading.Event) -> None:
-    writer_fd = None
-    terminal_fd = sys.stdin.fileno()
-    terminal_attrs = None
-    try:
-        while not stop_event.is_set():
-            try:
-                writer_fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
-                break
-            except OSError as exc:
-                if exc.errno != errno.ENXIO:
-                    raise
-                stop_event.wait(0.1)
-        if writer_fd is None:
-            return
-
-        terminal_attrs = termios.tcgetattr(terminal_fd)
-        tty.setcbreak(terminal_fd)
-        while not stop_event.is_set():
-            readable, _, _ = select.select([terminal_fd], [], [], 0.1)
-            if readable:
-                key = os.read(terminal_fd, 1).lower()
-                if key in (b"a", b"b", b"c"):
-                    os.write(writer_fd, key)
-    except BrokenPipeError:
-        return
-    finally:
-        if terminal_attrs is not None:
-            termios.tcsetattr(terminal_fd, termios.TCSADRAIN, terminal_attrs)
-        if writer_fd is not None:
-            os.close(writer_fd)
-
-
-def _configure_keyboard_device(cfg) -> None:
-    device = cfg.env.eval.get("keyboard_device")
-    if not device:
-        return
-
-    device_path = Path(str(device))
-    if device_path.parent != Path("/dev/input/by-id") or not device_path.name.endswith(
-        "-event-kbd"
-    ):
-        raise ValueError(
-            "env.eval.keyboard_device must use a stable "
-            "/dev/input/by-id/...-event-kbd path"
-        )
-    if not device_path.exists():
-        raise FileNotFoundError(f"Keyboard input device not found: {device_path}")
-    if not os.access(device_path, os.R_OK):
-        raise PermissionError(f"Keyboard input device is not readable: {device_path}")
-    os.environ["RLINF_KEYBOARD_DEVICE"] = str(device_path)
 
 
 class DataCollector(Worker):
@@ -107,19 +47,8 @@ class DataCollector(Worker):
             total_num_processes=1,
             worker_info=self.worker_info,
         )
-        self._hardware_env = self.env
-        try:
-            self._initialize_collection_storage()
-        except Exception:
-            try:
-                self._hardware_env.close()
-            finally:
-                if self.env is not self._hardware_env:
-                    self.env.close()
-            raise
 
-    def _initialize_collection_storage(self):
-        dc_cfg = self.cfg.env.eval.get("data_collection")
+        dc_cfg = cfg.env.eval.get("data_collection")
         if dc_cfg and getattr(dc_cfg, "enabled", False):
             from rlinf.envs.wrappers import CollectEpisode
 
@@ -129,7 +58,6 @@ class DataCollector(Worker):
                 export_format=dc_cfg.get("export_format", "pickle"),
                 robot_type=dc_cfg.get("robot_type", "panda"),
                 fps=dc_cfg.get("fps", 10),
-                use_videos=bool(dc_cfg.get("use_videos", False)),
                 only_success=dc_cfg.get("only_success", False),
                 finalize_interval=dc_cfg.get("finalize_interval", 100),
                 resume=bool(dc_cfg.get("resume", False)),
@@ -180,24 +108,12 @@ class DataCollector(Worker):
         return ret_obs
 
     def run(self):
-        try:
-            self._run_collection()
-        finally:
-            try:
-                self._hardware_env.close()
-            finally:
-                try:
-                    self.buffer.close()
-                finally:
-                    if self.env is not self._hardware_env:
-                        self.env.close()
-
-    def _run_collection(self):
         obs, _ = self.env.reset()
         # Seed from preexisting episodes so resume bar + stop target line up.
         success_cnt = self._preexisting_success
         if success_cnt >= self.num_data_episodes:
             self.log_info(f"[resume] target {self.num_data_episodes} already met.")
+            self.env.close()
             return
         progress_bar = tqdm(
             total=self.num_data_episodes,
@@ -250,7 +166,7 @@ class DataCollector(Worker):
                 current_rollout = EmbodiedTrajectoryBuilder(
                     max_episode_length=self.cfg.env.eval.max_episode_steps,
                 )
-            if kb_event != "start" and kb_phase in (None, "rec"):
+            if kb_phase in (None, "rec"):
                 current_rollout.append_step_result(step_result)
                 current_rollout.append_transitions(
                     curr_obs=current_obs_processed, next_obs=next_obs_processed
@@ -303,12 +219,14 @@ class DataCollector(Worker):
                         f"Discarded. Total success: {success_cnt}/{self.num_data_episodes}"
                     )
 
-                if success_cnt < self.num_data_episodes:
-                    obs, _ = self.env.reset()
-                    current_obs_processed = self._process_obs(obs)
-                    current_rollout = EmbodiedTrajectoryBuilder(
-                        max_episode_length=self.cfg.env.eval.max_episode_steps,
-                    )
+                reset_options = None
+                if success_cnt >= self.num_data_episodes:
+                    reset_options = {"skip_wait_for_start": True}
+                obs, _ = self.env.reset(options=reset_options)
+                current_obs_processed = self._process_obs(obs)
+                current_rollout = EmbodiedTrajectoryBuilder(
+                    max_episode_length=self.cfg.env.eval.max_episode_steps,
+                )
 
             # Pin loop period; on ``done`` env.reset usually exceeds it → sleep_for≤0 no-ops.
             if self._target_step_period is not None:
@@ -317,50 +235,24 @@ class DataCollector(Worker):
                 if sleep_for > 0:
                     time.sleep(sleep_for)
 
+        self.buffer.close()
         self.log_info(
             f"Finished. Demos saved in: {os.path.join(self.cfg.runner.logger.log_path, 'demos')}"
         )
+        self.env.close()
 
 
 @hydra.main(
     version_base="1.1", config_path="config", config_name="realworld_collect_data"
 )
 def main(cfg):
-    _configure_keyboard_device(cfg)
-    fifo_path = None
-    stop_event = threading.Event()
-    relay_thread = None
-    if cfg.env.eval.get("keyboard_fifo_path") == "terminal":
-        if not sys.stdin.isatty():
-            raise RuntimeError("Terminal keyboard relay requires an interactive stdin")
-        fifo_path = f"/tmp/rlinf_keyboard_{os.getpid()}.fifo"
-        os.mkfifo(fifo_path, mode=0o600)
-        cfg.env.eval.keyboard_fifo_path = fifo_path
-        relay_thread = threading.Thread(
-            target=_relay_terminal_keys,
-            args=(fifo_path, stop_event),
-            name="rlinf-terminal-key-relay",
-            daemon=True,
-        )
-        relay_thread.start()
-
-    try:
-        cluster = Cluster(cluster_cfg=cfg.cluster)
-        component_placement = ComponentPlacement(cfg, cluster)
-        env_placement = component_placement.get_strategy("env")
-        collector = DataCollector.create_group(cfg).launch(
-            cluster, name=cfg.env.group_name, placement_strategy=env_placement
-        )
-        collector.run().wait()
-    finally:
-        stop_event.set()
-        if relay_thread is not None:
-            relay_thread.join(timeout=1.0)
-        if fifo_path is not None:
-            try:
-                os.unlink(fifo_path)
-            except FileNotFoundError:
-                pass
+    cluster = Cluster(cluster_cfg=cfg.cluster)
+    component_placement = ComponentPlacement(cfg, cluster)
+    env_placement = component_placement.get_strategy("env")
+    collector = DataCollector.create_group(cfg).launch(
+        cluster, name=cfg.env.group_name, placement_strategy=env_placement
+    )
+    collector.run().wait()
 
 
 if __name__ == "__main__":

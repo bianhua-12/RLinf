@@ -106,7 +106,6 @@ franka = [
     "defusedxml",
     "pyspacemouse>=2.0.0",
     "pymodbus>=3.0,<4.0",
-    "dynamixel-sdk",
     "pyserial",
     "imageio[ffmpeg]",
     "evdev",
@@ -207,3 +206,4 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 docstring-code-format = true
 docstring-code-line-length = "dynamic"
+
