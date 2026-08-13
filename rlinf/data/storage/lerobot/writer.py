@@ -72,7 +72,6 @@ class LeRobotDatasetWriter:
         extra_view_image_keys: dict[str, tuple[int, ...]] | None = None,
         has_intervene_flag: bool = True,
         has_segment_id: bool = False,
-        use_videos: bool = False,
     ) -> None:
         """
         Create a new LeRobot dataset.
@@ -100,7 +99,6 @@ class LeRobotDatasetWriter:
             has_segment_id: Whether to include per-frame ``segment_id``
                 (uint8, shape ``(1,)``) in auto-generated features. Used for
                 in-episode sub-task boundaries set by KeyboardStartEndWrapper.
-            use_videos: Whether to encode camera features as MP4 videos.
 
         """
 
@@ -112,7 +110,6 @@ class LeRobotDatasetWriter:
         _silence_hf_datasets_progress_bars()
 
         if features is None:
-            camera_dtype = "video" if use_videos else "image"
             features = {
                 "state": {
                     "dtype": "float32",
@@ -149,7 +146,7 @@ class LeRobotDatasetWriter:
                 }
             if has_image:
                 features["image"] = {
-                    "dtype": camera_dtype,
+                    "dtype": "image",
                     "shape": list(image_shape),
                     "names": ["height", "width", "channel"],
                 }
@@ -157,7 +154,7 @@ class LeRobotDatasetWriter:
                 if keys:
                     for key, shape in keys.items():
                         features[key] = {
-                            "dtype": camera_dtype,
+                            "dtype": "image",
                             "shape": list(shape),
                             "names": ["height", "width", "channel"],
                         }
@@ -170,7 +167,6 @@ class LeRobotDatasetWriter:
             robot_type=robot_type,
             fps=fps,
             features=features,
-            use_videos=use_videos,
             image_writer_threads=image_writer_threads,
             image_writer_processes=image_writer_processes,
         )

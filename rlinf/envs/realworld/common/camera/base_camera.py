@@ -14,6 +14,7 @@
 
 import queue
 import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
@@ -54,7 +55,6 @@ class BaseCamera(ABC):
             target=self._capture_frames, daemon=True
         )
         self._frame_capturing_start = False
-        self._capture_error: Exception | None = None
 
     @property
     def name(self) -> str:
@@ -81,27 +81,16 @@ class BaseCamera(ABC):
         assert self._frame_capturing_start, (
             "Frame capturing is not started. Call open() first."
         )
-        if self._capture_error is not None:
-            raise RuntimeError(f"Camera {self.name!r} capture failed") from (
-                self._capture_error
-            )
-        try:
-            return self._frame_queue.get(timeout=timeout)
-        except queue.Empty:
-            if self._capture_error is not None:
-                raise RuntimeError(f"Camera {self.name!r} capture failed") from (
-                    self._capture_error
-                )
-            raise
+        return self._frame_queue.get(timeout=timeout)
 
     # ── internal ──────────────────────────────────────────────────────
 
     def _capture_frames(self):
         while self._frame_capturing_start:
+            time.sleep(1 / self._camera_info.fps)
             try:
                 has_frame, frame = self._read_frame()
             except Exception as e:
-                self._capture_error = e
                 _logger.error(
                     "[%s] _read_frame raised %s: %s — exiting capture thread.",
                     self._camera_info.name,
@@ -110,7 +99,6 @@ class BaseCamera(ABC):
                 )
                 break
             if not has_frame:
-                self._capture_error = RuntimeError("_read_frame returned no frame")
                 _logger.error(
                     "[%s] _read_frame returned (False, None) — exiting capture thread.",
                     self._camera_info.name,
