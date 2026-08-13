@@ -20,6 +20,7 @@ import termios
 import threading
 import time
 import tty
+from pathlib import Path
 
 import hydra
 import numpy as np
@@ -68,6 +69,26 @@ def _relay_terminal_keys(fifo_path: str, stop_event: threading.Event) -> None:
             os.close(writer_fd)
 
 
+def _configure_keyboard_device(cfg) -> None:
+    device = cfg.env.eval.get("keyboard_device")
+    if not device:
+        return
+
+    device_path = Path(str(device))
+    if device_path.parent != Path("/dev/input/by-id") or not device_path.name.endswith(
+        "-event-kbd"
+    ):
+        raise ValueError(
+            "env.eval.keyboard_device must use a stable "
+            "/dev/input/by-id/...-event-kbd path"
+        )
+    if not device_path.exists():
+        raise FileNotFoundError(f"Keyboard input device not found: {device_path}")
+    if not os.access(device_path, os.R_OK):
+        raise PermissionError(f"Keyboard input device is not readable: {device_path}")
+    os.environ["RLINF_KEYBOARD_DEVICE"] = str(device_path)
+
+
 class DataCollector(Worker):
     def __init__(self, cfg):
         super().__init__()
@@ -108,6 +129,7 @@ class DataCollector(Worker):
                 export_format=dc_cfg.get("export_format", "pickle"),
                 robot_type=dc_cfg.get("robot_type", "panda"),
                 fps=dc_cfg.get("fps", 10),
+                use_videos=bool(dc_cfg.get("use_videos", False)),
                 only_success=dc_cfg.get("only_success", False),
                 finalize_interval=dc_cfg.get("finalize_interval", 100),
                 resume=bool(dc_cfg.get("resume", False)),
@@ -304,10 +326,13 @@ class DataCollector(Worker):
     version_base="1.1", config_path="config", config_name="realworld_collect_data"
 )
 def main(cfg):
+    _configure_keyboard_device(cfg)
     fifo_path = None
     stop_event = threading.Event()
     relay_thread = None
-    if sys.stdin.isatty() and "keyboard_fifo_path" in cfg.env.eval:
+    if cfg.env.eval.get("keyboard_fifo_path") == "terminal":
+        if not sys.stdin.isatty():
+            raise RuntimeError("Terminal keyboard relay requires an interactive stdin")
         fifo_path = f"/tmp/rlinf_keyboard_{os.getpid()}.fifo"
         os.mkfifo(fifo_path, mode=0o600)
         cfg.env.eval.keyboard_fifo_path = fifo_path
