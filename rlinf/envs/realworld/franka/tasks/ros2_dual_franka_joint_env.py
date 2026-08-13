@@ -96,6 +96,22 @@ class Ros2DualFrankaJointEnv(DualFrankaJointEnv):
         """Return the placeholder reward used by manual data collection."""
         return 0.0
 
+    def _go_to_rest(self, joint_reset: bool = False) -> None:
+        """Preserve the upstream concurrent reset, but wait for ROS 2 completion."""
+        del joint_reset
+        try:
+            self._left_ctrl.open_gripper()
+            self._right_ctrl.open_gripper()
+        except Exception as exc:
+            self._logger.warning("open_gripper during reset failed: %s", exc)
+
+        left = self._left_ctrl.reset_joint(self.config.joint_reset_qpos[0])
+        right = self._right_ctrl.reset_joint(self.config.joint_reset_qpos[1])
+        left.wait()
+        right.wait()
+        self._left_state = self._left_ctrl.get_state().wait()[0]
+        self._right_state = self._right_ctrl.get_state().wait()[0]
+
     def _setup_hardware(self) -> None:
         self._resolve_hw_overrides()
         required = {

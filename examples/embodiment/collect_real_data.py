@@ -12,14 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import errno
 import os
-import select
-import sys
-import termios
-import threading
 import time
-import tty
 from pathlib import Path
 
 import hydra
@@ -34,39 +28,6 @@ from rlinf.data.schema.embodied_types import (
 from rlinf.data.storage.replay import TrajectoryReplayBuffer
 from rlinf.envs.realworld.realworld_env import RealWorldEnv
 from rlinf.scheduler import Cluster, ComponentPlacement, Worker
-
-
-def _relay_terminal_keys(fifo_path: str, stop_event: threading.Event) -> None:
-    writer_fd = None
-    terminal_fd = sys.stdin.fileno()
-    terminal_attrs = None
-    try:
-        while not stop_event.is_set():
-            try:
-                writer_fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
-                break
-            except OSError as exc:
-                if exc.errno != errno.ENXIO:
-                    raise
-                stop_event.wait(0.1)
-        if writer_fd is None:
-            return
-
-        terminal_attrs = termios.tcgetattr(terminal_fd)
-        tty.setcbreak(terminal_fd)
-        while not stop_event.is_set():
-            readable, _, _ = select.select([terminal_fd], [], [], 0.1)
-            if readable:
-                key = os.read(terminal_fd, 1).lower()
-                if key in (b"a", b"b", b"c"):
-                    os.write(writer_fd, key)
-    except BrokenPipeError:
-        return
-    finally:
-        if terminal_attrs is not None:
-            termios.tcsetattr(terminal_fd, termios.TCSADRAIN, terminal_attrs)
-        if writer_fd is not None:
-            os.close(writer_fd)
 
 
 def _configure_keyboard_device(cfg) -> None:
@@ -327,40 +288,13 @@ class DataCollector(Worker):
 )
 def main(cfg):
     _configure_keyboard_device(cfg)
-    fifo_path = None
-    stop_event = threading.Event()
-    relay_thread = None
-    if cfg.env.eval.get("keyboard_fifo_path") == "terminal":
-        if not sys.stdin.isatty():
-            raise RuntimeError("Terminal keyboard relay requires an interactive stdin")
-        fifo_path = f"/tmp/rlinf_keyboard_{os.getpid()}.fifo"
-        os.mkfifo(fifo_path, mode=0o600)
-        cfg.env.eval.keyboard_fifo_path = fifo_path
-        relay_thread = threading.Thread(
-            target=_relay_terminal_keys,
-            args=(fifo_path, stop_event),
-            name="rlinf-terminal-key-relay",
-            daemon=True,
-        )
-        relay_thread.start()
-
-    try:
-        cluster = Cluster(cluster_cfg=cfg.cluster)
-        component_placement = ComponentPlacement(cfg, cluster)
-        env_placement = component_placement.get_strategy("env")
-        collector = DataCollector.create_group(cfg).launch(
-            cluster, name=cfg.env.group_name, placement_strategy=env_placement
-        )
-        collector.run().wait()
-    finally:
-        stop_event.set()
-        if relay_thread is not None:
-            relay_thread.join(timeout=1.0)
-        if fifo_path is not None:
-            try:
-                os.unlink(fifo_path)
-            except FileNotFoundError:
-                pass
+    cluster = Cluster(cluster_cfg=cfg.cluster)
+    component_placement = ComponentPlacement(cfg, cluster)
+    env_placement = component_placement.get_strategy("env")
+    collector = DataCollector.create_group(cfg).launch(
+        cluster, name=cfg.env.group_name, placement_strategy=env_placement
+    )
+    collector.run().wait()
 
 
 if __name__ == "__main__":

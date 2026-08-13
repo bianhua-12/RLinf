@@ -5,8 +5,10 @@ defaults:
 max_episode_steps: null
 main_image_key: base_0_rgb
 keyboard_reward_wrapper: start_end
-keyboard_fifo_path: null
 use_gello_joint: true
+# Match GELLO target publication to the 30 Hz collection loop; the ROS 2
+# impedance controller itself continues running at 1 kHz.
+gello_joint_stream_period: 0.03333333333333333
 
 init_params:
   id: Ros2DualFrankaJointEnv-v1

@@ -10,6 +10,7 @@ __pycache__
 *.DS_Store
 *.out
 build
+/ros2_ws/install/
 docs/build
 dist
 logs/*

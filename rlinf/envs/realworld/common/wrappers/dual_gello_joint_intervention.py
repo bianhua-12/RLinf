@@ -58,8 +58,6 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         self._ready_timeout = ready_timeout
         self._stream_thread: threading.Thread | None = None
         self._stream_running = False
-        self._stream_error: Exception | None = None
-        self._closed = False
         self._stream_last_gripper_open: list[bool | None] = [None, None]
         self._stream_gate = threading.Event()
         self._stream_gate.set()  # gate open = stream tick allowed
@@ -107,51 +105,42 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         period = self._stream_period
         ctrls = (left_ctrl, right_ctrl)
 
-        try:
-            while self._stream_running:
-                self._stream_gate.wait()
-                if not self._stream_running:
-                    break
+        while self._stream_running:
+            self._stream_gate.wait()
+            if not self._stream_running:
+                break
 
-                loop_start = time.time()
+            loop_start = time.time()
 
-                if not (self.left_expert.ready and self.right_expert.ready):
-                    raise RuntimeError(
-                        "GELLO input was lost; controlled realignment is required"
-                    )
+            if not (self.left_expert.ready and self.right_expert.ready):
+                time.sleep(period)
+                continue
 
-                left_q, left_g = self.left_expert.get_action()
-                right_q, right_g = self.right_expert.get_action()
+            left_q, left_g = self.left_expert.get_action()
+            right_q, right_g = self.right_expert.get_action()
 
-                lf = left_ctrl.move_joints(left_q.astype(np.float32))
-                rf = right_ctrl.move_joints(right_q.astype(np.float32))
-                lf.wait()
-                rf.wait()
+            lf = left_ctrl.move_joints(left_q.astype(np.float32))
+            rf = right_ctrl.move_joints(right_q.astype(np.float32))
+            lf.wait()
+            rf.wait()
 
-                if self.gripper_enabled:
-                    for arm_idx, (ctrl, grip) in enumerate(
-                        zip(ctrls, (left_g, right_g))
-                    ):
-                        is_open_now = grip.item() < 0.5
-                        prev = self._stream_last_gripper_open[arm_idx]
-                        if prev is None:
-                            self._stream_last_gripper_open[arm_idx] = is_open_now
-                        elif is_open_now != prev:
-                            if is_open_now:
-                                ctrl.open_gripper()
-                            else:
-                                ctrl.close_gripper()
-                            self._stream_last_gripper_open[arm_idx] = is_open_now
+            if self.gripper_enabled:
+                for arm_idx, (ctrl, grip) in enumerate(zip(ctrls, (left_g, right_g))):
+                    is_open_now = grip.item() < 0.5
+                    prev = self._stream_last_gripper_open[arm_idx]
+                    if prev is None:
+                        self._stream_last_gripper_open[arm_idx] = is_open_now
+                    elif is_open_now != prev:
+                        if is_open_now:
+                            ctrl.open_gripper()
+                        else:
+                            ctrl.close_gripper()
+                        self._stream_last_gripper_open[arm_idx] = is_open_now
 
-                elapsed = time.time() - loop_start
-                sleep_for = period - elapsed
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
-        except Exception as exc:
-            self._stream_error = exc
-            self._aligned = False
-            self._stream_running = False
-            self._stream_gate.clear()
+            elapsed = time.time() - loop_start
+            sleep_for = period - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
     def _get_current_joint_positions(self) -> np.ndarray:
         return self.get_wrapper_attr("get_joint_positions")()
@@ -187,6 +176,9 @@ class DualGelloJointIntervention(gym.ActionWrapper):
             )
         else:
             expert_a = np.concatenate(per_arm, axis=0)
+
+        if self._direct_stream and self._aligned:
+            return expert_a, True
 
         movement = np.linalg.norm(
             np.concatenate([left_q, right_q]) - np.concatenate([current[0], current[1]])
@@ -234,7 +226,6 @@ class DualGelloJointIntervention(gym.ActionWrapper):
                     raise RuntimeError("failed to align both Frankas to GELLO")
                 _, info = result
                 result = (self.env.get_wrapper_attr("_get_observation")(), info)
-            self._stream_error = None
             self._stream_gate.set()
             if self._direct_stream and self._aligned:
                 self._start_stream_thread()
@@ -245,11 +236,8 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         return result
 
     def step(self, action):
-        if self._stream_error is not None:
-            raise RuntimeError("dual GELLO stream failed") from self._stream_error
         new_action, replaced = self.action(action)
         if self._direct_stream and self._aligned:
-            replaced = True
             self._start_stream_thread()
         obs, rew, done, truncated, info = self.env.step(new_action)
         if replaced:
@@ -258,19 +246,11 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         return obs, rew, done, truncated, info
 
     def close(self):
-        if self._closed:
-            return None
-        self._closed = True
         self._stream_running = False
         self._stream_gate.set()
         t = self._stream_thread
         if t is not None and t.is_alive():
             t.join(timeout=2.0)
-        try:
-            self.left_expert.close()
-        finally:
-            try:
-                self.right_expert.close()
-            finally:
-                super().close()
-        return None
+        self.left_expert.close()
+        self.right_expert.close()
+        return super().close()

@@ -66,8 +66,6 @@ class Ros2ControllerConfig:
     controlled_motion_timeout: float = 180.0
     controlled_motion_stable_time: float = 0.5
     gripper_poll_interval: float = 0.1
-    controller_health_period: float = 0.1
-    controller_health_timeout: float = 0.5
     joint_names: list[str] = field(
         default_factory=lambda: [f"fr3_joint{i}" for i in range(1, 8)]
     )
@@ -80,7 +78,6 @@ class Ros2DualFrankaBackend:
         self.config = config
         self._logger = get_logger()
         self._lock = threading.Lock()
-        self._health_lock = threading.Lock()
         self._states = {"left": None, "right": None}
         self._state_arrivals = {"left": 0.0, "right": 0.0}
         self._processes: dict[str, subprocess.Popen] = {}
@@ -92,13 +89,14 @@ class Ros2DualFrankaBackend:
         self._gripper_errors = {"left": None, "right": None}
         self._gripper_running = False
         self._gripper_threads = []
-        self._controller_health_futures = {"left": None, "right": None}
-        self._controller_health_requested = {"left": 0.0, "right": 0.0}
-        self._controller_last_active = {"left": 0.0, "right": 0.0}
-        self._controller_seen_active = {"left": False, "right": False}
-        self._controller_health_errors = {"left": None, "right": None}
-        self._started_at = time.monotonic()
+        self._controller_active = {"left": False, "right": False}
         self._closed = False
+        self._repo_root = Path(__file__).resolve().parents[4]
+        self._overlay_prefix = self._repo_root / "ros2_ws" / "install"
+        if not (self._overlay_prefix / "rlinf_franka_controller").exists():
+            raise RuntimeError(
+                f"RLinf ROS 2 controller is not built under {self._overlay_prefix}"
+            )
 
         try:
             self._start_ros()
@@ -113,7 +111,13 @@ class Ros2DualFrankaBackend:
             self._start_gripper_threads()
             for side in ("left", "right"):
                 self._start_controller(side, getattr(config, f"{side}_robot_ip"))
+                self._wait_for_controller_active(side)
+                deadline = time.monotonic() + self.config.ros_wait_timeout
                 while not self.is_robot_up(side):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"timed out waiting for {side} Franka and gripper"
+                        )
                     time.sleep(0.05)
         except Exception:
             self.close()
@@ -187,13 +191,9 @@ class Ros2DualFrankaBackend:
         ):
             raise RuntimeError(f"controller_manager already active at {service}")
 
-        repo_root = Path(__file__).resolve().parents[4]
-        overlay = repo_root / "ros2_ws" / "install" / "rlinf_franka_controller"
-        if not overlay.exists():
-            raise RuntimeError(
-                f"RLinf ROS 2 controller is not built under {repo_root / 'ros2_ws/install'}"
-            )
-        log_path = repo_root / "logs" / f"ros2_controller_{side}_{os.getpid()}.log"
+        log_path = (
+            self._repo_root / "logs" / f"ros2_controller_{side}_{os.getpid()}.log"
+        )
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_file = log_path.open("w", encoding="utf-8")
         self._logs[side] = log_file
@@ -215,6 +215,9 @@ class Ros2DualFrankaBackend:
             stderr=subprocess.STDOUT,
             env={
                 **os.environ,
+                "AMENT_PREFIX_PATH": str(self._overlay_prefix)
+                + os.pathsep
+                + os.environ.get("AMENT_PREFIX_PATH", ""),
                 "LD_LIBRARY_PATH": "/opt/openrobots/lib:"
                 + os.environ.get("LD_LIBRARY_PATH", ""),
             },
@@ -248,7 +251,6 @@ class Ros2DualFrankaBackend:
             self._state_arrivals[side] = time.monotonic()
 
     def _check_process(self, side: str) -> None:
-        self._poll_controller_health(side)
         process = self._processes.get(side)
         if process is not None and process.poll() is not None:
             raise RuntimeError(
@@ -258,68 +260,37 @@ class Ros2DualFrankaBackend:
             raise RuntimeError(
                 f"{side} gripper worker failed"
             ) from self._gripper_errors[side]
-        if self._controller_health_errors[side] is not None:
-            raise RuntimeError(f"{side} ROS 2 controller is not active") from (
-                self._controller_health_errors[side]
-            )
 
-    def _poll_controller_health(self, side: str) -> None:
-        now = time.monotonic()
-        with self._health_lock:
-            future = self._controller_health_futures[side]
-            if future is not None and future.done():
-                self._controller_health_futures[side] = None
-                try:
-                    response = future.result()
-                    state = next(
-                        (
-                            controller.state
-                            for controller in response.controller
-                            if controller.name == "joint_impedance_controller"
-                        ),
-                        None,
-                    )
-                    if state == "active":
-                        self._controller_seen_active[side] = True
-                        self._controller_last_active[side] = now
-                        self._controller_health_errors[side] = None
-                    elif self._controller_seen_active[side]:
-                        raise RuntimeError(f"controller state is {state!r}")
-                except Exception as exc:
-                    self._controller_health_errors[side] = exc
-
-            if (
-                self._controller_health_futures[side] is None
-                and now - self._controller_health_requested[side]
-                >= self.config.controller_health_period
-                and self._controller_health_clients[side].service_is_ready()
+    def _wait_for_controller_active(self, side: str) -> None:
+        client = self._controller_health_clients[side]
+        deadline = time.monotonic() + self.config.ros_wait_timeout
+        while time.monotonic() < deadline:
+            self._check_process(side)
+            if not client.wait_for_service(timeout_sec=0.1):
+                continue
+            future = client.call_async(self._list_controllers_type.Request())
+            while not future.done() and time.monotonic() < deadline:
+                self._check_process(side)
+                time.sleep(0.05)
+            if not future.done():
+                break
+            response = future.result()
+            if any(
+                controller.name == "joint_impedance_controller"
+                and controller.state == "active"
+                for controller in response.controller
             ):
-                self._controller_health_futures[side] = self._controller_health_clients[
-                    side
-                ].call_async(self._list_controllers_type.Request())
-                self._controller_health_requested[side] = now
-
-            future = self._controller_health_futures[side]
-            if future is not None and (
-                now - self._controller_health_requested[side]
-                > self.config.controller_health_timeout
-            ):
-                self._controller_health_errors[side] = TimeoutError(
-                    "controller health response timed out"
-                )
+                self._controller_active[side] = True
+                return
+            time.sleep(0.1)
+        raise TimeoutError(f"timed out waiting for {side} ROS 2 controller")
 
     def is_robot_up(self, side: str) -> bool:
         self._check_process(side)
         with self._lock:
             has_state = self._states[side] is not None
             has_gripper = self._gripper_positions[side] is not None
-        has_controller = self._controller_seen_active[side]
-        if not (has_state and has_gripper and has_controller) and (
-            time.monotonic() - self._started_at > self.config.ros_wait_timeout
-        ):
-            raise TimeoutError(
-                f"timed out waiting for {side} Franka, gripper, and controller"
-            )
+        has_controller = self._controller_active[side]
         return has_state and has_gripper and has_controller
 
     def get_state(self, side: str) -> FrankaRobotState:
