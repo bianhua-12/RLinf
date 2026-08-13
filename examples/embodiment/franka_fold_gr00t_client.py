@@ -38,6 +38,7 @@ CONTROL_HZ = 30.0
 TRAINING_RTC_MAX_DELAY = 10
 DEFAULT_PEDAL = "/dev/input/by-id/usb-PCsensor_FootSwitch-event-kbd"
 DEFAULT_TASK = "fold the clothes"
+DEFAULT_PICO_ZMQ_ADDR = "ipc:///tmp/vr_data.ipc"
 DEFAULT_JOINT_RESET_QPOS = [
     [
         -0.02556161,
@@ -349,13 +350,23 @@ def run_policy(
     action_index = 0
     episode_step = 0
     pending: Future | None = None
+    pending_kind: str | None = None
+    pending_generation = 0
     request_start_step = 0
     requested_delay = 0
+    generation = 0
+    pico_active = False
+    pico_ready = False
+    pico_resume_required = False
 
     print("Policy running. Pedal B=failure, C=success, Q=abort.")
     while True:
         if pending is not None and pending.done():
             actions, info = pending.result()
+            completed_kind = pending_kind
+            completed_generation = pending_generation
+            pending = None
+            pending_kind = None
             observed_delay = episode_step - request_start_step
             _write_diagnostic(
                 diagnostic_log,
@@ -363,13 +374,18 @@ def run_policy(
                 episode_step=episode_step,
                 requested_delay=requested_delay,
                 observed_delay=observed_delay,
-                accepted=observed_delay <= requested_delay,
+                accepted=(
+                    completed_generation == generation
+                    and observed_delay <= requested_delay
+                ),
+                kind=completed_kind,
                 info=info,
                 actions=actions,
             )
-            if observed_delay > requested_delay:
+            if completed_generation != generation:
+                print("Discarding a GR00T response issued before PICO takeover.")
+            elif observed_delay > requested_delay:
                 predicted_delay = min(observed_delay + 1, TRAINING_RTC_MAX_DELAY)
-                pending = None
             elif info.get("training_rtc_delay_steps") != requested_delay:
                 raise RuntimeError(
                     "GR00T server did not confirm the requested RTC delay"
@@ -378,12 +394,38 @@ def run_policy(
                 action_dict = validate_actions(actions)
                 action_chunk = flatten_actions(action_dict)
                 action_index = observed_delay
-                predicted_delay = min(
-                    max(observed_delay, 1) + 1, TRAINING_RTC_MAX_DELAY
-                )
-                pending = None
+                if completed_kind == "resume":
+                    try:
+                        env.get_wrapper_attr("release_to_policy")()
+                    except (RuntimeError, ValueError) as exc:
+                        print(f"PICO release rejected; holding and re-inferring: {exc}")
+                    else:
+                        pico_resume_required = False
+                        predicted_delay = TRAINING_RTC_MAX_DELAY
+                        print("Fresh GR00T action accepted; PICO takeover released.")
+                else:
+                    predicted_delay = min(
+                        max(observed_delay, 1) + 1, TRAINING_RTC_MAX_DELAY
+                    )
 
-        if pending is None and action_index >= 2:
+        if pico_resume_required and not pico_active and pico_ready and pending is None:
+            hold_action = np.asarray(
+                env.get_wrapper_attr("get_hold_action")(), dtype=np.float32
+            )
+            hold_chunk = np.repeat(hold_action[None, :], ACTION_HORIZON, axis=0)
+            hold_dict = {}
+            offset = 0
+            for key, width in ACTION_LAYOUT:
+                hold_dict[key] = hold_chunk[None, :, offset : offset + width]
+                offset += width
+            requested_delay = TRAINING_RTC_MAX_DELAY
+            options = rtc_options(hold_dict, 0, requested_delay)
+            observation = build_observation(latest_obs, task)
+            pending = policy.submit(observation, options)
+            pending_kind = "resume"
+            pending_generation = generation
+            request_start_step = episode_step
+        elif not pico_resume_required and pending is None and action_index >= 2:
             requested_delay = predicted_delay
             options = rtc_options(action_dict, action_index, requested_delay)
             observation = build_observation(latest_obs, task)
@@ -397,14 +439,16 @@ def run_policy(
                 action_prefix=options["training_rtc_action_prefix"],
             )
             pending = policy.submit(observation, options)
+            pending_kind = "rtc"
+            pending_generation = generation
             request_start_step = episode_step
 
-        if action_index >= ACTION_HORIZON:
+        if not pico_resume_required and action_index >= ACTION_HORIZON:
             raise RuntimeError(
                 "Action chunk exhausted before GR00T returned the next chunk"
             )
         state = np.asarray(latest_obs["state"]["proprio"], dtype=np.float32)
-        target = action_chunk[action_index]
+        target = action_chunk[min(action_index, ACTION_HORIZON - 1)]
         left_delta = target[0:7] - state[0:7]
         right_delta = target[8:15] - state[8:15]
         _write_diagnostic(
@@ -421,7 +465,20 @@ def run_policy(
         )
         latest_obs, _, terminated, truncated, info = env.step(target)
         episode_step += 1
-        action_index += 1
+        if not pico_resume_required:
+            action_index += 1
+
+        now_pico_active = bool(info.get("pico_active", False))
+        pico_ready = bool(info.get("pico_ready", False))
+        now_pico_takeover = bool(info.get("pico_takeover", False))
+        if now_pico_active and not pico_active:
+            generation += 1
+            pico_resume_required = True
+            print("PICO takeover active; invalidating pending GR00T actions.")
+        elif now_pico_takeover:
+            pico_resume_required = True
+        pico_active = now_pico_active
+
         if terminated or truncated:
             return info.get("eval_result") or "timeout"
 
@@ -469,6 +526,34 @@ def create_env(args: argparse.Namespace):
         env_idx=0,
         env_cfg=env_cfg,
     )
+    if args.enable_pico:
+        from rlinf.envs.realworld.common.wrappers.pico_joint_intervention import (
+            DualFrankaJointPicoIntervention,
+        )
+
+        try:
+            env = DualFrankaJointPicoIntervention(
+                env,
+                zmq_addr=args.pico_zmq_addr,
+                control_trigger="grip",
+                control_threshold=args.pico_control_threshold,
+                max_stale_s=0.2,
+                ready_timeout_s=args.pico_ready_timeout_s,
+                calibration={
+                    "enabled": True,
+                    "required": True,
+                    "auto_calibrate_on_start": True,
+                    "button": "trigger",
+                    "threshold": 0.5,
+                    "head_forward_axis": "-z",
+                    "base_position": [0.0, 0.0, 0.0],
+                },
+                left={"gripper_close_button": "X", "gripper_open_button": "Y"},
+                right={"gripper_close_button": "A", "gripper_open_button": "B"},
+            )
+        except Exception:
+            env.close()
+            raise
 
     class CollectionObservationWrapper(gym.ObservationWrapper):
         def observation(self, observation):
@@ -539,6 +624,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pedal-device", default=os.environ.get("RLINF_KEYBOARD_DEVICE", DEFAULT_PEDAL)
     )
+    parser.add_argument("--enable-pico", action="store_true")
+    parser.add_argument("--pico-zmq-addr", default=DEFAULT_PICO_ZMQ_ADDR)
+    parser.add_argument("--pico-control-threshold", type=float, default=0.85)
+    parser.add_argument("--pico-ready-timeout-s", type=float, default=10.0)
     parser.add_argument(
         "--rollout-dir",
         default=os.environ.get(
@@ -605,6 +694,10 @@ def main() -> None:
         raise SystemExit("Refusing to open hardware without --enable-policy")
     if not 1 <= args.port <= 65535 or args.timeout_ms <= 0:
         raise SystemExit("port and timeout-ms must be positive and valid")
+    if args.enable_pico and (
+        not 0.0 < args.pico_control_threshold <= 1.0 or args.pico_ready_timeout_s <= 0.0
+    ):
+        raise SystemExit("PICO threshold and timeout must be positive and valid")
     input("Press Enter to open hardware (Ctrl+C to cancel): ")
 
     os.environ["RLINF_KEYBOARD_DEVICE"] = args.pedal_device

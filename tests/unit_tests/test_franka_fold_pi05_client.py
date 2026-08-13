@@ -87,3 +87,69 @@ def test_run_policy_discards_late_rtc_response_and_retries():
     assert len(policy.observations) >= 3
     assert policy.observations[1]["training_rtc_delay_steps"] == 10
     assert policy.observations[2]["training_rtc_delay_steps"] == 10
+
+
+class _TakeoverEnv(_Env):
+    def __init__(self):
+        super().__init__()
+        self.release_count = 0
+
+    def get_wrapper_attr(self, name):
+        return getattr(self, name)
+
+    def get_hold_action(self):
+        return np.zeros(client.ACTION_DIM, dtype=np.float32)
+
+    def release_to_policy(self):
+        self.release_count += 1
+
+    def step(self, action):
+        del action
+        self.steps += 1
+        active = self.steps in (3, 4)
+        takeover = 3 <= self.steps <= 6
+        terminated = self.steps >= 8
+        return (
+            _observation(),
+            0.0,
+            terminated,
+            False,
+            {
+                "eval_result": "success" if terminated else None,
+                "pico_active": active,
+                "pico_ready": True,
+                "pico_takeover": takeover,
+            },
+        )
+
+
+class _TakeoverPolicy:
+    def __init__(self, env):
+        self.env = env
+        self.observations = []
+
+    def submit(self, observation):
+        self.observations.append(observation)
+        delay = observation.get("training_rtc_delay_steps")
+        response = _response(delay)
+        if len(self.observations) == 2:
+            return _DelayedFuture(self.env, 4, response)
+        future = Future()
+        future.set_result(response)
+        return future
+
+
+def test_run_policy_reinfers_from_hold_after_pico_takeover():
+    env = _TakeoverEnv()
+    policy = _TakeoverPolicy(env)
+
+    result = client.run_policy(env, policy, client.DEFAULT_TASK)
+
+    assert result == "success"
+    assert env.release_count == 1
+    resume_observation = policy.observations[-1]
+    assert resume_observation["training_rtc_delay_steps"] == 10
+    np.testing.assert_array_equal(
+        resume_observation["training_rtc_action_prefix"][:10],
+        np.zeros((10, client.ACTION_DIM)),
+    )

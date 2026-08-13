@@ -172,9 +172,8 @@ class PicoExpert:
         self._lock = threading.Lock()
         self._latest_data: Optional[dict[str, Any]] = None
         self._last_update_time = 0.0
+        self._source_timestamp = None
 
-        self._context = None
-        self._socket = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -209,13 +208,6 @@ class PicoExpert:
         if self._running:
             return
 
-        self._context = zmq.Context()
-        self._socket = self._context.socket(zmq.SUB)
-        self._socket.set_hwm(10)
-        self._socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
-        self._socket.setsockopt(zmq.SUBSCRIBE, b"")
-        self._socket.connect(self.zmq_addr)
-
         self._running = True
         self._thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._thread.start()
@@ -223,24 +215,17 @@ class PicoExpert:
 
     def stop(self) -> None:
         self._running = False
-        if self._socket is not None:
-            self._socket.close(linger=0)
-            self._socket = None
-
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=max(2.0, self.timeout_ms / 1000.0 + 1.0))
         self._thread = None
-
-        if self._context is not None:
-            self._context.term()
-            self._context = None
 
     def get_action(
         self,
         tcp_pose: np.ndarray,
-        action_scale: np.ndarray,
+        action_scale: Optional[np.ndarray],
         *,
         gripper_enabled: bool = True,
+        direct: bool = False,
     ) -> tuple[np.ndarray, bool, dict[str, Any]]:
         data = self._snapshot()
         if data is None:
@@ -314,21 +299,26 @@ class PicoExpert:
         target_pos, target_rot = self._target_tcp_pose(controller_pos, controller_rot)
         current_pos = np.asarray(tcp_pose[:3], dtype=np.float64)
         current_rot = R.from_quat(np.asarray(tcp_pose[3:7], dtype=np.float64))
-        action_scale = np.asarray(action_scale, dtype=np.float64)
-
-        delta_pos = (target_pos - current_pos) / float(action_scale[0])
         delta_rot = target_rot * current_rot.inv()
-        max_rot = float(action_scale[1])
-        delta_rotvec = delta_rot.as_rotvec()
-        if max_rot > 1e-9:
-            angle = float(np.linalg.norm(delta_rotvec))
-            if angle > max_rot:
-                delta_rotvec = delta_rotvec * (max_rot / angle)
-            delta_rot_action = delta_rotvec / max_rot
+        if direct:
+            expert_action = np.concatenate(
+                (target_pos - current_pos, delta_rot.as_rotvec()), axis=0
+            )
         else:
-            delta_rot_action = np.zeros(3, dtype=np.float64)
-        expert_action = np.concatenate((delta_pos, delta_rot_action), axis=0)
-        expert_action = np.clip(expert_action, -1.0, 1.0)
+            action_scale = np.asarray(action_scale, dtype=np.float64)
+            delta_pos = (target_pos - current_pos) / float(action_scale[0])
+            max_rot = float(action_scale[1])
+            delta_rotvec = delta_rot.as_rotvec()
+            if max_rot > 1e-9:
+                angle = float(np.linalg.norm(delta_rotvec))
+                if angle > max_rot:
+                    delta_rotvec = delta_rotvec * (max_rot / angle)
+                delta_rot_action = delta_rotvec / max_rot
+            else:
+                delta_rot_action = np.zeros(3, dtype=np.float64)
+            expert_action = np.clip(
+                np.concatenate((delta_pos, delta_rot_action), axis=0), -1.0, 1.0
+            )
 
         gripper_close = False
         if gripper_enabled:
@@ -368,20 +358,39 @@ class PicoExpert:
         return expert_action, True, info
 
     def _recv_loop(self) -> None:
-        while self._running:
-            try:
-                msg_bytes = self._socket.recv()
-                data = json.loads(msg_bytes.decode("utf-8"))
-                with self._lock:
-                    self._latest_data = data
-                    self._last_update_time = time.time()
-            except zmq.error.Again:
-                continue
-            except Exception as exc:
-                if not self._running:
-                    break
-                logger.warning("Error receiving PICO data: %s", exc)
-                time.sleep(self.reconnect_interval_s)
+        context = zmq.Context()
+        socket = context.socket(zmq.SUB)
+        try:
+            socket.set_hwm(10)
+            socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
+            socket.setsockopt(zmq.SUBSCRIBE, b"")
+            socket.connect(self.zmq_addr)
+            while self._running:
+                try:
+                    msg_bytes = socket.recv()
+                    data = json.loads(msg_bytes.decode("utf-8"))
+                    self._set_latest_data(data)
+                except zmq.error.Again:
+                    continue
+                except Exception as exc:
+                    if not self._running:
+                        break
+                    logger.warning("Error receiving PICO data: %s", exc)
+                    time.sleep(self.reconnect_interval_s)
+        finally:
+            socket.close(linger=0)
+            context.term()
+
+    def _set_latest_data(self, data: dict[str, Any]) -> None:
+        source_timestamp = data.get("timestamp_ns")
+        with self._lock:
+            self._latest_data = data
+            if (
+                source_timestamp is None
+                or source_timestamp != self._source_timestamp
+            ):
+                self._source_timestamp = source_timestamp
+                self._last_update_time = time.time()
 
     def _snapshot(self) -> Optional[dict[str, Any]]:
         with self._lock:

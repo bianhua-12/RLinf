@@ -34,6 +34,7 @@ CONTROL_HZ = 30.0
 TRAINING_RTC_MAX_DELAY = 10
 DEFAULT_PEDAL = "/dev/input/by-id/usb-PCsensor_FootSwitch-event-kbd"
 DEFAULT_TASK = "fold the clothes"
+DEFAULT_PICO_ZMQ_ADDR = "ipc:///tmp/vr_data.ipc"
 DEFAULT_JOINT_RESET_QPOS = [
     [
         -0.02556161,
@@ -231,35 +232,93 @@ def run_policy(env, policy: AsyncPi05Client, task: str) -> str:
     episode_step = 0
     delay_history = deque([TRAINING_RTC_MAX_DELAY], maxlen=8)
     pending: Future | None = None
+    pending_kind: str | None = None
+    pending_generation = 0
     request_start_step = 0
     requested_delay = 0
+    generation = 0
+    pico_active = False
+    pico_ready = False
+    pico_resume_required = False
 
     print("Policy running. Pedal B=failure, C=success, Q=abort.")
     while True:
         if pending is not None and pending.done():
             response = pending.result()
-            observed_delay = episode_step - request_start_step
-            if observed_delay > requested_delay:
-                print(
-                    "Pi0.5 response exceeded its RTC prefix: "
-                    f"observed={observed_delay}, conditioned={requested_delay}; "
-                    "discarding the stale response."
-                )
-                delay_history.append(
-                    min(observed_delay + 1, TRAINING_RTC_MAX_DELAY)
-                )
-                pending = None
+            completed_kind = pending_kind
+            completed_generation = pending_generation
+            pending = None
+            pending_kind = None
+            if completed_generation != generation:
+                print("Discarding a pi0.5 response issued before PICO takeover.")
+            elif completed_kind == "resume":
+                candidate = validate_actions(response)
+                observed_delay = episode_step - request_start_step
+                if observed_delay > requested_delay:
+                    print(
+                        "Pi0.5 resume response exceeded its RTC prefix; "
+                        "holding and re-inferring."
+                    )
+                elif response.get("training_rtc_delay_steps") != requested_delay:
+                    raise RuntimeError(
+                        "Pi0.5 server did not confirm the resume RTC delay"
+                    )
+                else:
+                    release = env.get_wrapper_attr("release_to_policy")
+                    try:
+                        release()
+                    except (RuntimeError, ValueError) as exc:
+                        print(f"PICO release rejected; holding and re-inferring: {exc}")
+                    else:
+                        action_chunk = candidate
+                        action_index = observed_delay
+                        pico_resume_required = False
+                        delay_history.clear()
+                        delay_history.append(TRAINING_RTC_MAX_DELAY)
+                        print("Fresh pi0.5 action accepted; PICO takeover released.")
             else:
-                if response.get("training_rtc_delay_steps") != requested_delay:
-                    raise RuntimeError("Pi0.5 server did not confirm the requested RTC delay")
-                action_chunk = validate_actions(response)
-                action_index = observed_delay
-                delay_history.append(
-                    min(max(observed_delay + 1, 1), TRAINING_RTC_MAX_DELAY)
-                )
-                pending = None
+                observed_delay = episode_step - request_start_step
+                if observed_delay > requested_delay:
+                    print(
+                        "Pi0.5 response exceeded its RTC prefix: "
+                        f"observed={observed_delay}, conditioned={requested_delay}; "
+                        "discarding the stale response."
+                    )
+                    delay_history.append(
+                        min(observed_delay + 1, TRAINING_RTC_MAX_DELAY)
+                    )
+                else:
+                    if response.get("training_rtc_delay_steps") != requested_delay:
+                        raise RuntimeError(
+                            "Pi0.5 server did not confirm the requested RTC delay"
+                        )
+                    action_chunk = validate_actions(response)
+                    action_index = observed_delay
+                    delay_history.append(
+                        min(max(observed_delay + 1, 1), TRAINING_RTC_MAX_DELAY)
+                    )
 
-        if pending is None and 2 <= action_index < ACTION_HORIZON:
+        if pico_resume_required and not pico_active and pico_ready and pending is None:
+            hold_action = np.asarray(
+                env.get_wrapper_attr("get_hold_action")(), dtype=np.float32
+            )
+            hold_chunk = np.repeat(hold_action[None, :], ACTION_HORIZON, axis=0)
+            requested_delay = TRAINING_RTC_MAX_DELAY
+            observation = add_rtc_prefix(
+                build_observation(latest_obs, task),
+                hold_chunk,
+                executed=0,
+                delay=requested_delay,
+            )
+            pending = policy.submit(observation)
+            pending_kind = "resume"
+            pending_generation = generation
+            request_start_step = episode_step
+        elif (
+            not pico_resume_required
+            and pending is None
+            and 2 <= action_index < ACTION_HORIZON
+        ):
             requested_delay = min(
                 max(delay_history), ACTION_HORIZON - action_index
             )
@@ -268,17 +327,34 @@ def run_policy(env, policy: AsyncPi05Client, task: str) -> str:
                 observation, action_chunk, action_index, requested_delay
             )
             pending = policy.submit(observation)
+            pending_kind = "rtc"
+            pending_generation = generation
             request_start_step = episode_step
 
-        if action_index >= ACTION_HORIZON:
+        if not pico_resume_required and action_index >= ACTION_HORIZON:
             print("Pi0.5 inference is still pending; holding the last joint target.")
             action_chunk = np.repeat(action_chunk[-1:], ACTION_HORIZON, axis=0)
             action_index = 0
+
+        command_index = min(action_index, ACTION_HORIZON - 1)
         latest_obs, _, terminated, truncated, info = env.step(
-            action_chunk[action_index]
+            action_chunk[command_index]
         )
         episode_step += 1
-        action_index += 1
+        if not pico_resume_required:
+            action_index += 1
+
+        now_pico_active = bool(info.get("pico_active", False))
+        pico_ready = bool(info.get("pico_ready", False))
+        now_pico_takeover = bool(info.get("pico_takeover", False))
+        if now_pico_active and not pico_active:
+            generation += 1
+            pico_resume_required = True
+            print("PICO takeover active; invalidating pending pi0.5 actions.")
+        elif now_pico_takeover:
+            pico_resume_required = True
+        pico_active = now_pico_active
+
         if terminated or truncated:
             return info.get("eval_result") or "timeout"
 
@@ -324,6 +400,34 @@ def create_env(args: argparse.Namespace):
         env_idx=0,
         env_cfg=env_cfg,
     )
+    if args.enable_pico:
+        from rlinf.envs.realworld.common.wrappers.pico_joint_intervention import (
+            DualFrankaJointPicoIntervention,
+        )
+
+        try:
+            env = DualFrankaJointPicoIntervention(
+                env,
+                zmq_addr=args.pico_zmq_addr,
+                control_trigger="grip",
+                control_threshold=args.pico_control_threshold,
+                max_stale_s=0.2,
+                ready_timeout_s=args.pico_ready_timeout_s,
+                calibration={
+                    "enabled": True,
+                    "required": True,
+                    "auto_calibrate_on_start": True,
+                    "button": "trigger",
+                    "threshold": 0.5,
+                    "head_forward_axis": "-z",
+                    "base_position": [0.0, 0.0, 0.0],
+                },
+                left={"gripper_close_button": "X", "gripper_open_button": "Y"},
+                right={"gripper_close_button": "A", "gripper_open_button": "B"},
+            )
+        except Exception:
+            env.close()
+            raise
 
     class CollectionObservationWrapper(gym.ObservationWrapper):
         def observation(self, observation):
@@ -381,6 +485,10 @@ def parse_args() -> argparse.Namespace:
         default="/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG046F7F-if00-port0",
     )
     parser.add_argument("--pedal-device", default=DEFAULT_PEDAL)
+    parser.add_argument("--enable-pico", action="store_true")
+    parser.add_argument("--pico-zmq-addr", default=DEFAULT_PICO_ZMQ_ADDR)
+    parser.add_argument("--pico-control-threshold", type=float, default=0.85)
+    parser.add_argument("--pico-ready-timeout-s", type=float, default=10.0)
     parser.add_argument(
         "--num-episodes",
         type=int,
@@ -463,6 +571,11 @@ def main() -> None:
         raise SystemExit(
             "port, timeout-s, and num-episodes must be positive and valid"
         )
+    if args.enable_pico and (
+        not 0.0 < args.pico_control_threshold <= 1.0
+        or args.pico_ready_timeout_s <= 0.0
+    ):
+        raise SystemExit("PICO threshold and timeout must be positive and valid")
     input("Press Enter to open hardware (Ctrl+C to cancel): ")
 
     os.environ["RLINF_KEYBOARD_DEVICE"] = args.pedal_device
