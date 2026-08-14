@@ -87,6 +87,79 @@ def _button_name(side: str, name: str) -> str:
     return name
 
 
+def _low_pass_alpha(dt: float, cutoff: float) -> float:
+    tau = 1.0 / (2.0 * np.pi * cutoff)
+    return 1.0 / (1.0 + tau / dt)
+
+
+class _OneEuroPoseFilter:
+    """Adaptive low-pass filter for controller position and orientation."""
+
+    def __init__(self, min_cutoff: float, beta: float, d_cutoff: float) -> None:
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.d_cutoff = float(d_cutoff)
+        self.reset()
+
+    def reset(self) -> None:
+        self._time: Optional[float] = None
+        self._raw_position: Optional[np.ndarray] = None
+        self._filtered_position: Optional[np.ndarray] = None
+        self._filtered_velocity = np.zeros(3, dtype=np.float64)
+        self._raw_rotation: Optional[R] = None
+        self._filtered_rotation: Optional[R] = None
+        self._filtered_angular_velocity = np.zeros(3, dtype=np.float64)
+
+    def filter(
+        self,
+        position: np.ndarray,
+        rotation: R,
+        timestamp: float,
+    ) -> tuple[np.ndarray, R]:
+        position = np.asarray(position, dtype=np.float64)
+        if self._time is None:
+            self._time = float(timestamp)
+            self._raw_position = position.copy()
+            self._filtered_position = position.copy()
+            self._raw_rotation = rotation
+            self._filtered_rotation = rotation
+            return position.copy(), rotation
+
+        dt = float(timestamp) - self._time
+        if dt <= 0.0:
+            return self._filtered_position.copy(), self._filtered_rotation
+
+        velocity = (position - self._raw_position) / dt
+        angular_velocity = (rotation * self._raw_rotation.inv()).as_rotvec() / dt
+        derivative_alpha = _low_pass_alpha(dt, self.d_cutoff)
+        self._filtered_velocity += derivative_alpha * (
+            velocity - self._filtered_velocity
+        )
+        self._filtered_angular_velocity += derivative_alpha * (
+            angular_velocity - self._filtered_angular_velocity
+        )
+
+        position_cutoff = self.min_cutoff + self.beta * np.linalg.norm(
+            self._filtered_velocity
+        )
+        rotation_cutoff = self.min_cutoff + self.beta * np.linalg.norm(
+            self._filtered_angular_velocity
+        )
+        position_alpha = _low_pass_alpha(dt, position_cutoff)
+        rotation_alpha = _low_pass_alpha(dt, rotation_cutoff)
+        self._filtered_position += position_alpha * (position - self._filtered_position)
+        rotation_delta = rotation * self._filtered_rotation.inv()
+        self._filtered_rotation = (
+            R.from_rotvec(rotation_alpha * rotation_delta.as_rotvec())
+            * self._filtered_rotation
+        )
+
+        self._time = float(timestamp)
+        self._raw_position = position.copy()
+        self._raw_rotation = rotation
+        return self._filtered_position.copy(), self._filtered_rotation
+
+
 class PicoExpert:
     """Read PICO controller data and produce Franka base-frame actions."""
 
@@ -111,6 +184,7 @@ class PicoExpert:
         reconnect_interval_ms: int = 500,
         max_stale_s: float = 0.25,
         calibration: Optional[Mapping[str, Any]] = None,
+        trajectory_filter: Optional[Mapping[str, Any]] = None,
     ) -> None:
         if zmq_config is None:
             zmq_cfg = {}
@@ -142,6 +216,23 @@ class PicoExpert:
             float(zmq_cfg.get("reconnect_interval_ms", reconnect_interval_ms)) / 1000.0
         )
         self.max_stale_s = float(max_stale_s)
+
+        filter_cfg = dict(trajectory_filter or {})
+        if filter_cfg:
+            min_cutoff = float(filter_cfg.get("min_cutoff", 1.0))
+            beta = float(filter_cfg.get("beta", 0.0))
+            d_cutoff = float(filter_cfg.get("d_cutoff", 1.0))
+            if min_cutoff <= 0.0 or beta < 0.0 or d_cutoff <= 0.0:
+                raise ValueError(
+                    "PICO trajectory filter requires positive cutoffs and nonnegative beta"
+                )
+            self._trajectory_filter = _OneEuroPoseFilter(
+                min_cutoff=min_cutoff,
+                beta=beta,
+                d_cutoff=d_cutoff,
+            )
+        else:
+            self._trajectory_filter = None
 
         calibration_cfg = dict(calibration or {})
         self.calibration_enabled = bool(calibration_cfg.get("enabled", True))
@@ -295,6 +386,12 @@ class PicoExpert:
             self._last_info = info
             return self._last_action.copy(), False, info
 
+        if self._trajectory_filter is not None:
+            controller_pos, controller_rot = self._trajectory_filter.filter(
+                controller_pos,
+                controller_rot,
+                time.monotonic(),
+            )
         target_pos, target_rot = self._target_tcp_pose(controller_pos, controller_rot)
         current_pos = np.asarray(tcp_pose[:3], dtype=np.float64)
         current_rot = R.from_quat(np.asarray(tcp_pose[3:7], dtype=np.float64))
@@ -403,6 +500,13 @@ class PicoExpert:
         self._ref_controller_rot = controller_rot
         self._ref_tcp_pos = np.asarray(tcp_pose[:3], dtype=np.float64).copy()
         self._ref_tcp_rot = R.from_quat(np.asarray(tcp_pose[3:7], dtype=np.float64))
+        if self._trajectory_filter is not None:
+            self._trajectory_filter.reset()
+            self._trajectory_filter.filter(
+                controller_pos,
+                controller_rot,
+                time.monotonic(),
+            )
         logger.info("PICO %s controller activated", self.hand)
 
     def _deactivate(self) -> None:
@@ -413,6 +517,8 @@ class PicoExpert:
         self._ref_controller_rot = None
         self._ref_tcp_pos = None
         self._ref_tcp_rot = None
+        if self._trajectory_filter is not None:
+            self._trajectory_filter.reset()
 
     def _target_tcp_pose(
         self,

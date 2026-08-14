@@ -105,6 +105,23 @@ def test_repeated_source_timestamp_stays_ready_while_messages_arrive(monkeypatch
     assert not expert.ready
 
 
+def test_one_euro_pose_filter_smooths_and_adapts_to_motion():
+    fixed = pico_expert._OneEuroPoseFilter(1.0, 0.0, 1.0)
+    adaptive = pico_expert._OneEuroPoseFilter(1.0, 0.1, 1.0)
+    position = np.array([1.0, 0.0, 0.0])
+    rotation = R.from_euler("z", 90.0, degrees=True)
+    for pose_filter in (fixed, adaptive):
+        pose_filter.filter(np.zeros(3), R.identity(), 0.0)
+
+    fixed_position, fixed_rotation = fixed.filter(position, rotation, 1.0 / 30.0)
+    adaptive_position, adaptive_rotation = adaptive.filter(
+        position, rotation, 1.0 / 30.0
+    )
+
+    assert 0.0 < fixed_position[0] < adaptive_position[0] < position[0]
+    assert 0.0 < fixed_rotation.magnitude() < adaptive_rotation.magnitude() < np.pi / 2
+
+
 def test_direct_action_returns_full_tcp_error():
     expert = pico_expert.PicoExpert.__new__(pico_expert.PicoExpert)
     expert.hand = "left"
@@ -114,6 +131,7 @@ def test_direct_action_returns_full_tcp_error():
     expert.require_calibration = False
     expert._calibrated = True
     expert._active = True
+    expert._trajectory_filter = None
     expert._last_action = np.zeros(7, dtype=np.float32)
     expert._snapshot = lambda: {}
     expert._maybe_update_calibration = lambda data: None

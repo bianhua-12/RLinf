@@ -413,6 +413,11 @@ def create_env(args: argparse.Namespace):
                 control_threshold=args.pico_control_threshold,
                 max_stale_s=0.2,
                 ready_timeout_s=args.pico_ready_timeout_s,
+                trajectory_filter={
+                    "min_cutoff": 1.0,
+                    "beta": 0.1,
+                    "d_cutoff": 1.0,
+                },
                 calibration={
                     "enabled": True,
                     "required": True,
