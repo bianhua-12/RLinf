@@ -172,7 +172,6 @@ class PicoExpert:
         self._lock = threading.Lock()
         self._latest_data: Optional[dict[str, Any]] = None
         self._last_update_time = 0.0
-        self._source_timestamp = None
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -197,7 +196,7 @@ class PicoExpert:
         with self._lock:
             return (
                 self._latest_data is not None
-                and time.time() - self._last_update_time <= self.max_stale_s
+                and time.monotonic() - self._last_update_time <= self.max_stale_s
             )
 
     def start(self) -> None:
@@ -382,21 +381,15 @@ class PicoExpert:
             context.term()
 
     def _set_latest_data(self, data: dict[str, Any]) -> None:
-        source_timestamp = data.get("timestamp_ns")
         with self._lock:
             self._latest_data = data
-            if (
-                source_timestamp is None
-                or source_timestamp != self._source_timestamp
-            ):
-                self._source_timestamp = source_timestamp
-                self._last_update_time = time.time()
+            self._last_update_time = time.monotonic()
 
     def _snapshot(self) -> Optional[dict[str, Any]]:
         with self._lock:
             if self._latest_data is None:
                 return None
-            if time.time() - self._last_update_time > self.max_stale_s:
+            if time.monotonic() - self._last_update_time > self.max_stale_s:
                 return None
             return dict(self._latest_data)
 

@@ -85,14 +85,13 @@ def test_zmq_socket_lifecycle_stays_on_receiver_thread(monkeypatch):
     assert {"context", "socket", "recv", "close", "term"} <= {name for name, _ in calls}
 
 
-def test_repeated_source_timestamp_becomes_stale(monkeypatch):
+def test_repeated_source_timestamp_stays_ready_while_messages_arrive(monkeypatch):
     now = [1.0]
-    monkeypatch.setattr(pico_expert.time, "time", lambda: now[0])
+    monkeypatch.setattr(pico_expert.time, "monotonic", lambda: now[0])
     expert = pico_expert.PicoExpert.__new__(pico_expert.PicoExpert)
     expert._lock = threading.Lock()
     expert._latest_data = None
     expert._last_update_time = 0.0
-    expert._source_timestamp = None
     expert.max_stale_s = 0.2
 
     expert._set_latest_data({"timestamp_ns": 1})
@@ -100,10 +99,10 @@ def test_repeated_source_timestamp_becomes_stale(monkeypatch):
 
     now[0] = 1.3
     expert._set_latest_data({"timestamp_ns": 1})
-    assert not expert.ready
-
-    expert._set_latest_data({"timestamp_ns": 2})
     assert expert.ready
+
+    now[0] = 1.51
+    assert not expert.ready
 
 
 def test_direct_action_returns_full_tcp_error():
