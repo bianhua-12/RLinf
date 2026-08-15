@@ -6,12 +6,44 @@
 #
 #     https://www.apache.org/licenses/LICENSE-2.0
 
+import sys
 from concurrent.futures import Future
 from io import StringIO
 
+import gymnasium as gym
 import numpy as np
 
 from examples.embodiment import franka_fold_gr00t_client as client
+
+
+def test_episode_timeout_defaults_to_120_seconds(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["franka_fold_gr00t_client.py"])
+
+    args = client.parse_args()
+
+    assert args.episode_timeout_s == 120.0
+
+
+def test_episode_timeout_terminates_as_failure(monkeypatch):
+    class _NeverDoneEnv(gym.Env):
+        def reset(self, *, seed=None, options=None):
+            return _observation(), {}
+
+        def step(self, action):
+            return _observation(), 1.0, False, False, {}
+
+    times = iter([10.0, 130.0])
+    monkeypatch.setattr(client.time, "monotonic", lambda: next(times))
+    env = client._EpisodeTimeoutWrapper(_NeverDoneEnv(), timeout_s=120.0)
+
+    env.reset()
+    _, reward, terminated, truncated, info = env.step(None)
+
+    assert reward == 0.0
+    assert terminated
+    assert not truncated
+    assert info["eval_result"] == "failure"
+    assert info["success"] is False
 
 
 def _observation():

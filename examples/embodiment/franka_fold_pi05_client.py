@@ -20,10 +20,12 @@ import argparse
 import functools
 import json
 import os
+import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
+import gymnasium as gym
 import msgpack
 import numpy as np
 import websockets.sync.client
@@ -145,6 +147,29 @@ class AsyncPi05Client:
         if self.client is not None:
             self.executor.submit(self.client.close).result()
         self.executor.shutdown(wait=True, cancel_futures=True)
+
+
+class _EpisodeTimeoutWrapper(gym.Wrapper):
+    """End an overlong policy episode as a failure."""
+
+    def __init__(self, env: gym.Env, timeout_s: float):
+        super().__init__(env)
+        self.timeout_s = timeout_s
+        self.deadline = 0.0
+
+    def reset(self, **kwargs):
+        observation, info = self.env.reset(**kwargs)
+        self.deadline = time.monotonic() + self.timeout_s
+        return observation, info
+
+    def step(self, action):
+        observation, reward, terminated, truncated, info = self.env.step(action)
+        if time.monotonic() >= self.deadline:
+            reward = 0.0
+            terminated = True
+            truncated = False
+            info = {**info, "eval_result": "failure", "success": False}
+        return observation, reward, terminated, truncated, info
 
 
 def build_observation(raw_obs: dict[str, Any], task: str) -> dict[str, Any]:
@@ -360,8 +385,6 @@ def run_policy(env, policy: AsyncPi05Client, task: str) -> str:
 
 
 def create_env(args: argparse.Namespace):
-    import gymnasium as gym
-
     import rlinf.envs.realworld.franka.tasks  # noqa: F401
 
     override_cfg = {
@@ -434,6 +457,8 @@ def create_env(args: argparse.Namespace):
             env.close()
             raise
 
+    env = _EpisodeTimeoutWrapper(env, args.episode_timeout_s)
+
     class CollectionObservationWrapper(gym.ObservationWrapper):
         def observation(self, observation):
             return collection_observation(observation, args.task)
@@ -474,6 +499,7 @@ def parse_args() -> argparse.Namespace:
         "--port", type=int, default=int(os.environ.get("OPENPI_SERVER_PORT", "8000"))
     )
     parser.add_argument("--timeout-s", type=float, default=15.0)
+    parser.add_argument("--episode-timeout-s", type=float, default=120.0)
     parser.add_argument("--task", default=DEFAULT_TASK)
     parser.add_argument("--joint-reset-qpos", type=_joint_reset, default=DEFAULT_JOINT_RESET_QPOS)
     parser.add_argument("--left-robot-ip", default="172.16.0.1")
@@ -571,10 +597,11 @@ def main() -> None:
     if (
         not 1 <= args.port <= 65535
         or args.timeout_s <= 0
+        or args.episode_timeout_s <= 0
         or args.num_episodes <= 0
     ):
         raise SystemExit(
-            "port, timeout-s, and num-episodes must be positive and valid"
+            "port, timeout-s, episode-timeout-s, and num-episodes must be positive and valid"
         )
     if args.enable_pico and (
         not 0.0 < args.pico_control_threshold <= 1.0

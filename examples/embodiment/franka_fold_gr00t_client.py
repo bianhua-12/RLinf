@@ -23,6 +23,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, TextIO
 
+import gymnasium as gym
 import msgpack
 import numpy as np
 import zmq
@@ -214,6 +215,29 @@ class AsyncGr00tClient:
         if self.client is not None:
             self.executor.submit(self.client.close).result()
         self.executor.shutdown(wait=True, cancel_futures=True)
+
+
+class _EpisodeTimeoutWrapper(gym.Wrapper):
+    """End an overlong policy episode as a failure."""
+
+    def __init__(self, env: gym.Env, timeout_s: float):
+        super().__init__(env)
+        self.timeout_s = timeout_s
+        self.deadline = 0.0
+
+    def reset(self, **kwargs):
+        observation, info = self.env.reset(**kwargs)
+        self.deadline = time.monotonic() + self.timeout_s
+        return observation, info
+
+    def step(self, action):
+        observation, reward, terminated, truncated, info = self.env.step(action)
+        if time.monotonic() >= self.deadline:
+            reward = 0.0
+            terminated = True
+            truncated = False
+            info = {**info, "eval_result": "failure", "success": False}
+        return observation, reward, terminated, truncated, info
 
 
 def build_observation(raw_obs: dict[str, Any], task: str) -> dict[str, Any]:
@@ -485,8 +509,6 @@ def run_policy(
 
 def create_env(args: argparse.Namespace):
     """Construct the existing RLinf ROS 2 dual-Franka environment directly."""
-    import gymnasium as gym
-
     import rlinf.envs.realworld.franka.tasks  # noqa: F401
 
     override_cfg = {
@@ -555,6 +577,8 @@ def create_env(args: argparse.Namespace):
             env.close()
             raise
 
+    env = _EpisodeTimeoutWrapper(env, args.episode_timeout_s)
+
     class CollectionObservationWrapper(gym.ObservationWrapper):
         def observation(self, observation):
             return collection_observation(observation, args.task)
@@ -596,6 +620,7 @@ def parse_args() -> argparse.Namespace:
         "--port", type=int, default=int(os.environ.get("GR00T_SERVER_PORT", "5555"))
     )
     parser.add_argument("--timeout-ms", type=int, default=15000)
+    parser.add_argument("--episode-timeout-s", type=float, default=120.0)
     parser.add_argument(
         "--task", default=os.environ.get("RLINF_TASK_DESCRIPTION", DEFAULT_TASK)
     )
@@ -692,8 +717,14 @@ def main() -> None:
         return
     if not args.enable_policy:
         raise SystemExit("Refusing to open hardware without --enable-policy")
-    if not 1 <= args.port <= 65535 or args.timeout_ms <= 0:
-        raise SystemExit("port and timeout-ms must be positive and valid")
+    if (
+        not 1 <= args.port <= 65535
+        or args.timeout_ms <= 0
+        or args.episode_timeout_s <= 0
+    ):
+        raise SystemExit(
+            "port, timeout-ms, and episode-timeout-s must be positive and valid"
+        )
     if args.enable_pico and (
         not 0.0 < args.pico_control_threshold <= 1.0 or args.pico_ready_timeout_s <= 0.0
     ):
