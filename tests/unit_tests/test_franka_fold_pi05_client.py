@@ -21,6 +21,8 @@ def test_episode_timeout_defaults_to_120_seconds(monkeypatch):
     args = client.parse_args()
 
     assert args.episode_timeout_s == 120.0
+    assert args.base_camera_type == "hikrobot"
+    assert args.base_camera_serial == "DA6135161"
 
 
 def test_episode_timeout_terminates_as_failure(monkeypatch):

@@ -393,7 +393,7 @@ def create_env(args: argparse.Namespace):
         "base_camera_serials": [args.base_camera_serial],
         "left_camera_serials": [args.left_camera_serial],
         "right_camera_serials": [args.right_camera_serial],
-        "base_camera_type": "realsense",
+        "base_camera_type": args.base_camera_type,
         "left_camera_type": "realsense",
         "right_camera_type": "realsense",
         "left_gripper_type": "robotiq",
@@ -504,7 +504,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint-reset-qpos", type=_joint_reset, default=DEFAULT_JOINT_RESET_QPOS)
     parser.add_argument("--left-robot-ip", default="172.16.0.1")
     parser.add_argument("--right-robot-ip", default="172.16.0.2")
-    parser.add_argument("--base-camera-serial", default="327122078534")
+    parser.add_argument("--base-camera-type", default="hikrobot")
+    parser.add_argument("--base-camera-serial", default="DA6135161")
     parser.add_argument("--left-camera-serial", default="261922076829")
     parser.add_argument("--right-camera-serial", default="262322073199")
     parser.add_argument(

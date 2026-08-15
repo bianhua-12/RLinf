@@ -31,6 +31,7 @@ def create_camera(camera_info: CameraInfo) -> BaseCamera:
     * ``"realsense"`` / ``"rs"`` — Intel RealSense (requires ``pyrealsense2``)
     * ``"zed"`` — Stereolabs ZED (requires the ZED SDK / ``pyzed``)
     * ``"lumos"`` — LUMOS V4L2 USB camera (requires ``opencv-python``)
+    * ``"hikrobot"`` / ``"mvs"`` — calibrated Hikrobot fisheye camera
     """
     camera_type = camera_info.camera_type.lower()
     if camera_type == "zed":
@@ -43,6 +44,11 @@ def create_camera(camera_info: CameraInfo) -> BaseCamera:
         from .lumos_camera import LumosCamera
 
         return LumosCamera(camera_info)
+    if camera_type in ("hikrobot", "mvs"):
+        from .hikrobot_camera import HikrobotCamera
+
+        return HikrobotCamera(camera_info)
     raise ValueError(
-        f"Unsupported camera_type={camera_type!r}. Supported types: 'realsense', 'zed', 'lumos'."
+        f"Unsupported camera_type={camera_type!r}. Supported types: "
+        "'realsense', 'zed', 'lumos', 'hikrobot'."
     )

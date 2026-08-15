@@ -24,10 +24,10 @@ cluster:
         configs:
           - left_robot_ip: 172.16.0.1
             right_robot_ip: 172.16.0.2
-            base_camera_serials: ["327122078534"]
+            base_camera_serials: ["DA6135161"]
             left_camera_serials: ["261922076829"]
             right_camera_serials: ["262322073199"]
-            base_camera_type: realsense
+            base_camera_type: hikrobot
             left_camera_type: realsense
             right_camera_type: realsense
             left_gripper_type: robotiq
