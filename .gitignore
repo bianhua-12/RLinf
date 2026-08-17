@@ -25,3 +25,4 @@ PKG-INFO
 .claude/settings.json
 .envrc
 /artifacts
+/*.sh
