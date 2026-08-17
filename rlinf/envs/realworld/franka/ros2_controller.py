@@ -65,7 +65,8 @@ class Ros2ControllerConfig:
     controlled_motion_tolerance: float = 0.03
     controlled_motion_timeout: float = 180.0
     controlled_motion_stable_time: float = 0.5
-    gripper_poll_interval: float = 0.1
+    # Match gripper target application and status polling to the 30 Hz data loop.
+    gripper_poll_interval: float = 1.0 / 30.0
     controller_health_period: float = 0.1
     controller_health_timeout: float = 0.5
     joint_names: list[str] = field(

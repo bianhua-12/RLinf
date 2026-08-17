@@ -218,6 +218,14 @@ def validate_actions(response: dict[str, Any]) -> np.ndarray:
     return actions
 
 
+def _clip_action_chunk(env, actions: np.ndarray) -> np.ndarray:
+    """Clip policy actions before both recording and execution."""
+    return np.ascontiguousarray(
+        np.clip(actions, env.action_space.low, env.action_space.high),
+        dtype=np.float32,
+    )
+
+
 def add_rtc_prefix(
     observation: dict[str, Any], previous_actions: np.ndarray, executed: int, delay: int
 ) -> dict[str, Any]:
@@ -252,7 +260,10 @@ def collection_observation(raw_obs: dict[str, Any], task: str) -> dict[str, Any]
 def run_policy(env, policy: AsyncPi05Client, task: str) -> str:
     """Execute one rolling Training RTC episode at the environment's 30 Hz rate."""
     latest_obs, _ = env.reset()
-    action_chunk = validate_actions(policy.submit(build_observation(latest_obs, task)).result())
+    action_chunk = _clip_action_chunk(
+        env,
+        validate_actions(policy.submit(build_observation(latest_obs, task)).result()),
+    )
     action_index = 0
     episode_step = 0
     delay_history = deque([TRAINING_RTC_MAX_DELAY], maxlen=8)
@@ -277,7 +288,7 @@ def run_policy(env, policy: AsyncPi05Client, task: str) -> str:
             if completed_generation != generation:
                 print("Discarding a pi0.5 response issued before PICO takeover.")
             elif completed_kind == "resume":
-                candidate = validate_actions(response)
+                candidate = _clip_action_chunk(env, validate_actions(response))
                 observed_delay = episode_step - request_start_step
                 if observed_delay > requested_delay:
                     print(
@@ -317,7 +328,7 @@ def run_policy(env, policy: AsyncPi05Client, task: str) -> str:
                         raise RuntimeError(
                             "Pi0.5 server did not confirm the requested RTC delay"
                         )
-                    action_chunk = validate_actions(response)
+                    action_chunk = _clip_action_chunk(env, validate_actions(response))
                     action_index = observed_delay
                     delay_history.append(
                         min(max(observed_delay + 1, 1), TRAINING_RTC_MAX_DELAY)

@@ -88,6 +88,10 @@ class _DelayedFuture:
 class _Env:
     def __init__(self):
         self.steps = 0
+        self.action_space = gym.spaces.Box(
+            -np.ones(client.ACTION_DIM, dtype=np.float32),
+            np.ones(client.ACTION_DIM, dtype=np.float32),
+        )
 
     def reset(self):
         return _observation(), {}
@@ -123,6 +127,20 @@ def test_run_policy_discards_late_rtc_response_and_retries():
     assert len(policy.observations) >= 3
     assert policy.observations[1]["training_rtc_delay_steps"] == 10
     assert policy.observations[2]["training_rtc_delay_steps"] == 10
+
+
+def test_clip_action_chunk_matches_recorded_action_space():
+    env = _Env()
+    actions = np.zeros((client.ACTION_HORIZON, client.ACTION_DIM), dtype=np.float32)
+    actions[:, 7] = 1.027
+    actions[:, 15] = -1.026
+
+    clipped = client._clip_action_chunk(env, actions)
+
+    assert clipped.dtype == np.float32
+    assert clipped.flags.c_contiguous
+    assert np.all(clipped[:, 7] == 1.0)
+    assert np.all(clipped[:, 15] == -1.0)
 
 
 class _TakeoverEnv(_Env):

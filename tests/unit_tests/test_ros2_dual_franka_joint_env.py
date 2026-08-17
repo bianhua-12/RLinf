@@ -15,7 +15,12 @@
 import threading
 from types import SimpleNamespace
 
-from rlinf.envs.realworld.franka.ros2_controller import Ros2DualFrankaBackend
+import pytest
+
+from rlinf.envs.realworld.franka.ros2_controller import (
+    Ros2ControllerConfig,
+    Ros2DualFrankaBackend,
+)
 from rlinf.envs.realworld.franka.tasks.ros2_dual_franka_joint_env import (
     Ros2DualFrankaJointEnv,
 )
@@ -30,6 +35,59 @@ def test_ros2_joint_env_uses_placeholder_reward_for_manual_collection():
 def test_backend_subscribes_to_throttled_joint_states():
     assert Ros2DualFrankaBackend._state_topic("left") == "/left/joint_states"
     assert Ros2DualFrankaBackend._state_topic("right") == "/right/joint_states"
+
+
+def test_robotiq_polling_defaults_to_30_hz():
+    config = Ros2ControllerConfig(
+        left_robot_ip="left",
+        right_robot_ip="right",
+        left_gripper_type="robotiq",
+        right_gripper_type="robotiq",
+        left_gripper_connection="left-port",
+        right_gripper_connection="right-port",
+    )
+
+    assert config.gripper_poll_interval == 1.0 / 30.0
+
+
+def test_observation_deadline_subtracts_previous_post_read_work(monkeypatch):
+    env = object.__new__(Ros2DualFrankaJointEnv)
+    env.config = SimpleNamespace(step_frequency=30.0)
+    env._step_deadline = 0.0
+    sleeps = []
+    times = iter([0.002, 1.0 / 30.0 + 0.002])
+    monkeypatch.setattr(
+        "rlinf.envs.realworld.franka.dual_franka_env.time.perf_counter",
+        lambda: next(times),
+    )
+    monkeypatch.setattr(
+        "rlinf.envs.realworld.franka.dual_franka_env.time.sleep", sleeps.append
+    )
+
+    env._wait_for_observation_deadline()
+    env._wait_for_observation_deadline()
+
+    assert sleeps == pytest.approx([1.0 / 30.0 - 0.002] * 2)
+
+
+def test_observation_deadline_reanchors_after_overrun(monkeypatch):
+    env = object.__new__(Ros2DualFrankaJointEnv)
+    env.config = SimpleNamespace(step_frequency=30.0)
+    env._step_deadline = 0.0
+    sleeps = []
+    times = iter([0.1, 0.102])
+    monkeypatch.setattr(
+        "rlinf.envs.realworld.franka.dual_franka_env.time.perf_counter",
+        lambda: next(times),
+    )
+    monkeypatch.setattr(
+        "rlinf.envs.realworld.franka.dual_franka_env.time.sleep", sleeps.append
+    )
+
+    env._wait_for_observation_deadline()
+    env._wait_for_observation_deadline()
+
+    assert sleeps == pytest.approx([1.0 / 30.0 - 0.002])
 
 
 def test_go_to_rest_waits_for_both_arms(monkeypatch):
