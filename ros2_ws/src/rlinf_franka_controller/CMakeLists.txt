@@ -7,6 +7,7 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 find_package(ament_cmake REQUIRED)
 find_package(controller_interface REQUIRED)
+find_package(controller_manager REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(franka_example_controllers REQUIRED)
 find_package(pluginlib REQUIRED)
@@ -29,11 +30,33 @@ ament_target_dependencies(${PROJECT_NAME}
   sensor_msgs
 )
 
+add_executable(robot_driven_control_node
+  src/robot_driven_control_node.cpp
+)
+target_link_libraries(robot_driven_control_node
+  controller_manager::controller_manager
+)
+ament_target_dependencies(robot_driven_control_node
+  rclcpp
+  realtime_tools
+)
+
 pluginlib_export_plugin_description_file(
   controller_interface rlinf_franka_controller.xml
 )
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(
+    test_single_fr3_launch
+    test/test_single_fr3_launch.py
+  )
+endif()
+
 install(TARGETS ${PROJECT_NAME} LIBRARY DESTINATION lib)
+install(TARGETS robot_driven_control_node
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
 install(DIRECTORY include/ DESTINATION include)
 install(
   DIRECTORY config launch

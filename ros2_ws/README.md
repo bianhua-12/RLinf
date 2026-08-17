@@ -14,3 +14,17 @@ source install/setup.bash
 
 The collector launches `single_fr3.launch.py` itself. Do not launch this
 controller separately while collecting data.
+
+For real Franka hardware, this launch file uses RLinf's
+`robot_driven_control_node`. Franka's blocking 1 kHz read supplies the control
+loop timing, so the node does not add the fixed-rate sleep used by the stock
+`ros2_control_node`. Fake hardware keeps the fixed-rate sleep because it has no
+blocking robot read.
+
+Verify the complete launch path without connecting to a robot:
+
+```bash
+ros2 launch rlinf_franka_controller single_fr3.launch.py \
+  robot_ip:=127.0.0.1 namespace:=smoke arm_prefix:=smoke \
+  use_fake_hardware:=true
+```
