@@ -72,6 +72,7 @@ class LeRobotDatasetWriter:
         extra_view_image_keys: dict[str, tuple[int, ...]] | None = None,
         has_intervene_flag: bool = True,
         has_segment_id: bool = False,
+        has_observation_timestamp: bool = False,
         use_videos: bool = False,
     ) -> None:
         """
@@ -100,6 +101,9 @@ class LeRobotDatasetWriter:
             has_segment_id: Whether to include per-frame ``segment_id``
                 (uint8, shape ``(1,)``) in auto-generated features. Used for
                 in-episode sub-task boundaries set by KeyboardStartEndWrapper.
+            has_observation_timestamp: Whether to include the monotonic
+                ``observation_timestamp_ns`` (int64, shape ``(1,)``) captured
+                when the observation was received.
             use_videos: Whether to encode camera features as MP4 videos.
 
         """
@@ -147,6 +151,12 @@ class LeRobotDatasetWriter:
                     "shape": (1,),
                     "names": ["segment_id"],
                 }
+            if has_observation_timestamp:
+                features["observation_timestamp_ns"] = {
+                    "dtype": "int64",
+                    "shape": (1,),
+                    "names": ["observation_timestamp_ns"],
+                }
             if has_image:
                 features["image"] = {
                     "dtype": camera_dtype,
@@ -187,6 +197,7 @@ class LeRobotDatasetWriter:
                 - actions: np.ndarray [action_dim]
                 - task: str (task instruction)
                 - intervene_flag: np.ndarray [1] of bool (optional; matches schema)
+                - observation_timestamp_ns: np.ndarray [1] of int64 (optional)
                 - Any other fields defined in the features schema
 
         The frames will be automatically processed to include both the original

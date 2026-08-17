@@ -34,6 +34,8 @@ class GelloJointExpert:
         port: Serial port of the GELLO device.
     """
 
+    POLL_PERIOD_S = 1.0 / 50.0
+
     def __init__(
         self,
         port: str | None = None,
@@ -112,7 +114,7 @@ class GelloJointExpert:
                 time.sleep(backoff)
                 continue
 
-            time.sleep(0.001)
+            time.sleep(self.POLL_PERIOD_S)
 
     def close(self) -> None:
         """Stop the background read loop."""

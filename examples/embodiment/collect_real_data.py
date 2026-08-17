@@ -106,6 +106,7 @@ class DataCollector(Worker):
             seed_offset=0,
             total_num_processes=1,
             worker_info=self.worker_info,
+            return_numpy=True,
         )
         self._hardware_env = self.env
         try:
@@ -134,6 +135,8 @@ class DataCollector(Worker):
                 only_success=dc_cfg.get("only_success", False),
                 finalize_interval=dc_cfg.get("finalize_interval", 100),
                 resume=bool(dc_cfg.get("resume", False)),
+                # RealWorldEnv allocates fresh observation arrays on every step.
+                copy_observations=False,
             )
             self._preexisting_success = int(
                 getattr(self.env, "preexisting_episode_count", 0)
@@ -183,6 +186,17 @@ class DataCollector(Worker):
                 ret_obs[key] = val.clone()
         return ret_obs
 
+    def _wait_for_step_deadline(self, next_deadline: float) -> float:
+        """Wait for an absolute deadline so scheduler oversleep does not drift."""
+        if self._target_step_period is None:
+            return next_deadline
+
+        next_deadline += self._target_step_period
+        sleep_for = next_deadline - time.perf_counter()
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        return next_deadline
+
     def run(self):
         try:
             self._run_collection()
@@ -210,14 +224,16 @@ class DataCollector(Worker):
             desc="Collecting Data Episodes:",
         )
 
-        current_rollout = EmbodiedTrajectoryBuilder(
-            max_episode_length=self.cfg.env.eval.max_episode_steps,
-        )
+        current_rollout = None
+        current_obs_processed = None
+        if self.save_demos:
+            current_rollout = EmbodiedTrajectoryBuilder(
+                max_episode_length=self.cfg.env.eval.max_episode_steps,
+            )
+            current_obs_processed = self._process_obs(obs)
 
-        current_obs_processed = self._process_obs(obs)
-
+        next_step_deadline = time.perf_counter()
         while success_cnt < self.num_data_episodes:
-            iter_start = time.perf_counter()
             # Teleop wrapper overrides this via info["intervene_action"].
             action = np.zeros((1, self.action_dim))
             next_obs, reward, terminated, truncated, info = self.env.step(action)
@@ -231,38 +247,45 @@ class DataCollector(Worker):
             if "intervene_action" in info:
                 action = info["intervene_action"]
 
-            next_obs_processed = self._process_obs(next_obs)
+            done = bool((terminated | truncated).any().item())
 
-            terminated_tensor = terminated.unsqueeze(1)
-            truncated_tensor = truncated.unsqueeze(1)
-            done_tensor = terminated_tensor | truncated_tensor
-            done = bool(done_tensor.any().item())
-
-            action_tensor = torch.as_tensor(action, dtype=torch.float32)
-            reward_tensor = reward.float().unsqueeze(1)
-
-            step_result = ChunkStepResult(
-                actions=action_tensor,
-                rewards=reward_tensor,
-                dones=done_tensor,
-                terminations=terminated_tensor,
-                truncations=truncated_tensor,
-                forward_inputs={"action": action_tensor},
-            )
-
-            # Rebuild rollout on rec-start or abort; ``restart`` kept for older wrappers.
-            if kb_event in ("start", "restart", "abort"):
-                current_rollout = EmbodiedTrajectoryBuilder(
-                    max_episode_length=self.cfg.env.eval.max_episode_steps,
+            if self.save_demos:
+                next_obs_processed = self._process_obs(next_obs)
+                terminated_tensor = torch.as_tensor(
+                    terminated, dtype=torch.bool
+                ).unsqueeze(1)
+                truncated_tensor = torch.as_tensor(
+                    truncated, dtype=torch.bool
+                ).unsqueeze(1)
+                done_tensor = terminated_tensor | truncated_tensor
+                action_tensor = torch.as_tensor(action, dtype=torch.float32)
+                reward_tensor = torch.as_tensor(reward, dtype=torch.float32).unsqueeze(
+                    1
                 )
-            if kb_event != "start" and kb_phase in (None, "rec"):
-                current_rollout.append_step_result(step_result)
-                current_rollout.append_transitions(
-                    curr_obs=current_obs_processed, next_obs=next_obs_processed
+                step_result = ChunkStepResult(
+                    actions=action_tensor,
+                    rewards=reward_tensor,
+                    dones=done_tensor,
+                    terminations=terminated_tensor,
+                    truncations=truncated_tensor,
+                    forward_inputs={"action": action_tensor},
                 )
+
+                # Rebuild rollout on rec-start or abort; ``restart`` supports
+                # older keyboard wrappers.
+                if kb_event in ("start", "restart", "abort"):
+                    current_rollout = EmbodiedTrajectoryBuilder(
+                        max_episode_length=self.cfg.env.eval.max_episode_steps,
+                    )
+                if kb_event != "start" and kb_phase in (None, "rec"):
+                    current_rollout.append_step_result(step_result)
+                    current_rollout.append_transitions(
+                        curr_obs=current_obs_processed,
+                        next_obs=next_obs_processed,
+                    )
+                current_obs_processed = next_obs_processed
 
             obs = next_obs
-            current_obs_processed = next_obs_processed
 
             if done:
                 r_val = (
@@ -270,7 +293,7 @@ class DataCollector(Worker):
                     if hasattr(reward, "__getitem__") and len(reward) > 0
                     else reward
                 )
-                if isinstance(r_val, torch.Tensor):
+                if hasattr(r_val, "item"):
                     r_val = r_val.item()
 
                 manual_done = False
@@ -311,17 +334,15 @@ class DataCollector(Worker):
 
                 if success_cnt < self.num_data_episodes:
                     obs, _ = self.env.reset()
-                    current_obs_processed = self._process_obs(obs)
-                    current_rollout = EmbodiedTrajectoryBuilder(
-                        max_episode_length=self.cfg.env.eval.max_episode_steps,
-                    )
+                    next_step_deadline = time.perf_counter()
+                    if self.save_demos:
+                        current_obs_processed = self._process_obs(obs)
+                        current_rollout = EmbodiedTrajectoryBuilder(
+                            max_episode_length=self.cfg.env.eval.max_episode_steps,
+                        )
 
-            # Pin loop period; on ``done`` env.reset usually exceeds it → sleep_for≤0 no-ops.
-            if self._target_step_period is not None:
-                elapsed = time.perf_counter() - iter_start
-                sleep_for = self._target_step_period - elapsed
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
+            if success_cnt < self.num_data_episodes:
+                next_step_deadline = self._wait_for_step_deadline(next_step_deadline)
 
         if self.save_demos:
             self.log_info(

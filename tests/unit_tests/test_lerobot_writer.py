@@ -53,6 +53,7 @@ def test_auto_generated_camera_features_follow_config(use_videos, expected_dtype
                 "extra_view_image-0": (224, 224, 3),
                 "extra_view_image-1": (224, 224, 3),
             },
+            has_observation_timestamp=True,
             use_videos=use_videos,
         )
 
@@ -64,4 +65,9 @@ def test_auto_generated_camera_features_follow_config(use_videos, expected_dtype
         "extra_view_image-1",
     ]
     assert all(features[key]["dtype"] == expected_dtype for key in camera_keys)
+    assert features["observation_timestamp_ns"] == {
+        "dtype": "int64",
+        "shape": (1,),
+        "names": ["observation_timestamp_ns"],
+    }
     assert dataset_cls.create.call_args.kwargs["use_videos"] is use_videos

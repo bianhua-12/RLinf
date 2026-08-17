@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#     https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,6 +15,7 @@
 import queue
 
 from rlinf.envs.realworld.common.video_player import video_player
+from rlinf.envs.realworld.common.video_player.video_player import VideoPlayer
 
 
 class _EmptyThenStopQueue:
@@ -39,3 +40,14 @@ def test_video_player_processes_events_while_waiting(monkeypatch):
     player._play()
 
     assert wait_key_calls == [1]
+
+
+def test_video_player_keeps_only_the_latest_pending_frame():
+    player = VideoPlayer(enable=False)
+    player.is_running = True
+
+    player.put_frame("old")
+    player.put_frame("new")
+
+    assert player.queue.qsize() == 1
+    assert player.queue.get_nowait() == "new"

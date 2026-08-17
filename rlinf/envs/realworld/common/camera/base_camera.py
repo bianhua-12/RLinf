@@ -14,7 +14,6 @@
 
 import queue
 import threading
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
@@ -87,7 +86,6 @@ class BaseCamera(ABC):
 
     def _capture_frames(self):
         while self._frame_capturing_start:
-            time.sleep(1 / self._camera_info.fps)
             try:
                 has_frame, frame = self._read_frame()
             except Exception as e:

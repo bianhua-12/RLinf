@@ -20,6 +20,7 @@ import json
 import os
 import pickle
 import re
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
 from typing import Any, Optional
@@ -105,6 +106,10 @@ class CollectEpisode(gym.Wrapper):
             (N = sum of episodes across pre-existing shards) so the in-progress
             write never touches previously-finalized data. Ignored for pickle.
             Defaults to False.
+        copy_observations: Whether to deep-copy observations before buffering.
+            Set to False only when the wrapped environment returns newly
+            allocated tensors or arrays on every reset and step. Defaults to
+            True.
     """
 
     def __init__(
@@ -121,6 +126,7 @@ class CollectEpisode(gym.Wrapper):
         only_success: bool = False,
         finalize_interval: int = 100,
         resume: bool = False,
+        copy_observations: bool = True,
     ):
         if isinstance(env, gym.Env):
             super().__init__(env)
@@ -132,7 +138,6 @@ class CollectEpisode(gym.Wrapper):
                 f"Unsupported export_format={export_format!r}, "
                 f"expected one of {_VALID_FORMATS}"
             )
-
         self.save_dir = save_dir
         self.rank = rank
         self.num_envs = num_envs
@@ -143,6 +148,7 @@ class CollectEpisode(gym.Wrapper):
         self.use_videos = use_videos
         self.only_success = only_success
         self.finalize_interval = finalize_interval
+        self.copy_observations = copy_observations
 
         self._preexisting_episode_count = 0
         self._next_shard_id = 0
@@ -222,7 +228,7 @@ class CollectEpisode(gym.Wrapper):
             obs, info = self.env.reset()
 
         self._show_goal_site_visual()
-        self._record_reset_obs(obs)
+        self._record_reset_obs(obs, info)
         return obs, info
 
     def step(self, action, **kwargs):
@@ -315,26 +321,41 @@ class CollectEpisode(gym.Wrapper):
             "truncated": [],
             "infos": [],
             "segment_ids": [],
+            "observation_timestamps_ns": [],
         }
 
-    def _seed_reset_frame(self, env_idx: int, env_obs: Any) -> None:
+    def _seed_reset_frame(
+        self,
+        env_idx: int,
+        env_obs: Any,
+        observation_timestamp_ns: int,
+        env_info: Any = None,
+    ) -> None:
         """Seed a fresh buffer with the post-reset state-aligned entry.
 
         State-aligned fields (observations / rewards / terminated / truncated /
-        infos) get a leading reset entry; action-aligned fields (actions,
-        segment_ids) stay empty and fill on the first regular step.
+        infos / observation timestamps) get a leading reset entry;
+        action-aligned fields (actions, segment_ids) stay empty and fill on the
+        first regular step.
         """
         buf = self._buffers[env_idx]
         buf["observations"].append(env_obs)
         buf["rewards"].append(0.0)
         buf["terminated"].append(False)
         buf["truncated"].append(False)
-        buf["infos"].append({})
+        buf["infos"].append(env_info if env_info is not None else {})
+        buf["observation_timestamps_ns"].append(observation_timestamp_ns)
 
-    def _record_reset_obs(self, obs) -> None:
+    def _record_reset_obs(self, obs, info) -> None:
         """Record the initial observation from reset into every env's buffer."""
         for env_idx in range(self.num_envs):
-            self._seed_reset_frame(env_idx, self._slice_copy(obs, env_idx))
+            env_info = self._slice_copy(info, env_idx)
+            self._seed_reset_frame(
+                env_idx,
+                self._slice_observation(obs, env_idx),
+                self._observation_timestamp_ns(env_info),
+                env_info,
+            )
 
     @staticmethod
     def _bool_from_env_info(env_info: Any, key: str) -> bool:
@@ -351,9 +372,11 @@ class CollectEpisode(gym.Wrapper):
         if has_final_obs:
             final_observation = info["final_observation"]
             final_info_batch = info["final_info"]
-            info_no_reset = copy.deepcopy(info)
-            info_no_reset.pop("final_observation")
-            info_no_reset.pop("final_info")
+            info_no_reset = {
+                key: value
+                for key, value in info.items()
+                if key not in ("final_observation", "final_info")
+            }
 
         for env_idx in range(self.num_envs):
             # Auto-reset envs store the pre-reset obs in info["final_observation"];
@@ -363,31 +386,41 @@ class CollectEpisode(gym.Wrapper):
                 truncated, env_idx
             )
             if has_final_obs and env_done:
-                env_obs = self._slice_copy(final_observation, env_idx)
-                env_info = self._slice_copy(final_info_batch, env_idx)
-                self._pending_obs[env_idx] = self._slice_copy(obs, env_idx)
+                obs_source = final_observation
+                info_source = final_info_batch
+            else:
+                obs_source = obs
+                info_source = info_no_reset if has_final_obs else info
+
+            # Inspect the small info structure before taking ownership of image
+            # observations. Pre-record frames must not enter the data buffer.
+            env_info_view = self._slice_data(info_source, env_idx)
+            record_reset = self._bool_from_env_info(env_info_view, "record_reset")
+            pre_record = self._bool_from_env_info(env_info_view, "pre_record")
+
+            if pre_record:
+                continue
+
+            env_info = self._slice_copy(info_source, env_idx)
+            env_obs = self._slice_observation(obs_source, env_idx)
+
+            if has_final_obs and env_done:
+                self._pending_obs[env_idx] = self._slice_observation(obs, env_idx)
                 self._pending_info[env_idx] = self._slice_copy(info_no_reset, env_idx)
                 if "intervene_action" in env_info:
                     env_info["intervene_action"] = env_info["intervene_action"][-1]
                     env_info["intervene_flag"] = env_info["intervene_flag"][-1]
-            else:
-                env_obs = self._slice_copy(obs, env_idx)
-                env_info = self._slice_copy(info, env_idx)
-                if "final_observation" in env_info:
-                    env_info.pop("final_observation")
-                    env_info.pop("final_info")
-
-            record_reset = self._bool_from_env_info(env_info, "record_reset")
-            pre_record = self._bool_from_env_info(env_info, "pre_record")
 
             if record_reset:
                 self._buffers[env_idx] = self._new_buffer()
                 self._episode_success[env_idx] = False
                 self._segment_ids[env_idx] = 0
-                self._seed_reset_frame(env_idx, env_obs)
-                continue
-
-            if pre_record:
+                self._seed_reset_frame(
+                    env_idx,
+                    env_obs,
+                    self._observation_timestamp_ns(env_info),
+                    env_info,
+                )
                 continue
 
             if self._bool_from_env_info(env_info, "segment_advance"):
@@ -401,8 +434,11 @@ class CollectEpisode(gym.Wrapper):
             buf["truncated"].append(self._slice_copy(truncated, env_idx))
             buf["infos"].append(env_info)
             buf["segment_ids"].append(int(self._segment_ids[env_idx]))
+            buf["observation_timestamps_ns"].append(
+                self._observation_timestamp_ns(env_info)
+            )
 
-            self._update_success(env_idx, self._slice_data(env_info, env_idx))
+            self._update_success(env_idx, env_info)
 
     def _reset_env_buffer(self, env_idx: int) -> None:
         """Advance episode counter, clear the buffer, and carry over pending obs."""
@@ -412,25 +448,25 @@ class CollectEpisode(gym.Wrapper):
         self._segment_ids[env_idx] = 0
 
         if self._pending_obs[env_idx] is not None:
-            self._buffers[env_idx]["observations"].append(self._pending_obs[env_idx])
+            pending_info = self._pending_info[env_idx]
+            self._seed_reset_frame(
+                env_idx,
+                self._pending_obs[env_idx],
+                self._observation_timestamp_ns(pending_info),
+                pending_info,
+            )
             self._pending_obs[env_idx] = None
-
-            if self._pending_info[env_idx] is not None:
-                self._buffers[env_idx]["infos"].append(self._pending_info[env_idx])
-                self._pending_info[env_idx] = None
-            else:
-                self._buffers[env_idx]["infos"].append({})
-
-            self._buffers[env_idx]["rewards"].append(0.0)
-            self._buffers[env_idx]["terminated"].append(False)
-            self._buffers[env_idx]["truncated"].append(False)
+            self._pending_info[env_idx] = None
 
     def _maybe_flush(self, terminated, truncated) -> None:
         """Save finished episodes and reset their buffers."""
         for env_idx in range(self.num_envs):
-            is_success = self._get_episode_success(self._buffers[env_idx], env_idx)
             done_by_term = self._scalar_flag(terminated, env_idx)
             done_by_trunc = self._scalar_flag(truncated, env_idx)
+            if not (done_by_term or done_by_trunc):
+                continue
+
+            is_success = self._get_episode_success(self._buffers[env_idx], env_idx)
             if self.only_success:
                 if is_success and done_by_term:
                     self._flush_episode(env_idx, is_success)
@@ -468,6 +504,7 @@ class CollectEpisode(gym.Wrapper):
                     "terminated": buf["terminated"],
                     "truncated": buf["truncated"],
                     "infos": buf["infos"],
+                    "observation_timestamps_ns": buf["observation_timestamps_ns"],
                 }
             )
             label = "success" if is_success else "fail"
@@ -488,8 +525,8 @@ class CollectEpisode(gym.Wrapper):
         Produces the format expected by ``LeRobotDatasetWriter.add_episode``:
         a ``list[dict]`` where every dict represents one step and carries the
         fields ``image``, ``state``, ``actions``, ``task``, ``is_success``,
-        ``done``, ``intervene_flag``, and optionally ``wrist_image`` /
-        ``extra_view_image``.
+        ``done``, ``intervene_flag``, ``observation_timestamp_ns``, and
+        optionally ``wrist_image`` / ``extra_view_image``.
         The observations list contains one extra entry prepended at reset time,
         so it is aligned to the actions list by taking the leading N entries.
         Steps where any required field (image, state, action) is missing are
@@ -505,6 +542,7 @@ class CollectEpisode(gym.Wrapper):
         actions = buf["actions"]
         terminated = buf["terminated"]
         obs_steps = buf["observations"]
+        observation_timestamps_ns = buf.get("observation_timestamps_ns", [])
         seg_ids = buf.get("segment_ids", [])
         if not actions:
             return None
@@ -552,6 +590,10 @@ class CollectEpisode(gym.Wrapper):
                 "intervene_flag": np.array([intervene_flag], dtype=bool),
                 "segment_id": np.array([seg_id], dtype=np.uint8),
             }
+            if i < len(observation_timestamps_ns):
+                frame["observation_timestamp_ns"] = np.array(
+                    [observation_timestamps_ns[i]], dtype=np.int64
+                )
             if image is not None:
                 frame["image"] = self._to_uint8(np.asarray(image))
             for key, img in self._expand_multi_view_images(
@@ -598,6 +640,7 @@ class CollectEpisode(gym.Wrapper):
                 extra_view_image_keys=extra_view_image_keys,
                 has_intervene_flag="intervene_flag" in first,
                 has_segment_id="segment_id" in first,
+                has_observation_timestamp="observation_timestamp_ns" in first,
                 use_videos=self.use_videos,
             )
             self._next_shard_id = shard_id + 1
@@ -844,6 +887,39 @@ class CollectEpisode(gym.Wrapper):
     def _slice_copy(self, data, env_idx: int):
         """Slice batched data for a single env and deep-copy the result."""
         return self._copy(self._slice_data(data, env_idx))
+
+    def _slice_observation(self, data, env_idx: int):
+        """Slice an observation and either copy it or take shared ownership."""
+        sliced = self._slice_data(data, env_idx)
+        if self.copy_observations:
+            return self._copy(sliced)
+        return self._own_observation(sliced)
+
+    def _own_observation(self, data):
+        """Copy containers while retaining fresh CPU tensor and array storage."""
+        if isinstance(data, torch.Tensor):
+            detached = data.detach()
+            return detached.cpu() if detached.device.type != "cpu" else detached
+        if isinstance(data, np.ndarray):
+            return data
+        if isinstance(data, dict):
+            return {key: self._own_observation(value) for key, value in data.items()}
+        if isinstance(data, list):
+            return [self._own_observation(value) for value in data]
+        if isinstance(data, tuple):
+            return tuple(self._own_observation(value) for value in data)
+        return data
+
+    @staticmethod
+    def _observation_timestamp_ns(env_info: Any) -> int:
+        """Extract a monotonic observation timestamp, with a local fallback."""
+        if isinstance(env_info, dict):
+            value = env_info.get("observation_timestamp_ns")
+            if value is not None:
+                array = CollectEpisode._to_numpy(value)
+                if array is not None and array.size:
+                    return int(array.reshape(-1)[0])
+        return time.monotonic_ns()
 
     def _scalar_flag(self, flags, env_idx: int) -> bool:
         """Extract a boolean flag for ``env_idx`` from a batched flag."""

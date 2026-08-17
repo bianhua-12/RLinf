@@ -5,9 +5,16 @@
 # You may obtain a copy of the License at
 #
 #     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import math
 from types import SimpleNamespace
+from unittest.mock import MagicMock, call
 
 from rlinf.envs.realworld.common.camera import CameraInfo, create_camera
 from rlinf.envs.realworld.common.camera.base_camera import BaseCamera
@@ -68,3 +75,26 @@ def test_hikrobot_enables_continuous_auto_features():
         ("GainAuto", "Continuous"),
         ("BalanceWhiteAuto", "Continuous"),
     ]
+
+
+def test_configure_frame_rate_enables_limit_and_reads_result():
+    camera = HikrobotCamera.__new__(HikrobotCamera)
+    camera._sdk = SimpleNamespace(
+        MV_OK=0,
+        MVCC_FLOATVALUE=lambda: SimpleNamespace(fCurValue=29.97),
+    )
+    camera._camera = MagicMock()
+    camera._camera.MV_CC_SetBoolValue.return_value = 0
+    camera._camera.MV_CC_SetFloatValue.return_value = 0
+    camera._camera.MV_CC_GetFloatValue.return_value = 0
+
+    camera._configure_frame_rate(30)
+
+    assert camera._camera.method_calls == [
+        call.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", True),
+        call.MV_CC_SetFloatValue("AcquisitionFrameRate", 30),
+        call.MV_CC_GetFloatValue(
+            "ResultingFrameRate", camera._camera.MV_CC_GetFloatValue.call_args.args[1]
+        ),
+    ]
+    assert camera._resulting_frame_rate == 29.97

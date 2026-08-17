@@ -23,7 +23,7 @@ import numpy as np
 
 class VideoPlayer:
     def __init__(self, enable: bool = True):
-        self.queue = queue.Queue()
+        self.queue = queue.Queue(maxsize=1)
         self.is_running = False
         if not enable:
             return
@@ -32,14 +32,33 @@ class VideoPlayer:
 
     def put_frame(self, frame):
         if self.is_running:
-            self.queue.put(frame)
+            self._put_latest(frame)
+
+    def _put_latest(self, frame):
+        try:
+            self.queue.put_nowait(frame)
+            return
+        except queue.Full:
+            pass
+
+        try:
+            self.queue.get_nowait()
+        except queue.Empty:
+            pass
+
+        try:
+            self.queue.put_nowait(frame)
+        except queue.Full:
+            # The consumer raced with us and another producer won. The queue
+            # still contains a newer frame, which is the desired outcome.
+            pass
 
     def stop(self):
         if not hasattr(self, "_run_thread"):
             return
-        self.queue.put(None)
-        self._run_thread.join()
         self.is_running = False
+        self._put_latest(None)
+        self._run_thread.join()
 
     def _play(self):
         if os.environ.get("DISPLAY") is None:

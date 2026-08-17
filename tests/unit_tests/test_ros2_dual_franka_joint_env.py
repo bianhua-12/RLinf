@@ -27,6 +27,11 @@ def test_ros2_joint_env_uses_placeholder_reward_for_manual_collection():
     assert env._calc_step_reward([True, True]) == 0.0
 
 
+def test_backend_subscribes_to_throttled_joint_states():
+    assert Ros2DualFrankaBackend._state_topic("left") == "/left/joint_states"
+    assert Ros2DualFrankaBackend._state_topic("right") == "/right/joint_states"
+
+
 def test_go_to_rest_waits_for_both_arms(monkeypatch):
     events = []
 

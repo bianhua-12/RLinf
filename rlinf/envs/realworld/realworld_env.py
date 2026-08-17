@@ -32,7 +32,15 @@ from rlinf.scheduler import WorkerInfo
 
 
 class RealWorldEnv(gym.Env):
-    def __init__(self, cfg, num_envs, seed_offset, total_num_processes, worker_info):
+    def __init__(
+        self,
+        cfg,
+        num_envs,
+        seed_offset,
+        total_num_processes,
+        worker_info,
+        return_numpy: bool = False,
+    ):
         assert num_envs == 1, (
             f"Currently, only 1 realworld env can be started per worker, but {num_envs=} is received."
         )
@@ -57,6 +65,7 @@ class RealWorldEnv(gym.Env):
         self.manual_episode_control_only = bool(
             self.override_cfg.get("manual_episode_control_only", False)
         )
+        self.return_numpy = return_numpy
 
         self._init_env()
 
@@ -110,7 +119,7 @@ class RealWorldEnv(gym.Env):
             partial(self._create_env, env_idx=env_idx)
             for env_idx in range(self.num_envs)
         ]
-        self.env = NoAutoResetSyncVectorEnv(env_fns)
+        self.env = NoAutoResetSyncVectorEnv(env_fns, copy=not self.return_numpy)
         self.task_descriptions = list(
             self.env.call("get_wrapper_attr", "task_description")
         )
@@ -186,17 +195,24 @@ class RealWorldEnv(gym.Env):
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
-        episode_info["intervened_once"] = self.intervened_once
-        episode_info["intervened_steps"] = self.intervened_steps
+        episode_info["intervened_once"] = self.intervened_once.copy()
+        episode_info["intervened_steps"] = self.intervened_steps.copy()
         episode_info["success_no_intervened"] = self.success_once.copy() & (
             ~self.intervened_once
         )
-        infos["episode"] = to_tensor(episode_info)
+        infos["episode"] = (
+            episode_info if self.return_numpy else to_tensor(episode_info)
+        )
         return infos
+
+    def _format_output(self, value):
+        """Keep collection outputs in NumPy while preserving the default API."""
+        return value if self.return_numpy else to_tensor(value)
 
     def reset(self, *, reset_state_ids=None, seed=None, options=None, env_idx=None):
         # TODO: handle partial reset
         raw_obs, infos = self.env.reset(seed=seed, options=options)
+        self._stamp_observation_info(infos)
 
         extracted_obs = self._wrap_obs(raw_obs)
         if env_idx is not None:
@@ -204,6 +220,12 @@ class RealWorldEnv(gym.Env):
         else:
             self._reset_metrics()
         return extracted_obs, infos
+
+    def _stamp_observation_info(self, infos):
+        """Attach the monotonic time at which a camera observation was received."""
+        infos["observation_timestamp_ns"] = np.full(
+            self.num_envs, time.monotonic_ns(), dtype=np.int64
+        )
 
     def _wrap_obs(self, raw_obs):
         """
@@ -220,14 +242,18 @@ class RealWorldEnv(gym.Env):
             raise KeyError(
                 f"main_image_key {self.main_image_key!r} not in {list(frames)}"
             )
-        obs["main_images"] = frames[self.main_image_key]
+        main_images = frames[self.main_image_key]
+        # The copy=False vector buffer is reused on the next step. Collection
+        # keeps observations for the full episode, so take ownership once here.
+        obs["main_images"] = main_images.copy() if self.return_numpy else main_images
         raw_images = OrderedDict(sorted(frames.items()))
         raw_images.pop(self.main_image_key)
 
         if raw_images:
             obs["extra_view_images"] = np.stack(list(raw_images.values()), axis=1)
 
-        obs = to_tensor(obs)
+        if not self.return_numpy:
+            obs = to_tensor(obs)
         obs["task_descriptions"] = self.task_descriptions
         return obs
 
@@ -237,6 +263,7 @@ class RealWorldEnv(gym.Env):
 
         self._elapsed_steps += 1
         raw_obs, _reward, terminations, truncations, infos = self.env.step(actions)
+        self._stamp_observation_info(infos)
         # max_episode_steps: null → external wrapper owns episode end.
         if self.cfg.max_episode_steps is None:
             timeout_truncations = np.zeros_like(truncations, dtype=bool)
@@ -262,7 +289,9 @@ class RealWorldEnv(gym.Env):
             infos,
         )
         if self.ignore_terminations:
-            infos["episode"]["success_at_end"] = to_tensor(terminations)
+            infos["episode"]["success_at_end"] = self._format_output(
+                terminations.copy()
+            )
             terminations[:] = False
 
         intervene_action = np.zeros_like(actions)
@@ -271,11 +300,11 @@ class RealWorldEnv(gym.Env):
                 env_intervene_action = infos["intervene_action"][env_id]
                 if env_intervene_action is not None:
                     intervene_action[env_id] = env_intervene_action.copy()
-        infos["intervene_action"] = to_tensor(intervene_action)
-        infos["intervene_flag"] = to_tensor(intervene_flag)
+        infos["intervene_action"] = self._format_output(intervene_action)
+        infos["intervene_flag"] = self._format_output(intervene_flag)
         if "rlt_switch_flags" in infos:
-            infos["rlt_switch_flags"] = to_tensor(
-                np.asarray(infos["rlt_switch_flags"], dtype=bool)
+            infos["rlt_switch_flags"] = self._format_output(
+                np.asarray(infos["rlt_switch_flags"], dtype=bool).copy()
             )
 
         dones = terminations | truncations
@@ -284,9 +313,9 @@ class RealWorldEnv(gym.Env):
             obs, infos = self._handle_auto_reset(dones, obs, infos)
         return (
             obs,
-            to_tensor(step_reward),
-            to_tensor(terminations),
-            to_tensor(truncations),
+            self._format_output(step_reward),
+            self._format_output(terminations),
+            self._format_output(truncations),
             infos,
         )
 
@@ -321,45 +350,55 @@ class RealWorldEnv(gym.Env):
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
 
-        chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
-        raw_chunk_terminations = torch.stack(
-            raw_chunk_terminations, dim=1
-        )  # [num_envs, chunk_steps]
-        raw_chunk_truncations = torch.stack(
-            raw_chunk_truncations, dim=1
-        )  # [num_envs, chunk_steps]
-
-        past_terminations = raw_chunk_terminations.any(dim=1)
-        past_truncations = raw_chunk_truncations.any(dim=1)
-        past_dones = torch.logical_or(past_terminations, past_truncations)
+        if self.return_numpy:
+            stack = partial(np.stack, axis=1)
+            chunk_rewards = stack(chunk_rewards)
+            raw_chunk_terminations = stack(raw_chunk_terminations)
+            raw_chunk_truncations = stack(raw_chunk_truncations)
+            past_terminations = raw_chunk_terminations.any(axis=1)
+            past_truncations = raw_chunk_truncations.any(axis=1)
+            past_dones = np.logical_or(past_terminations, past_truncations)
+        else:
+            stack = partial(torch.stack, dim=1)
+            chunk_rewards = stack(chunk_rewards)
+            raw_chunk_terminations = stack(raw_chunk_terminations)
+            raw_chunk_truncations = stack(raw_chunk_truncations)
+            past_terminations = raw_chunk_terminations.any(dim=1)
+            past_truncations = raw_chunk_truncations.any(dim=1)
+            past_dones = torch.logical_or(past_terminations, past_truncations)
 
         infos_last = infos_list[-1] if infos_list else {}
         if raw_chunk_intervene_actions:
-            infos_last["intervene_action"] = torch.stack(
-                raw_chunk_intervene_actions, dim=1
-            ).reshape(self.num_envs, -1)
-            infos_last["intervene_flag"] = torch.stack(raw_chunk_intervene_flag, dim=1)
+            infos_last["intervene_action"] = stack(raw_chunk_intervene_actions).reshape(
+                self.num_envs, -1
+            )
+            infos_last["intervene_flag"] = stack(raw_chunk_intervene_flag)
             infos_list[-1] = infos_last
         if raw_chunk_rlt_switch_flags:
-            infos_last["rlt_switch_flags"] = torch.stack(
-                raw_chunk_rlt_switch_flags, dim=1
-            )
+            infos_last["rlt_switch_flags"] = stack(raw_chunk_rlt_switch_flags)
             infos_list[-1] = infos_last
 
         if past_dones.any() and self.auto_reset:
             obs_list[-1], infos_list[-1] = self._handle_auto_reset(
-                past_dones.cpu().numpy(), obs_list[-1], infos_list[-1]
+                past_dones if self.return_numpy else past_dones.cpu().numpy(),
+                obs_list[-1],
+                infos_list[-1],
             )
 
         if self.auto_reset or self.ignore_terminations:
-            chunk_terminations = torch.zeros_like(raw_chunk_terminations)
+            zeros_like = np.zeros_like if self.return_numpy else torch.zeros_like
+            chunk_terminations = zeros_like(raw_chunk_terminations)
             chunk_terminations[:, -1] = past_terminations
 
-            chunk_truncations = torch.zeros_like(raw_chunk_truncations)
+            chunk_truncations = zeros_like(raw_chunk_truncations)
             chunk_truncations[:, -1] = past_truncations
         else:
-            chunk_terminations = raw_chunk_terminations.clone()
-            chunk_truncations = raw_chunk_truncations.clone()
+            if self.return_numpy:
+                chunk_terminations = raw_chunk_terminations.copy()
+                chunk_truncations = raw_chunk_truncations.copy()
+            else:
+                chunk_terminations = raw_chunk_terminations.clone()
+                chunk_truncations = raw_chunk_truncations.clone()
         return (
             obs_list,
             chunk_rewards,

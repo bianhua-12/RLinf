@@ -249,7 +249,10 @@ class DualFrankaEnv(gym.Env):
         start_x = (w - crop_size) // 2
         start_y = (h - crop_size) // 2
         cropped = frame[start_y : start_y + crop_size, start_x : start_x + crop_size]
-        resized = cv2.resize(cropped, reshape_size)
+        if (cropped.shape[1], cropped.shape[0]) == reshape_size:
+            resized = cropped
+        else:
+            resized = cv2.resize(cropped, reshape_size)
         return cropped, resized
 
     def _get_camera_frames(self) -> dict[str, np.ndarray]:
@@ -278,10 +281,9 @@ class DualFrankaEnv(gym.Env):
                 frame = cached
 
             reshape_size = self.observation_space["frames"][name].shape[:2][::-1]
-            cropped, resized = self._crop_frame(frame, reshape_size)
+            _, resized = self._crop_frame(frame, reshape_size)
             frames[name] = resized[..., ::-1]
             display_frames[name] = resized
-            display_frames[f"{name}_full"] = cropped
             self._last_camera_frame[name] = frame
 
         self.camera_player.put_frame(display_frames)

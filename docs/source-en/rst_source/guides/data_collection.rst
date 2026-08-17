@@ -97,6 +97,11 @@ Constructor Arguments
      - ``bool``
      - ``False``
      - Encode LeRobot camera features as MP4 videos
+   * - ``copy_observations``
+     - ``bool``
+     - ``True``
+     - Deep-copy observations before buffering. Set to ``False`` only when the
+       wrapped environment allocates fresh tensors or arrays on every step
    * - ``only_success``
      - ``bool``
      - ``False``
@@ -179,6 +184,7 @@ The file contains a single dictionary:
        "episode_id":  int,   # episode counter (per-env, monotonically increasing)
        "success":     bool,  # whether the episode succeeded
        "observations": list, # length = num_steps + 1 (includes the initial reset obs)
+       "observation_timestamps_ns": list, # monotonic time for each observation
        "actions":     list,  # length = num_steps
        "rewards":     list,  # length = num_steps
        "terminated":  list,  # length = num_steps
@@ -230,7 +236,10 @@ Parquet column schema:
    * - ``actions``
      - Action vector, ``float32[action_dim]``
    * - ``timestamp``
-     - Frame timestamp in seconds, ``float``
+     - Nominal frame time in seconds, generated as ``frame_index / fps``
+   * - ``observation_timestamp_ns``
+     - Actual monotonic time when the observation was received, ``int64[1]``;
+       use differences between these values to measure the collection rate
    * - ``frame_index``
      - Frame index within the episode, ``int64``
    * - ``episode_index``
@@ -302,12 +311,14 @@ Core Components
 
 ``DataCollector`` workflow:
 
-1. Initialise ``RealWorldEnv`` and ``TrajectoryReplayBuffer``.
+1. Initialise ``RealWorldEnv`` and, when ``runner.save_demos=True``,
+   ``TrajectoryReplayBuffer``.
 2. Loop over steps, reading the SpaceMouse intervention action from
    ``info["intervene_action"]``.
-3. Construct a ``ChunkStepResult`` and append it to ``EmbodiedTrajectoryBuilder``.
+3. When ``runner.save_demos=True``, construct a ``ChunkStepResult`` and append
+   it to ``EmbodiedTrajectoryBuilder``.
 4. When an episode ends (``done=True``) with reward ``>= 0.5``, count it as a
-   success and write the trajectory to the buffer.
+   success and, when enabled, write the replay trajectory to the buffer.
 5. Stop automatically once ``num_data_episodes`` successes have been collected
    and finalise the buffer.
 
@@ -403,7 +414,9 @@ replay buffer and the ``CollectEpisode`` export in the same run. With
 - ``logs/{timestamp}/collected_data/`` as episode files in ``pickle`` or LeRobot format
 
 Set ``runner.save_demos=False`` to skip the replay-buffer output while keeping
-the configured ``collected_data/`` export enabled.
+the configured ``collected_data/`` export enabled. This mode also skips
+observation conversion, ``EmbodiedTrajectoryBuilder``, and ``ChunkStepResult``
+construction; only the episode exporter retains observations.
 
 To collect LeRobot-format data while still building the replay buffer, keep the
 real-world collection config like this:

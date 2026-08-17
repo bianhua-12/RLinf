@@ -119,6 +119,11 @@ class Ros2DualFrankaBackend:
             self.close()
             raise
 
+    @staticmethod
+    def _state_topic(side: str) -> str:
+        """Return the launcher's 30 Hz joint-state aggregation topic."""
+        return f"/{side}/joint_states"
+
     def _start_ros(self) -> None:
         try:
             import rclpy
@@ -157,7 +162,7 @@ class Ros2DualFrankaBackend:
             self._subscriptions.append(
                 self._node.create_subscription(
                     JointState,
-                    f"/{side}/franka/joint_states",
+                    self._state_topic(side),
                     lambda msg, arm=side: self._on_state(arm, msg),
                     state_qos,
                 )

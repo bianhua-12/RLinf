@@ -117,6 +117,7 @@ class HikrobotCamera(BaseCamera):
                 ),
                 "disable trigger mode",
             )
+            self._configure_frame_rate(camera_info.fps)
             self._enable_continuous_auto_features()
             self._check(self._camera.MV_CC_StartGrabbing(), "start grabbing")
             self._grabbing = True
@@ -178,6 +179,30 @@ class HikrobotCamera(BaseCamera):
                 _logger.warning(
                     "Failed to set Hikrobot %s=Continuous: %#x", feature, result
                 )
+
+    def _configure_frame_rate(self, requested_fps: float) -> None:
+        self._check(
+            self._camera.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", True),
+            "enable acquisition frame rate control",
+        )
+        self._check(
+            self._camera.MV_CC_SetFloatValue("AcquisitionFrameRate", requested_fps),
+            f"set acquisition frame rate to {requested_fps:g} fps",
+        )
+
+        resulting_frame_rate = self._sdk.MVCC_FLOATVALUE()
+        self._check(
+            self._camera.MV_CC_GetFloatValue(
+                "ResultingFrameRate", resulting_frame_rate
+            ),
+            "read resulting frame rate",
+        )
+        self._resulting_frame_rate = float(resulting_frame_rate.fCurValue)
+        _logger.info(
+            "Hikrobot acquisition frame rate: requested=%.3f fps, resulting=%.3f fps",
+            requested_fps,
+            self._resulting_frame_rate,
+        )
 
     def _read_frame(self) -> tuple[bool, Optional[np.ndarray]]:
         result = self._camera.MV_CC_GetImageForBGR(

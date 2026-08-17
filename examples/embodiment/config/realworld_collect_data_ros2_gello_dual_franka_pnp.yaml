@@ -56,8 +56,8 @@ env:
     ignore_terminations: false
     auto_reset: false
     keyboard_device: /dev/input/by-id/usb-PCsensor_FootSwitch-event-kbd
-    left_gello_port: /dev/serial/by-path/pci-0000:80:14.0-usb-0:10.3:1.0-port0
-    right_gello_port: /dev/serial/by-path/pci-0000:80:14.0-usb-0:10.2:1.0-port0
+    left_gello_port: /dev/serial/by-path/pci-0000:00:14.0-usb-0:10.3:1.0-port0
+    right_gello_port: /dev/serial/by-path/pci-0000:00:14.0-usb-0:10.2:1.0-port0
     left_gello_joint_signs: [1, -1, 1, 1, 1, -1, 1]
     right_gello_joint_signs: [1, -1, 1, 1, 1, -1, 1]
     left_gello_joint_offsets: [4.712, 3.142, 3.142, 4.712, 4.712, 4.712, -1.571]
