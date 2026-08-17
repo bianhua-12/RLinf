@@ -38,6 +38,7 @@ from rlinf.scheduler import Cluster, ComponentPlacement, Worker
 _ARM_INDICES = np.array([*range(7), *range(8, 15)])
 _GRIPPER_INDICES = np.array([7, 15])
 _DEFAULT_DATASET_PATH = "/data/datasets/fold_clothes/franka_fold_clothes_raw_v1"
+_GRIPPER_ACTION_SOURCES = {"gello", "policy"}
 
 
 @dataclass(frozen=True)
@@ -50,9 +51,34 @@ class ReplayEpisode:
     frame_indices: np.ndarray
     states: np.ndarray
     actions: np.ndarray
+    gripper_action_source: str
 
 
-def load_replay_episode(dataset_path: str, episode_index: int) -> ReplayEpisode:
+def _normalize_gripper_actions(actions: np.ndarray, source: str) -> np.ndarray:
+    """Convert recorded gripper values to commands with collection-time semantics."""
+    if source not in _GRIPPER_ACTION_SOURCES:
+        choices = ", ".join(sorted(_GRIPPER_ACTION_SOURCES))
+        raise ValueError(f"Unknown gripper action source {source!r}; choose {choices}")
+
+    normalized = actions.copy()
+    if source == "gello":
+        # GELLO direct streaming switches at closedness=0.5. The recorded
+        # transform is action=1-2*closedness, so the equivalent boundary is 0.
+        normalized[:, _GRIPPER_INDICES] = np.where(
+            normalized[:, _GRIPPER_INDICES] > 0.0, 1.0, -1.0
+        )
+    else:
+        normalized[:, _GRIPPER_INDICES] = np.clip(
+            normalized[:, _GRIPPER_INDICES], -1.0, 1.0
+        )
+    return normalized
+
+
+def load_replay_episode(
+    dataset_path: str,
+    episode_index: int,
+    gripper_action_source: str = "gello",
+) -> ReplayEpisode:
     """Load one episode without decoding its videos."""
     root = resolve_lerobot_dataset_root(dataset_path)
     info_path = root / "meta" / "info.json"
@@ -105,9 +131,7 @@ def load_replay_episode(dataset_path: str, episode_index: int) -> ReplayEpisode:
     joint_actions = actions[:, _ARM_INDICES]
     if np.any(joint_actions < joint_low) or np.any(joint_actions > joint_high):
         raise ValueError("Episode actions exceed FR3 joint limits")
-    actions[:, _GRIPPER_INDICES] = np.clip(
-        actions[:, _GRIPPER_INDICES], -1.0, 1.0
-    )
+    actions = _normalize_gripper_actions(actions, gripper_action_source)
 
     return ReplayEpisode(
         root=root,
@@ -116,6 +140,7 @@ def load_replay_episode(dataset_path: str, episode_index: int) -> ReplayEpisode:
         frame_indices=frame_indices,
         states=states,
         actions=actions,
+        gripper_action_source=gripper_action_source,
     )
 
 
@@ -137,6 +162,7 @@ class LeRobotEpisodeReplayer(Worker):
         self.episode = load_replay_episode(
             cfg.runner.replay_dataset_path,
             int(cfg.runner.replay_episode_index),
+            str(cfg.runner.get("replay_gripper_action_source", "gello")),
         )
         first_state = self.episode.states[0]
         with open_dict(self.cfg):
@@ -145,7 +171,9 @@ class LeRobotEpisodeReplayer(Worker):
             self.cfg.env.eval.override_cfg.teleop_direct_stream = False
             self.cfg.env.eval.override_cfg.joint_action_mode = "absolute"
             self.cfg.env.eval.override_cfg.step_frequency = self.episode.fps
-            self.cfg.env.eval.override_cfg.max_num_steps = len(self.episode.actions) + 200
+            self.cfg.env.eval.override_cfg.max_num_steps = (
+                len(self.episode.actions) + 200
+            )
             self.cfg.env.eval.override_cfg.joint_reset_qpos = [
                 first_state[:7].tolist(),
                 first_state[8:15].tolist(),
@@ -179,8 +207,7 @@ class LeRobotEpisodeReplayer(Worker):
                 start_error = float(
                     np.max(
                         np.abs(
-                            current[_ARM_INDICES]
-                            - self.episode.states[0, _ARM_INDICES]
+                            current[_ARM_INDICES] - self.episode.states[0, _ARM_INDICES]
                         )
                     )
                 )
@@ -204,18 +231,17 @@ class LeRobotEpisodeReplayer(Worker):
 
             actual = np.stack(actual_states)
             tracking_error = (
-                actual[:, _ARM_INDICES]
-                - self.episode.actions[:, _ARM_INDICES]
+                actual[:, _ARM_INDICES] - self.episode.actions[:, _ARM_INDICES]
             )
             reproduction_error = (
-                actual[:-1, _ARM_INDICES]
-                - self.episode.states[1:, _ARM_INDICES]
+                actual[:-1, _ARM_INDICES] - self.episode.states[1:, _ARM_INDICES]
             )
             intervals = np.diff(np.asarray(step_starts))
             result = {
                 "episode_index": self.episode.episode_index,
                 "frames": len(self.episode.actions),
                 "fps": self.episode.fps,
+                "gripper_action_source": self.episode.gripper_action_source,
                 "mean_actual_fps": (
                     float(1.0 / intervals.mean()) if len(intervals) else None
                 ),
@@ -241,14 +267,22 @@ os.environ.setdefault("RLINF_TASK_DESCRIPTION", "LeRobot episode replay")
 def main(cfg) -> None:
     dataset_path = os.environ.get("RLINF_REPLAY_DATASET", _DEFAULT_DATASET_PATH)
     episode_index = int(os.environ.get("RLINF_REPLAY_EPISODE", "0"))
-    episode = load_replay_episode(dataset_path, episode_index)
+    gripper_action_source = os.environ.get(
+        "RLINF_REPLAY_GRIPPER_SOURCE", "gello"
+    ).lower()
+    episode = load_replay_episode(
+        dataset_path,
+        episode_index,
+        gripper_action_source,
+    )
     max_joint_step = float(
         np.max(np.abs(np.diff(episode.actions[:, _ARM_INDICES], axis=0)))
     )
     print(
         f"Dataset: {episode.root}\n"
         f"Episode: {episode_index}, frames: {len(episode.actions)}, "
-        f"fps: {episode.fps:g}, max joint step: {max_joint_step:.4f} rad"
+        f"fps: {episode.fps:g}, gripper source: {episode.gripper_action_source}, "
+        f"max joint step: {max_joint_step:.4f} rad"
     )
     if os.environ.get("RLINF_REPLAY_VALIDATE_ONLY") == "1":
         print("Validation only; no hardware was opened.")
@@ -270,6 +304,7 @@ def main(cfg) -> None:
     with open_dict(cfg):
         cfg.runner.replay_dataset_path = str(episode.root)
         cfg.runner.replay_episode_index = episode_index
+        cfg.runner.replay_gripper_action_source = episode.gripper_action_source
     cluster = Cluster(cluster_cfg=cfg.cluster)
     placement = ComponentPlacement(cfg, cluster).get_strategy("env")
     replayer = LeRobotEpisodeReplayer.create_group(cfg).launch(
