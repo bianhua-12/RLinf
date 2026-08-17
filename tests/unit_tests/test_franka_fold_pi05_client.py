@@ -7,7 +7,9 @@
 #     https://www.apache.org/licenses/LICENSE-2.0
 
 import sys
+from argparse import Namespace
 from concurrent.futures import Future
+from types import ModuleType
 
 import gymnasium as gym
 import numpy as np
@@ -187,3 +189,80 @@ def test_run_policy_reinfers_from_hold_after_pico_takeover():
         resume_observation["training_rtc_action_prefix"][:10],
         np.zeros((10, client.ACTION_DIM)),
     )
+
+
+def test_create_env_defers_video_encoding_for_pi05_and_pico(monkeypatch, tmp_path):
+    class _HardwareEnv(gym.Env):
+        action_space = gym.spaces.Box(-1.0, 1.0, (client.ACTION_DIM,))
+        observation_space = gym.spaces.Dict({})
+
+    captured = []
+
+    class _CollectEpisode:
+        def __init__(self, env, **kwargs):
+            captured.append(kwargs)
+
+    monkeypatch.setattr(client.gym, "make", lambda *args, **kwargs: _HardwareEnv())
+    monkeypatch.setattr("rlinf.envs.wrappers.CollectEpisode", _CollectEpisode)
+    pico_module = ModuleType(
+        "rlinf.envs.realworld.common.wrappers.pico_joint_intervention"
+    )
+    pico_module.DualFrankaJointPicoIntervention = lambda env, **kwargs: env
+    monkeypatch.setitem(sys.modules, pico_module.__name__, pico_module)
+    args = Namespace(
+        left_robot_ip="left",
+        right_robot_ip="right",
+        base_camera_serial="base",
+        left_camera_serial="left-camera",
+        right_camera_serial="right-camera",
+        base_camera_type="realsense",
+        left_gripper_connection="left-gripper",
+        right_gripper_connection="right-gripper",
+        joint_reset_qpos=client.DEFAULT_JOINT_RESET_QPOS,
+        task=client.DEFAULT_TASK,
+        enable_pico=False,
+        pico_zmq_addr="ipc:///tmp/test-pico.ipc",
+        pico_control_threshold=0.85,
+        pico_ready_timeout_s=1.0,
+        episode_timeout_s=120.0,
+        rollout_dir=str(tmp_path),
+    )
+
+    client.create_env(args)
+    args.enable_pico = True
+    client.create_env(args)
+
+    assert len(captured) == 2
+    for kwargs in captured:
+        assert kwargs["fps"] == 30
+        assert kwargs["use_videos"] is True
+        assert kwargs["finalize_interval"] == 0
+        assert kwargs["defer_video_encoding_until_finalize"] is True
+        assert kwargs["isolate_episode_stats"] is True
+        assert kwargs["image_writer_threads"] == 12
+        assert kwargs["image_writer_processes"] == 0
+        assert kwargs["copy_observations"] is False
+
+
+def test_close_rollout_resources_stops_hardware_before_encoding():
+    events = []
+
+    class _HardwareEnv:
+        def close(self):
+            events.append("hardware")
+
+    class _CollectionEnv:
+        env = _HardwareEnv()
+
+        def close(self):
+            events.append("writer")
+
+    class _Policy:
+        def close(self):
+            events.append("policy")
+            raise RuntimeError("policy close failed")
+
+    with np.testing.assert_raises_regex(RuntimeError, "policy close failed"):
+        client._close_rollout_resources(_CollectionEnv(), _Policy())
+
+    assert events == ["hardware", "policy", "writer"]

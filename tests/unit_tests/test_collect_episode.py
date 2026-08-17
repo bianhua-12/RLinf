@@ -247,6 +247,16 @@ def test_maybe_flush_does_not_scan_unfinished_episode(tmp_path):
     wrapper.close()
 
 
+def test_close_does_not_flush_unfinished_episode(tmp_path):
+    wrapper = CollectEpisode(_FreshObservationEnv(), str(tmp_path))
+    wrapper._buffers[0]["actions"].append(np.zeros(2, dtype=np.float32))
+    wrapper._flush_episode = MagicMock()
+
+    wrapper.close()
+
+    wrapper._flush_episode.assert_not_called()
+
+
 def test_deferred_video_encoding_requires_no_periodic_finalize(tmp_path):
     with pytest.raises(ValueError, match="requires finalize_interval=0"):
         CollectEpisode(

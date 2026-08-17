@@ -475,7 +475,12 @@ def create_env(args: argparse.Namespace):
         use_videos=True,
         only_success=False,
         finalize_interval=0,
+        defer_video_encoding_until_finalize=True,
+        isolate_episode_stats=True,
+        image_writer_threads=12,
+        image_writer_processes=0,
         resume=True,
+        copy_observations=False,
     )
 
 
@@ -588,6 +593,35 @@ def self_test() -> None:
     )
 
 
+def _close_rollout_resources(env, policy: AsyncPi05Client) -> None:
+    """Stop hardware before draining and encoding the recorded episodes."""
+    first_error: BaseException | None = None
+
+    if env is not None:
+        try:
+            # CollectEpisode's direct child owns the PICO and hardware wrappers.
+            env.env.close()
+        except BaseException as exc:
+            first_error = exc
+
+    try:
+        policy.close()
+    except BaseException as exc:
+        if first_error is None:
+            first_error = exc
+
+    if env is not None:
+        try:
+            # This drains episode writes and performs the deferred video encoding.
+            env.close()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+
+    if first_error is not None:
+        raise first_error
+
+
 def main() -> None:
     args = parse_args()
     if args.self_test:
@@ -629,9 +663,7 @@ def main() -> None:
             if episode_index + 1 < args.num_episodes:
                 print("Resetting arms for the next episode.")
     finally:
-        policy.close()
-        if env is not None:
-            env.close()
+        _close_rollout_resources(env, policy)
 
 
 if __name__ == "__main__":
