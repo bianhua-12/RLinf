@@ -101,6 +101,14 @@ class CollectEpisode(gym.Wrapper):
         finalize_interval: Call ``writer.finalize()`` every this many completed
             episodes to flush ``info.json`` and ``stats.json`` as a checkpoint.
             ``0`` disables periodic flushing (lerobot only). Defaults to 100.
+        defer_video_encoding_until_finalize: Keep video frames as PNGs while
+            collecting and encode them only after the hardware loop stops.
+            Requires ``use_videos=True`` and ``finalize_interval=0``.
+        isolate_episode_stats: Compute LeRobot image statistics in a spawned
+            process so their Python memory cleanup cannot pause collection.
+        image_writer_threads: Number of LeRobot image-writer threads.
+        image_writer_processes: Number of LeRobot image-writer processes. Use
+            ``0`` inside Ray actors to avoid forking from the actor process.
         resume: If True and ``export_format == "lerobot"``, reuse ``save_dir``
             across sessions — new episodes land in a fresh ``id_{N}`` shard
             (N = sum of episodes across pre-existing shards) so the in-progress
@@ -125,6 +133,10 @@ class CollectEpisode(gym.Wrapper):
         use_videos: bool = False,
         only_success: bool = False,
         finalize_interval: int = 100,
+        defer_video_encoding_until_finalize: bool = False,
+        isolate_episode_stats: bool = False,
+        image_writer_threads: int = 10,
+        image_writer_processes: int = 0,
         resume: bool = False,
         copy_observations: bool = True,
     ):
@@ -138,6 +150,14 @@ class CollectEpisode(gym.Wrapper):
                 f"Unsupported export_format={export_format!r}, "
                 f"expected one of {_VALID_FORMATS}"
             )
+        if defer_video_encoding_until_finalize and not use_videos:
+            raise ValueError(
+                "defer_video_encoding_until_finalize requires use_videos=True"
+            )
+        if defer_video_encoding_until_finalize and finalize_interval != 0:
+            raise ValueError(
+                "defer_video_encoding_until_finalize requires finalize_interval=0"
+            )
         self.save_dir = save_dir
         self.rank = rank
         self.num_envs = num_envs
@@ -148,6 +168,10 @@ class CollectEpisode(gym.Wrapper):
         self.use_videos = use_videos
         self.only_success = only_success
         self.finalize_interval = finalize_interval
+        self.defer_video_encoding_until_finalize = defer_video_encoding_until_finalize
+        self.isolate_episode_stats = isolate_episode_stats
+        self.image_writer_threads = image_writer_threads
+        self.image_writer_processes = image_writer_processes
         self.copy_observations = copy_observations
 
         self._preexisting_episode_count = 0
@@ -301,16 +325,35 @@ class CollectEpisode(gym.Wrapper):
 
     def close(self):
         if self._closed:
+            # Resource shutdown is one-shot, but a transient finalization error
+            # may leave the writer available for an explicit best-effort retry.
+            self._finalize_lerobot()
             return None
         self._closed = True
-        self._finalize_lerobot()
-        self._wait_futures()
-        if self._executor is not None:
-            self._executor.shutdown(wait=True)
-            self._executor = None
-        if hasattr(self.env, "close"):
-            return self.env.close()
-        return None
+        first_error: Optional[BaseException] = None
+        result = None
+        try:
+            self._finalize_lerobot()
+            self._wait_futures()
+        except BaseException as exc:
+            first_error = exc
+        finally:
+            if self._executor is not None:
+                try:
+                    self._executor.shutdown(wait=True)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                self._executor = None
+            if hasattr(self.env, "close"):
+                try:
+                    result = self.env.close()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+        if first_error is not None:
+            raise first_error
+        return result
 
     def _new_buffer(self) -> dict[str, list]:
         return {
@@ -642,6 +685,12 @@ class CollectEpisode(gym.Wrapper):
                 has_segment_id="segment_id" in first,
                 has_observation_timestamp="observation_timestamp_ns" in first,
                 use_videos=self.use_videos,
+                defer_video_encoding_until_finalize=(
+                    self.defer_video_encoding_until_finalize
+                ),
+                isolate_episode_stats=self.isolate_episode_stats,
+                image_writer_threads=self.image_writer_threads,
+                image_writer_processes=self.image_writer_processes,
             )
             self._next_shard_id = shard_id + 1
         return self._lerobot_writer
@@ -669,7 +718,7 @@ class CollectEpisode(gym.Wrapper):
     def _write_lerobot_episode(self, ep_data: dict) -> None:
         with self._lerobot_lock:
             writer = self._ensure_lerobot_writer(ep_data)
-            writer.add_episode(ep_data)
+            writer.add_episode(ep_data, consume=True)
             self._episodes_written += 1
             count = self._episodes_written
             if self.finalize_interval > 0 and count % self.finalize_interval == 0:
@@ -679,14 +728,33 @@ class CollectEpisode(gym.Wrapper):
         """Drain pending futures then write the LeRobot dataset metadata."""
         if self.export_format != "lerobot":
             return
-        self._wait_futures()
-        with self._lerobot_lock:
-            if (
-                self._lerobot_writer is not None
-                and self._lerobot_writer.dataset is not None
-            ):
-                self._lerobot_writer.finalize()
-            self._lerobot_writer = None
+        first_error: Optional[BaseException] = None
+        try:
+            self._wait_futures()
+        except BaseException as exc:
+            first_error = exc
+
+        finalize_succeeded = False
+        try:
+            with self._lerobot_lock:
+                if (
+                    self._lerobot_writer is not None
+                    and self._lerobot_writer.dataset is not None
+                ):
+                    if first_error is None:
+                        self._lerobot_writer.finalize()
+                    else:
+                        self._lerobot_writer.finalize(prior_error=first_error)
+                finalize_succeeded = True
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        finally:
+            if finalize_succeeded:
+                self._lerobot_writer = None
+
+        if first_error is not None:
+            raise first_error
 
     def _write_pickle(self, save_path: str, episode_data: dict) -> None:
         with open(save_path, "wb") as f:
@@ -709,9 +777,16 @@ class CollectEpisode(gym.Wrapper):
         self._futures = remaining
 
     def _wait_futures(self) -> None:
+        first_error: Optional[BaseException] = None
         for f in self._futures:
-            f.result()
+            try:
+                f.result()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
         self._futures = []
+        if first_error is not None:
+            raise first_error
 
     def _finalize_on_exit(self) -> None:
         self.close()

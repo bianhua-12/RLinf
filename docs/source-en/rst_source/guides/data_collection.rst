@@ -40,14 +40,18 @@ Key Features
 - Compatible with auto-reset environments: the final pre-reset observation is
   correctly attributed to the current episode, and the post-reset observation is
   carried over to the next episode.
-- All write operations run asynchronously in a background thread so they never
-  block the RL training loop.
+- Episode writes run asynchronously in a background thread.
 - The LeRobot writer is lazily initialized on the first episode write, with image
   shape, state dimension, and action dimension inferred automatically.
 - Set ``use_videos=True`` to store ``image`` and ``extra_view_image`` as MP4
   video streams. When
   ``extra_view_images`` is a stacked ``[N, H, W, C]`` tensor, the columns are
   fanned out by index (``extra_view_image-0``, ``extra_view_image-1``, …).
+- For timing-sensitive hardware collection, set
+  ``defer_video_encoding_until_finalize=True``, ``isolate_episode_stats=True``,
+  and ``finalize_interval=0``. Collection writes PNGs while the robot is active;
+  image statistics run in a spawned process, and MP4 encoding starts only after
+  hardware collection stops. The command waits for finalization before exiting.
 - Set ``only_success=True`` to filter out failed episodes and save disk space.
 
 Constructor Arguments
@@ -110,6 +114,23 @@ Constructor Arguments
      - ``int``
      - ``100``
      - Call ``writer.finalize()`` every N completed episodes as a checkpoint (``0`` disables; lerobot format only)
+   * - ``defer_video_encoding_until_finalize``
+     - ``bool``
+     - ``False``
+     - Encode videos only when the wrapper closes. Requires ``use_videos=True``
+       and ``finalize_interval=0``
+   * - ``isolate_episode_stats``
+     - ``bool``
+     - ``False``
+     - Compute LeRobot image statistics in a spawned process
+   * - ``image_writer_threads``
+     - ``int``
+     - ``10``
+     - Number of asynchronous image-writer threads
+   * - ``image_writer_processes``
+     - ``int``
+     - ``0``
+     - Number of image-writer processes. Keep ``0`` inside Ray actors
 
 Usage Examples
 ~~~~~~~~~~~~~~
@@ -154,6 +175,12 @@ Add a ``data_collection`` block under ``env`` in your YAML config:
         only_success: True
         robot_type: "panda"
         fps: 10
+        use_videos: True
+        defer_video_encoding_until_finalize: True
+        isolate_episode_stats: True
+        image_writer_threads: 12
+        image_writer_processes: 0
+        finalize_interval: 0
 
 Then run the training script as usual; data is collected automatically:
 

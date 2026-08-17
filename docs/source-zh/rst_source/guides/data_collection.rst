@@ -36,12 +36,16 @@ Episode 数据采集
 - 支持单环境与向量化并行环境（``num_envs > 1``）。
 - 兼容自动重置（auto-reset）环境：正确将重置前的最终观测归入当前 episode，
   将重置后的初始观测带入下一 episode。
-- 写入操作在独立后台线程异步执行，不阻塞 RL 训练主循环。
+- episode 写入操作在独立后台线程异步执行。
 - LeRobot writer 在第一条 episode 写入时懒初始化，自动推断图像尺寸、状态维度、动作维度。
 - 设置 ``use_videos=True`` 可将 ``image`` 与 ``extra_view_image`` 保存为 MP4 视频流；当
   ``extra_view_images``
   为 ``[N, H, W, C]`` 多视角堆叠时，会自动按索引展开成 ``extra_view_image-0``、
   ``extra_view_image-1`` …… 等列。
+- 对采集节拍敏感的真机任务，应设置
+  ``defer_video_encoding_until_finalize=True``、``isolate_episode_stats=True`` 和
+  ``finalize_interval=0``。机器人运行期间写入 PNG，图像统计在 spawn 子进程执行；硬件采集
+  停止后才开始 MP4 编码，命令会等待最终化完成后退出。
 - ``only_success=True`` 可过滤失败 episode，节省磁盘空间。
 
 构造参数
@@ -104,6 +108,23 @@ Episode 数据采集
      - ``int``
      - ``100``
      - 每写完 N 个 episode 主动调用 ``writer.finalize()`` 生成检查点（``0`` 表示禁用，仅 lerobot 格式有效）
+   * - ``defer_video_encoding_until_finalize``
+     - ``bool``
+     - ``False``
+     - 仅在 wrapper 关闭时编码视频；要求 ``use_videos=True`` 且
+       ``finalize_interval=0``
+   * - ``isolate_episode_stats``
+     - ``bool``
+     - ``False``
+     - 在 spawn 子进程中计算 LeRobot 图像统计
+   * - ``image_writer_threads``
+     - ``int``
+     - ``10``
+     - 异步图像写入线程数量
+   * - ``image_writer_processes``
+     - ``int``
+     - ``0``
+     - 图像写入进程数量；在 Ray actor 内保持为 ``0``
 
 使用示例
 ~~~~~~~~
@@ -147,6 +168,12 @@ Episode 数据采集
         only_success: True
         robot_type: "panda"
         fps: 10
+        use_videos: True
+        defer_video_encoding_until_finalize: True
+        isolate_episode_stats: True
+        image_writer_threads: 12
+        image_writer_processes: 0
+        finalize_interval: 0
 
 然后正常启动训练脚本，数据会在训练过程中自动采集：
 

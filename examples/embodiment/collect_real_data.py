@@ -15,6 +15,7 @@
 import errno
 import os
 import select
+import signal
 import sys
 import termios
 import threading
@@ -34,6 +35,27 @@ from rlinf.data.schema.embodied_types import (
 from rlinf.data.storage.replay import TrajectoryReplayBuffer
 from rlinf.envs.realworld.realworld_env import RealWorldEnv
 from rlinf.scheduler import Cluster, ComponentPlacement, Worker
+from rlinf.utils.logging import get_logger
+
+
+class _GracefulStopSignalHandler:
+    """Request a clean actor shutdown on first SIGINT, force on the second."""
+
+    def __init__(self, stop_request_path: Path, logger):
+        self._stop_request_path = stop_request_path
+        self._logger = logger
+        self._signal_count = 0
+
+    def __call__(self, _signum, _frame) -> None:
+        self._signal_count += 1
+        if self._signal_count == 1:
+            self._logger.warning(
+                "Graceful stop requested; waiting for hardware shutdown and "
+                "final video encoding. Press Ctrl-C again to force exit."
+            )
+            self._stop_request_path.touch()
+            return
+        raise KeyboardInterrupt
 
 
 def _relay_terminal_keys(fifo_path: str, stop_event: threading.Event) -> None:
@@ -95,6 +117,7 @@ class DataCollector(Worker):
 
         self.cfg = cfg
         self.num_data_episodes = cfg.runner.num_data_episodes
+        self._stop_request_path = Path(cfg.runner.logger.log_path) / ".stop_collection"
         self.total_cnt = 0
         override_cfg = cfg.env.eval.get("override_cfg", {})
         self.manual_episode_control_only = bool(
@@ -134,6 +157,12 @@ class DataCollector(Worker):
                 use_videos=bool(dc_cfg.get("use_videos", False)),
                 only_success=dc_cfg.get("only_success", False),
                 finalize_interval=dc_cfg.get("finalize_interval", 100),
+                defer_video_encoding_until_finalize=bool(
+                    dc_cfg.get("defer_video_encoding_until_finalize", False)
+                ),
+                isolate_episode_stats=bool(dc_cfg.get("isolate_episode_stats", False)),
+                image_writer_threads=int(dc_cfg.get("image_writer_threads", 10)),
+                image_writer_processes=int(dc_cfg.get("image_writer_processes", 0)),
                 resume=bool(dc_cfg.get("resume", False)),
                 # RealWorldEnv allocates fresh observation arrays on every step.
                 copy_observations=False,
@@ -197,6 +226,11 @@ class DataCollector(Worker):
             time.sleep(sleep_for)
         return next_deadline
 
+    def _stop_requested(self) -> bool:
+        """Return whether the driver requested a graceful collection stop."""
+        path = getattr(self, "_stop_request_path", None)
+        return path is not None and path.exists()
+
     def run(self):
         try:
             self._run_collection()
@@ -209,7 +243,11 @@ class DataCollector(Worker):
                         self.buffer.close()
                 finally:
                     if self.env is not self._hardware_env:
+                        self.log_info(
+                            "Hardware collection stopped; finalizing collected data."
+                        )
                         self.env.close()
+                        self.log_info("Collected data finalized.")
 
     def _run_collection(self):
         obs, _ = self.env.reset()
@@ -233,7 +271,7 @@ class DataCollector(Worker):
             current_obs_processed = self._process_obs(obs)
 
         next_step_deadline = time.perf_counter()
-        while success_cnt < self.num_data_episodes:
+        while success_cnt < self.num_data_episodes and not self._stop_requested():
             # Teleop wrapper overrides this via info["intervene_action"].
             action = np.zeros((1, self.action_dim))
             next_obs, reward, terminated, truncated, info = self.env.step(action)
@@ -344,7 +382,11 @@ class DataCollector(Worker):
             if success_cnt < self.num_data_episodes:
                 next_step_deadline = self._wait_for_step_deadline(next_step_deadline)
 
-        if self.save_demos:
+        if self._stop_requested():
+            self.log_info(
+                f"Graceful stop requested after {success_cnt} completed episodes."
+            )
+        elif self.save_demos:
             self.log_info(
                 "Finished. Demos saved in: "
                 f"{os.path.join(self.cfg.runner.logger.log_path, 'demos')}"
@@ -361,6 +403,9 @@ def main(cfg):
     fifo_path = None
     stop_event = threading.Event()
     relay_thread = None
+    stop_request_path = Path(cfg.runner.logger.log_path) / ".stop_collection"
+    logger = get_logger()
+    stop_request_path.unlink(missing_ok=True)
     if cfg.env.eval.get("keyboard_fifo_path") == "terminal":
         if not sys.stdin.isatty():
             raise RuntimeError("Terminal keyboard relay requires an interactive stdin")
@@ -382,8 +427,18 @@ def main(cfg):
         collector = DataCollector.create_group(cfg).launch(
             cluster, name=cfg.env.group_name, placement_strategy=env_placement
         )
-        collector.run().wait()
+        collection_work = collector.run()
+        previous_sigint_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(
+            signal.SIGINT,
+            _GracefulStopSignalHandler(stop_request_path, logger),
+        )
+        try:
+            collection_work.wait()
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
     finally:
+        stop_request_path.unlink(missing_ok=True)
         stop_event.set()
         if relay_thread is not None:
             relay_thread.join(timeout=1.0)

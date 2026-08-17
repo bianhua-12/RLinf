@@ -84,3 +84,8 @@ env:
       robot_type: dual_FR3
       fps: 30
       use_videos: true
+      defer_video_encoding_until_finalize: true
+      finalize_interval: 0
+      isolate_episode_stats: true
+      image_writer_threads: 12
+      image_writer_processes: 0

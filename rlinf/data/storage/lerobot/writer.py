@@ -15,10 +15,17 @@
 """LeRobot dataset writer for saving rollout data."""
 
 import gc
+import importlib
+import multiprocessing
+import sys
+from concurrent.futures import ProcessPoolExecutor
+from threading import Lock
 from typing import Any
 
 from rlinf.data.storage.lerobot.compat import add_frame_to_dataset
 from rlinf.utils.logging import get_logger
+
+_COMPUTE_STATS_PATCH_LOCK = Lock()
 
 
 def _silence_hf_datasets_progress_bars() -> None:
@@ -30,6 +37,15 @@ def _silence_hf_datasets_progress_bars() -> None:
         _hf_datasets.disable_progress_bar()
     except ImportError:
         pass
+
+
+def _compute_episode_stats_in_process(
+    episode_data: dict[str, Any], features: dict[str, Any]
+) -> dict[str, Any]:
+    """Compute LeRobot episode statistics outside the collector process."""
+    from lerobot.datasets.compute_stats import compute_episode_stats
+
+    return compute_episode_stats(episode_data, features)
 
 
 class LeRobotDatasetWriter:
@@ -54,6 +70,9 @@ class LeRobotDatasetWriter:
     def __init__(self):
         """Initialize the writer."""
         self.dataset = None
+        self.use_videos = False
+        self.defer_video_encoding_until_finalize = False
+        self._episode_stats_executor: ProcessPoolExecutor | None = None
         self.logger = get_logger()
 
     def create(
@@ -63,7 +82,7 @@ class LeRobotDatasetWriter:
         fps: int = 5,
         features: dict[str, dict[str, Any]] | None = None,
         image_writer_threads: int = 10,
-        image_writer_processes: int = 5,
+        image_writer_processes: int = 0,
         image_shape: tuple[int, int, int] = (256, 256, 3),
         state_dim: int = 8,
         action_dim: int = 7,
@@ -74,6 +93,8 @@ class LeRobotDatasetWriter:
         has_segment_id: bool = False,
         has_observation_timestamp: bool = False,
         use_videos: bool = False,
+        defer_video_encoding_until_finalize: bool = False,
+        isolate_episode_stats: bool = False,
     ) -> None:
         """
         Create a new LeRobot dataset.
@@ -105,6 +126,11 @@ class LeRobotDatasetWriter:
                 ``observation_timestamp_ns`` (int64, shape ``(1,)``) captured
                 when the observation was received.
             use_videos: Whether to encode camera features as MP4 videos.
+            defer_video_encoding_until_finalize: Keep completed-episode PNGs
+                during collection and encode all videos in :meth:`finalize`.
+            isolate_episode_stats: Compute per-episode image statistics in a
+                persistent spawned process so image loading and array cleanup
+                cannot pause the collection process's Python threads.
 
         """
 
@@ -175,6 +201,16 @@ class LeRobotDatasetWriter:
         self.logger.info(
             f"Creating LeRobot dataset: repo_id={repo_id}, robot_type={robot_type}, fps={fps}"
         )
+        create_kwargs = {}
+        if defer_video_encoding_until_finalize:
+            if not use_videos:
+                raise ValueError(
+                    "defer_video_encoding_until_finalize requires use_videos=True"
+                )
+            # LeRobot performs synchronous video encoding when this threshold is
+            # reached. Defer every practical run to finalize().
+            create_kwargs["batch_encoding_size"] = sys.maxsize
+
         self.dataset = LeRobotDataset.create(
             repo_id=repo_id,
             robot_type=robot_type,
@@ -183,9 +219,22 @@ class LeRobotDatasetWriter:
             use_videos=use_videos,
             image_writer_threads=image_writer_threads,
             image_writer_processes=image_writer_processes,
+            **create_kwargs,
         )
+        self.use_videos = use_videos
+        self.defer_video_encoding_until_finalize = defer_video_encoding_until_finalize
+        if isolate_episode_stats:
+            self._episode_stats_executor = ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
 
-    def add_episode(self, episode_data: list[dict[str, Any]]) -> None:
+    def add_episode(
+        self,
+        episode_data: list[dict[str, Any]],
+        *,
+        consume: bool = False,
+    ) -> None:
         """
         Add an episode to the dataset.
 
@@ -199,6 +248,8 @@ class LeRobotDatasetWriter:
                 - intervene_flag: np.ndarray [1] of bool (optional; matches schema)
                 - observation_timestamp_ns: np.ndarray [1] of int64 (optional)
                 - Any other fields defined in the features schema
+            consume: Clear frames after LeRobot accepts them. The caller must
+                transfer ownership of ``episode_data`` when enabling this.
 
         The frames will be automatically processed to include both the original
         image format and the observation.images format (transposed to [C, H, W]).
@@ -209,31 +260,127 @@ class LeRobotDatasetWriter:
         if not episode_data:
             self.logger.warning("Empty episode_data provided, skipping.")
             return
-        for frame_data in episode_data:
-            add_frame_to_dataset(self.dataset, frame_data)
+        frame_count = len(episode_data)
+        task = episode_data[0].get("task", "N/A")
+        accepted_frames = 0
+        try:
+            for frame_data in episode_data:
+                add_frame_to_dataset(self.dataset, frame_data)
+                accepted_frames += 1
+                if consume:
+                    frame_data.clear()
+        except BaseException:
+            if consume:
+                del episode_data[:accepted_frames]
+            raise
 
-        self.dataset.save_episode()
-        self.logger.info(
-            f"Saved episode with {len(episode_data)} frames, task: '{episode_data[0].get('task', 'N/A')}'"
+        self._save_episode()
+        if consume:
+            episode_data.clear()
+        self.logger.info(f"Saved episode with {frame_count} frames, task: '{task}'")
+
+    def _save_episode(self) -> None:
+        """Save metadata while optionally isolating image-stat computation."""
+        # LeRobot imports compute_episode_stats into its dataset module. Guard
+        # every save across all writer instances so a non-isolated writer cannot
+        # observe another writer's temporary replacement.
+        with _COMPUTE_STATS_PATCH_LOCK:
+            if self._episode_stats_executor is None:
+                self.dataset.save_episode()
+                return
+
+            dataset_module = importlib.import_module(type(self.dataset).__module__)
+            original_compute_stats = dataset_module.compute_episode_stats
+
+            def isolated_compute_stats(episode_buffer, features):
+                future = self._episode_stats_executor.submit(
+                    _compute_episode_stats_in_process,
+                    episode_buffer,
+                    features,
+                )
+                return future.result()
+
+            dataset_module.compute_episode_stats = isolated_compute_stats
+            try:
+                self.dataset.save_episode()
+            finally:
+                dataset_module.compute_episode_stats = original_compute_stats
+
+    def _encode_pending_videos(self, prior_error: BaseException | None = None) -> None:
+        """Encode episodes deferred while hardware collection was active."""
+        pending = int(getattr(self.dataset, "episodes_since_last_encoding", 0))
+        if pending <= 0 and prior_error is None:
+            return
+
+        try:
+            from lerobot.datasets.video_utils import VideoEncodingManager
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "The installed LeRobot version does not support deferred video encoding"
+            ) from exc
+
+        if pending > 0:
+            self.logger.info(
+                "Encoding %d deferred episodes after hardware collection stopped.",
+                pending,
+            )
+        manager = VideoEncodingManager(self.dataset)
+        manager.__enter__()
+        manager.__exit__(
+            type(prior_error) if prior_error is not None else None,
+            prior_error,
+            prior_error.__traceback__ if prior_error is not None else None,
         )
+        self.dataset.episodes_since_last_encoding = 0
 
-    def finalize(self) -> None:
+    def finalize(self, prior_error: BaseException | None = None) -> None:
         """Finalize the dataset and properly clean up all resources."""
         if self.dataset is None:
             raise RuntimeError("Dataset not created. Call create() first.")
 
-        if (
-            hasattr(self.dataset, "image_writer")
-            and self.dataset.image_writer is not None
-        ):
-            self.dataset.image_writer.wait_until_done()
+        first_error = prior_error
+        try:
+            if (
+                hasattr(self.dataset, "image_writer")
+                and self.dataset.image_writer is not None
+            ):
+                self.dataset.image_writer.wait_until_done()
+            if self.defer_video_encoding_until_finalize or (
+                prior_error is not None and self.use_videos
+            ):
+                self._encode_pending_videos(prior_error)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+            else:
+                self.logger.error("Dataset finalization also failed: %s", exc)
+        finally:
+            if self._episode_stats_executor is not None:
+                try:
+                    self._episode_stats_executor.shutdown(wait=True)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                    else:
+                        self.logger.error(
+                            "Episode statistics process shutdown also failed: %s", exc
+                        )
+                self._episode_stats_executor = None
+            if (
+                hasattr(self.dataset, "image_writer")
+                and self.dataset.image_writer is not None
+            ):
+                try:
+                    self.dataset.image_writer.stop()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                    else:
+                        self.logger.error("Image writer shutdown also failed: %s", exc)
+                self.dataset.image_writer = None
 
-        if (
-            hasattr(self.dataset, "image_writer")
-            and self.dataset.image_writer is not None
-        ):
-            self.dataset.image_writer.stop()
-            self.dataset.image_writer = None
+        if first_error is not None:
+            raise first_error
 
         if hasattr(self.dataset, "episode_buffer"):
             self.dataset.episode_buffer = None

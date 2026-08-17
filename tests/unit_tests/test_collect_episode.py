@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 
 import gymnasium as gym
 import numpy as np
+import pytest
 import torch
 
 from rlinf.envs.realworld.realworld_env import RealWorldEnv
@@ -244,3 +245,117 @@ def test_maybe_flush_does_not_scan_unfinished_episode(tmp_path):
 
     wrapper._get_episode_success.assert_not_called()
     wrapper.close()
+
+
+def test_deferred_video_encoding_requires_no_periodic_finalize(tmp_path):
+    with pytest.raises(ValueError, match="requires finalize_interval=0"):
+        CollectEpisode(
+            _FreshObservationEnv(),
+            str(tmp_path),
+            use_videos=True,
+            defer_video_encoding_until_finalize=True,
+        )
+
+
+def test_lerobot_writer_receives_deferred_and_isolated_options(tmp_path):
+    wrapper = CollectEpisode(
+        _FreshObservationEnv(),
+        str(tmp_path),
+        export_format="lerobot",
+        use_videos=True,
+        finalize_interval=0,
+        defer_video_encoding_until_finalize=True,
+        isolate_episode_stats=True,
+        image_writer_threads=12,
+        image_writer_processes=0,
+    )
+    writer = MagicMock()
+    writer.dataset = None
+    wrapper._lerobot_writer = writer
+    frame = {
+        "image": np.zeros((2, 2, 3), dtype=np.uint8),
+        "state": np.zeros(2, dtype=np.float32),
+        "actions": np.zeros(2, dtype=np.float32),
+        "intervene_flag": np.array([False]),
+        "segment_id": np.array([0], dtype=np.uint8),
+        "observation_timestamp_ns": np.array([1], dtype=np.int64),
+        "task": "test task",
+    }
+
+    wrapper._ensure_lerobot_writer([frame])
+    kwargs = writer.create.call_args.kwargs
+    assert kwargs["defer_video_encoding_until_finalize"] is True
+    assert kwargs["isolate_episode_stats"] is True
+    assert kwargs["image_writer_threads"] == 12
+    assert kwargs["image_writer_processes"] == 0
+
+    writer.dataset = object()
+    episode = [frame]
+    wrapper._write_lerobot_episode(episode)
+    writer.add_episode.assert_called_once_with(episode, consume=True)
+    wrapper.close()
+
+
+def test_close_waits_all_futures_and_closes_env_after_failure(tmp_path):
+    wrapper = CollectEpisode(_FreshObservationEnv(), str(tmp_path))
+    first = MagicMock()
+    first.result.side_effect = RuntimeError("first failed")
+    second = MagicMock()
+    wrapper._futures = [first, second]
+    wrapper.env.close = MagicMock()
+
+    with pytest.raises(RuntimeError, match="first failed"):
+        wrapper.close()
+
+    first.result.assert_called_once_with()
+    second.result.assert_called_once_with()
+    wrapper.env.close.assert_called_once_with()
+    assert wrapper._executor is None
+
+
+def test_close_retains_writer_when_finalization_fails(tmp_path):
+    wrapper = CollectEpisode(
+        _FreshObservationEnv(), str(tmp_path), export_format="lerobot"
+    )
+    writer = MagicMock()
+    writer.dataset = object()
+    writer.finalize.side_effect = RuntimeError("finalize failed")
+    wrapper._lerobot_writer = writer
+
+    with pytest.raises(RuntimeError, match="finalize failed"):
+        wrapper.close()
+
+    assert wrapper._lerobot_writer is writer
+    writer.finalize.side_effect = None
+    wrapper.close()
+
+
+def test_close_retries_writer_without_reclosing_environment(tmp_path):
+    wrapper = CollectEpisode(
+        _FreshObservationEnv(), str(tmp_path), export_format="lerobot"
+    )
+    wrapper.env.close = MagicMock()
+    writer = MagicMock()
+    writer.dataset = object()
+    writer.finalize.side_effect = [RuntimeError("finalize failed"), None]
+    wrapper._lerobot_writer = writer
+
+    with pytest.raises(RuntimeError, match="finalize failed"):
+        wrapper.close()
+    wrapper.close()
+    wrapper.close()
+
+    assert writer.finalize.call_count == 2
+    assert wrapper._lerobot_writer is None
+    wrapper.env.close.assert_called_once_with()
+    assert wrapper._executor is None
+
+
+def test_pickle_close_remains_idempotent(tmp_path):
+    wrapper = CollectEpisode(_FreshObservationEnv(), str(tmp_path))
+    wrapper.env.close = MagicMock()
+
+    wrapper.close()
+    wrapper.close()
+
+    wrapper.env.close.assert_called_once_with()

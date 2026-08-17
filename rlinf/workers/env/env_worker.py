@@ -422,6 +422,20 @@ class EnvWorker(Worker):
                     finalize_interval=getattr(
                         env_cfg.data_collection, "finalize_interval", 100
                     ),
+                    defer_video_encoding_until_finalize=getattr(
+                        env_cfg.data_collection,
+                        "defer_video_encoding_until_finalize",
+                        False,
+                    ),
+                    isolate_episode_stats=getattr(
+                        env_cfg.data_collection, "isolate_episode_stats", False
+                    ),
+                    image_writer_threads=getattr(
+                        env_cfg.data_collection, "image_writer_threads", 10
+                    ),
+                    image_writer_processes=getattr(
+                        env_cfg.data_collection, "image_writer_processes", 0
+                    ),
                 )
             env_list.append(env)
         return env_list

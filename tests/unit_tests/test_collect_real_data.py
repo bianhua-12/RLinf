@@ -54,6 +54,12 @@ def test_initialize_collection_storage_skips_demos_when_disabled(monkeypatch, tm
                     "data_collection": {
                         "enabled": True,
                         "save_dir": str(tmp_path / "collected_data"),
+                        "use_videos": True,
+                        "finalize_interval": 0,
+                        "defer_video_encoding_until_finalize": True,
+                        "isolate_episode_stats": True,
+                        "image_writer_threads": 12,
+                        "image_writer_processes": 0,
                     }
                 }
             },
@@ -71,6 +77,12 @@ def test_initialize_collection_storage_skips_demos_when_disabled(monkeypatch, tm
 
     collect_episode.assert_called_once()
     assert collect_episode.call_args.kwargs["copy_observations"] is False
+    assert (
+        collect_episode.call_args.kwargs["defer_video_encoding_until_finalize"] is True
+    )
+    assert collect_episode.call_args.kwargs["isolate_episode_stats"] is True
+    assert collect_episode.call_args.kwargs["image_writer_threads"] == 12
+    assert collect_episode.call_args.kwargs["image_writer_processes"] == 0
     replay_buffer.assert_not_called()
     assert collector.buffer is None
     assert not (tmp_path / "demos").exists()
@@ -143,3 +155,35 @@ def test_step_deadline_compensates_for_previous_oversleep(monkeypatch):
     assert [args[0] for args, _ in sleep.call_args_list] == pytest.approx(
         [1.0 / 30.0 - 0.010, 2.0 / 30.0 - 0.034]
     )
+
+
+def test_run_collection_honors_graceful_stop_request(tmp_path):
+    env = MagicMock()
+    env.reset.return_value = ({}, {})
+    collector = collect_real_data.DataCollector.__new__(collect_real_data.DataCollector)
+    collector.env = env
+    collector.save_demos = False
+    collector.num_data_episodes = 50
+    collector._preexisting_success = 0
+    collector._stop_request_path = tmp_path / ".stop_collection"
+    collector._stop_request_path.touch()
+    collector.log_info = MagicMock()
+
+    collector._run_collection()
+
+    env.reset.assert_called_once_with()
+    env.step.assert_not_called()
+    assert "Graceful stop requested" in collector.log_info.call_args.args[0]
+
+
+def test_sigint_handler_requests_stop_then_forces_exit(tmp_path):
+    stop_path = tmp_path / ".stop_collection"
+    logger = MagicMock()
+    handler = collect_real_data._GracefulStopSignalHandler(stop_path, logger)
+
+    handler(None, None)
+
+    assert stop_path.exists()
+    logger.warning.assert_called_once()
+    with pytest.raises(KeyboardInterrupt):
+        handler(None, None)
