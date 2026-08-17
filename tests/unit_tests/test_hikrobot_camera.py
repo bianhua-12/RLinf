@@ -36,12 +36,20 @@ def test_hikrobot_undistort_maps_are_square_with_100_degree_fov():
     import cv2
 
     map1, map2 = HikrobotCamera._create_undistort_maps(cv2)
-    focal_length = HikrobotCamera._K_100_SQUARE[0, 0]
+    output_matrix = HikrobotCamera._output_camera_matrix()
+    focal_length = output_matrix[0, 0]
     half_size = HikrobotCamera._OUTPUT_SIZE / 2
     field_of_view = math.degrees(2 * math.atan(half_size / focal_length))
+    scale = HikrobotCamera._OUTPUT_SIZE / HikrobotCamera._REFERENCE_OUTPUT_SIZE
 
-    assert map1.shape[:2] == (1080, 1080)
-    assert map2.shape == (1080, 1080)
+    assert map1.shape[:2] == (224, 224)
+    assert map2.shape == (224, 224)
+    assert math.isclose(
+        focal_length,
+        HikrobotCamera._K_100_SQUARE_REFERENCE[0, 0] * scale,
+    )
+    assert math.isclose(output_matrix[0, 2], half_size)
+    assert math.isclose(output_matrix[1, 2], half_size)
     assert math.isclose(field_of_view, 100.0)
 
 
@@ -50,10 +58,7 @@ def test_hikrobot_enables_continuous_auto_features():
     camera = HikrobotCamera.__new__(HikrobotCamera)
     camera._sdk = SimpleNamespace(MV_OK=0)
     camera._camera = SimpleNamespace(
-        MV_CC_SetEnumValueByString=lambda key, value: calls.append(
-            (key, value)
-        )
-        or 0,
+        MV_CC_SetEnumValueByString=lambda key, value: calls.append((key, value)) or 0,
     )
 
     camera._enable_continuous_auto_features()

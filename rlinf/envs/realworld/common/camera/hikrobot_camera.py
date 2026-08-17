@@ -52,7 +52,8 @@ class HikrobotCamera(BaseCamera):
     _SERIAL_NUMBER = "DA6135161"
     _NATIVE_W = 1440
     _NATIVE_H = 1080
-    _OUTPUT_SIZE = 1080
+    _REFERENCE_OUTPUT_SIZE = 1080
+    _OUTPUT_SIZE = 224
     _K = np.array(
         [
             [329.3108299651, 0.0, 755.1510914205],
@@ -65,7 +66,7 @@ class HikrobotCamera(BaseCamera):
         [-0.0112917342, -0.0066525146, -0.0019194655, 0.0005036831],
         dtype=np.float64,
     )
-    _K_100_SQUARE = np.array(
+    _K_100_SQUARE_REFERENCE = np.array(
         [
             [453.1138008357, 0.0, 540.0],
             [0.0, 453.1138008357, 540.0],
@@ -124,12 +125,20 @@ class HikrobotCamera(BaseCamera):
             raise
 
     @classmethod
+    def _output_camera_matrix(cls) -> np.ndarray:
+        scale = cls._OUTPUT_SIZE / cls._REFERENCE_OUTPUT_SIZE
+        matrix = cls._K_100_SQUARE_REFERENCE.copy()
+        matrix[0] *= scale
+        matrix[1] *= scale
+        return matrix
+
+    @classmethod
     def _create_undistort_maps(cls, cv2):
         return cv2.fisheye.initUndistortRectifyMap(
             cls._K,
             cls._D,
             np.eye(3),
-            cls._K_100_SQUARE,
+            cls._output_camera_matrix(),
             (cls._OUTPUT_SIZE, cls._OUTPUT_SIZE),
             cv2.CV_16SC2,
         )
