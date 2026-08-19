@@ -255,6 +255,11 @@ The command continuously refreshes output, for example:
 The GELLO gripper value is continuous: ``0`` maps to a fully open Robotiq
 gripper, ``1`` maps to fully closed, and intermediate values retain partial
 openings (for example, ``0.5`` commands the halfway position).
+For grippers that need more force at the mechanical stop, set the per-arm
+``left_gripper_close_force`` or ``right_gripper_close_force`` in
+``override_cfg`` to a value in ``[0, 255]``. The force is used only at the
+fully closed target; intermediate targets remain continuous. Use the lowest
+force that closes the gripper reliably.
 
 If values stop updating or jump by about ``2π``, run the calibration below.
 

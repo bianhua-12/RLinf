@@ -59,6 +59,8 @@ class Ros2ControllerConfig:
     right_gripper_type: str
     left_gripper_connection: str
     right_gripper_connection: str
+    left_gripper_close_force: float = 130.0
+    right_gripper_close_force: float = 130.0
     ros_discovery_timeout: float = 2.0
     ros_wait_timeout: float = 30.0
     ros_state_max_age: float = 0.5
@@ -464,7 +466,8 @@ class Ros2DualFrankaBackend:
                     if target == 0:
                         gripper.open(speed=1.0)
                     elif target == 255:
-                        gripper.close(speed=1.0)
+                        force = getattr(self.config, f"{side}_gripper_close_force")
+                        gripper.close(speed=1.0, force=force)
                     else:
                         gripper.move(target, speed=1.0)
                     applied_target = target

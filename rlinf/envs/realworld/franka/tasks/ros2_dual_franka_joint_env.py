@@ -46,6 +46,8 @@ class Ros2DualFrankaJointRobotConfig(DualFrankaJointRobotConfig):
     controlled_motion_tolerance: float = 0.03
     controlled_motion_timeout: float = 180.0
     controlled_motion_stable_time: float = 0.5
+    left_gripper_close_force: float = 130.0
+    right_gripper_close_force: float = 130.0
 
 
 class Ros2DualFrankaJointEnv(DualFrankaJointEnv):
@@ -126,6 +128,8 @@ class Ros2DualFrankaJointEnv(DualFrankaJointEnv):
                 or self._DEFAULT_GRIPPER_TYPE,
                 left_gripper_connection=self.config.left_gripper_connection,
                 right_gripper_connection=self.config.right_gripper_connection,
+                left_gripper_close_force=self.config.left_gripper_close_force,
+                right_gripper_close_force=self.config.right_gripper_close_force,
                 ros_discovery_timeout=self.config.ros_discovery_timeout,
                 ros_wait_timeout=self.config.ros_wait_timeout,
                 ros_state_max_age=self.config.ros_state_max_age,

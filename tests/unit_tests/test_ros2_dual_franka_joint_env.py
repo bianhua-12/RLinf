@@ -48,6 +48,8 @@ def test_robotiq_polling_defaults_to_30_hz():
     )
 
     assert config.gripper_poll_interval == 1.0 / 30.0
+    assert config.left_gripper_close_force == 130.0
+    assert config.right_gripper_close_force == 130.0
 
 
 @pytest.mark.parametrize(
@@ -88,8 +90,8 @@ def test_ros2_backend_applies_intermediate_gripper_position(monkeypatch):
         def open(self, speed):
             self.calls.append(("open", speed))
 
-        def close(self, speed):
-            self.calls.append(("close", speed))
+        def close(self, speed, force=130.0):
+            self.calls.append(("close", speed, force))
 
         def move(self, position, speed):
             self.calls.append(("move", position, speed))
@@ -122,6 +124,49 @@ def test_ros2_backend_applies_intermediate_gripper_position(monkeypatch):
     assert gripper.calls == [("move", 128, 1.0)]
     assert backend._gripper_positions["left"] == 0.0425
     assert not backend._gripper_open["left"]
+
+
+@pytest.mark.parametrize(("side", "force"), [("left", 255.0), ("right", 255.0)])
+def test_ros2_backend_applies_per_arm_force_at_fully_closed_target(
+    monkeypatch, side, force
+):
+    class Gripper:
+        def __init__(self):
+            self.calls = []
+
+        def close(self, speed, force):
+            self.calls.append(("close", speed, force))
+
+        @property
+        def position(self):
+            backend._gripper_running = False
+            return 0.0
+
+        @property
+        def is_open(self):
+            return False
+
+    gripper = Gripper()
+    backend = object.__new__(Ros2DualFrankaBackend)
+    backend.config = SimpleNamespace(
+        gripper_poll_interval=0.0,
+        left_gripper_close_force=255.0,
+        right_gripper_close_force=255.0,
+    )
+    backend._lock = threading.Lock()
+    backend._grippers = {side: gripper}
+    backend._gripper_targets = {side: 255}
+    backend._gripper_positions = {side: None}
+    backend._gripper_open = {side: True}
+    backend._gripper_errors = {side: None}
+    backend._gripper_running = True
+    monkeypatch.setattr(
+        "rlinf.envs.realworld.franka.ros2_controller.time.sleep", lambda _: None
+    )
+
+    backend._gripper_loop(side)
+
+    assert gripper.calls == [("close", 1.0, force)]
 
 
 @pytest.mark.parametrize("position", [-1, 256, float("nan"), float("inf")])
