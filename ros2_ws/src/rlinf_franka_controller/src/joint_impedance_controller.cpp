@@ -14,8 +14,14 @@
 
 #include <rlinf_franka_controller/joint_impedance_controller.hpp>
 
+#include <franka_example_controllers/default_robot_behavior_utils.hpp>
+#include <franka_msgs/srv/set_full_collision_behavior.hpp>
+
 #include <Eigen/Eigen>
+#include <chrono>
 #include <cmath>
+#include <exception>
+#include <future>
 #include <string>
 
 using std::placeholders::_1;
@@ -59,8 +65,8 @@ JointImpedanceController::update(const rclcpp::Time &time,
   }
 
   const JointTarget joint_target = *joint_target_buffer_.readFromRT();
-  const bool new_target = joint_target.valid &&
-                          joint_target.received_time > command_epoch_;
+  const bool new_target =
+      joint_target.valid && joint_target.received_time > command_epoch_;
 
   if (control_state_ == ControlState::RESETTING) {
     auto trajectory_time = this->get_node()->now() - start_time_;
@@ -152,6 +158,8 @@ CallbackReturn JointImpedanceController::on_init() {
   auto_declare<double>("k_alpha", 0.99);
   auto_declare<double>("reset_speed_factor", 0.012);
   auto_declare<double>("command_timeout", 0.5);
+  auto_declare<double>("cartesian_collision_threshold_scale", 1.0);
+  auto_declare<double>("collision_service_timeout", 2.0);
   auto_declare<std::string>("command_topic", "rlinf/joint_targets");
   auto_declare<std::string>("reset_topic", "rlinf/reset_joint_target");
   return CallbackReturn::SUCCESS;
@@ -174,6 +182,12 @@ CallbackReturn JointImpedanceController::on_configure(
   reset_speed_factor_ =
       get_node()->get_parameter("reset_speed_factor").as_double();
   command_timeout_ = get_node()->get_parameter("command_timeout").as_double();
+  cartesian_collision_threshold_scale_ =
+      get_node()
+          ->get_parameter("cartesian_collision_threshold_scale")
+          .as_double();
+  collision_service_timeout_ =
+      get_node()->get_parameter("collision_service_timeout").as_double();
 
   if (!validateGains_(k_gains) || !validateGains_(d_gains)) {
     return CallbackReturn::FAILURE;
@@ -192,10 +206,18 @@ CallbackReturn JointImpedanceController::on_configure(
   if (command_timeout_ <= 0.0) {
     return CallbackReturn::FAILURE;
   }
+  if (cartesian_collision_threshold_scale_ <= 0.0 ||
+      collision_service_timeout_ <= 0.0) {
+    return CallbackReturn::FAILURE;
+  }
 
   k_alpha_ = k_alpha;
 
   dq_filtered_.setZero();
+
+  if (!configureCollisionBehavior_()) {
+    return CallbackReturn::ERROR;
+  }
 
   joint_state_subscriber_ =
       get_node()->create_subscription<sensor_msgs::msg::JointState>(
@@ -203,13 +225,69 @@ CallbackReturn JointImpedanceController::on_configure(
           [this](const sensor_msgs::msg::JointState &msg) {
             jointStateCallback_(msg);
           });
-  reset_subscriber_ = get_node()->create_subscription<sensor_msgs::msg::JointState>(
-      get_node()->get_parameter("reset_topic").as_string(), 1,
-      [this](const sensor_msgs::msg::JointState &msg) {
-        resetTargetCallback_(msg);
-      });
+  reset_subscriber_ =
+      get_node()->create_subscription<sensor_msgs::msg::JointState>(
+          get_node()->get_parameter("reset_topic").as_string(), 1,
+          [this](const sensor_msgs::msg::JointState &msg) {
+            resetTargetCallback_(msg);
+          });
 
   return CallbackReturn::SUCCESS;
+}
+
+bool JointImpedanceController::configureCollisionBehavior_() {
+  using CollisionService = franka_msgs::srv::SetFullCollisionBehavior;
+  const auto timeout =
+      std::chrono::duration<double>(collision_service_timeout_);
+  auto client = get_node()->create_client<CollisionService>(
+      "service_server/set_full_collision_behavior");
+
+  if (!client->wait_for_service(timeout)) {
+    // Fake hardware has no Franka parameter service. Real hardware exposes the
+    // service before controller configuration starts.
+    RCLCPP_WARN(get_node()->get_logger(),
+                "Collision behavior service unavailable; keeping the current "
+                "robot thresholds");
+    return true;
+  }
+
+  auto request = DefaultRobotBehavior::getDefaultCollisionBehaviorRequest();
+  auto scale_thresholds = [this](auto &thresholds) {
+    for (double &threshold : thresholds) {
+      threshold *= cartesian_collision_threshold_scale_;
+    }
+  };
+  scale_thresholds(request->lower_force_thresholds_acceleration);
+  scale_thresholds(request->upper_force_thresholds_acceleration);
+  scale_thresholds(request->lower_force_thresholds_nominal);
+  scale_thresholds(request->upper_force_thresholds_nominal);
+
+  auto future = client->async_send_request(request);
+  if (future.wait_for(timeout) != std::future_status::ready) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "Timed out while setting Franka collision behavior");
+    return false;
+  }
+  CollisionService::Response::SharedPtr response;
+  try {
+    response = future.get();
+  } catch (const std::exception &error) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "Collision behavior service call failed: %s", error.what());
+    return false;
+  }
+  if (!response->success) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "Failed to set Franka collision behavior: %s",
+                 response->error.c_str());
+    return false;
+  }
+
+  RCLCPP_INFO(get_node()->get_logger(),
+              "Cartesian collision thresholds set to %.2fx the Franka "
+              "default; joint collision thresholds remain at the default",
+              cartesian_collision_threshold_scale_);
+  return true;
 }
 
 CallbackReturn JointImpedanceController::on_activate(

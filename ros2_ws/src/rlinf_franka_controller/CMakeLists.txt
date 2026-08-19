@@ -10,6 +10,7 @@ find_package(controller_interface REQUIRED)
 find_package(controller_manager REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(franka_example_controllers REQUIRED)
+find_package(franka_msgs REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
@@ -23,6 +24,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC include ${EIGEN3_INCLUDE_DIRS}
 ament_target_dependencies(${PROJECT_NAME}
   controller_interface
   franka_example_controllers
+  franka_msgs
   pluginlib
   rclcpp
   rclcpp_lifecycle
@@ -70,6 +72,7 @@ ament_export_libraries(${PROJECT_NAME})
 ament_export_dependencies(
   controller_interface
   franka_example_controllers
+  franka_msgs
   pluginlib
   rclcpp
   rclcpp_lifecycle

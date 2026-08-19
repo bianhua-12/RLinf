@@ -10,6 +10,7 @@
   <depend>controller_interface</depend>
   <depend>controller_manager</depend>
   <depend>franka_example_controllers</depend>
+  <depend>franka_msgs</depend>
   <exec_depend>franka_description</exec_depend>
   <exec_depend>franka_hardware</exec_depend>
   <exec_depend>franka_robot_state_broadcaster</exec_depend>

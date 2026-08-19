@@ -14,11 +14,11 @@
 
 #pragma once
 
-#include <franka_example_controllers/motion_generator.hpp>
 #include <Eigen/Eigen>
 #include <array>
 #include <atomic>
 #include <controller_interface/controller_interface.hpp>
+#include <franka_example_controllers/motion_generator.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <realtime_tools/realtime_buffer.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
@@ -68,6 +68,8 @@ private:
   double k_alpha_;
   double reset_speed_factor_;
   double command_timeout_;
+  double cartesian_collision_threshold_scale_;
+  double collision_service_timeout_;
   ControlState control_state_{ControlState::HOLDING};
   std::atomic<bool> reset_requested_{false};
   bool move_to_start_position_finished_{false};
@@ -76,12 +78,13 @@ private:
   std::unique_ptr<MotionGenerator> motion_generator_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
       joint_state_subscriber_ = nullptr;
-  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr reset_subscriber_ =
-      nullptr;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
+      reset_subscriber_ = nullptr;
   realtime_tools::RealtimeBuffer<JointTarget> joint_target_buffer_;
   realtime_tools::RealtimeBuffer<JointTarget> reset_target_buffer_;
 
   Vector7d calculateTauDGains_(const Vector7d &q_goal);
+  bool configureCollisionBehavior_();
   bool validateGains_(const std::vector<double> &gains);
   void initializeResetMotion_();
   void updateJointStates_();

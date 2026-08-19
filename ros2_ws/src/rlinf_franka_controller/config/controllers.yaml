@@ -21,6 +21,10 @@
       d_gains: [20.0,  20.0,  20.0,  10.0,  10.0, 10.0,  5.0]
       reset_speed_factor: 0.1
       command_timeout: 0.5
+      # The recent hardware faults are cartesian_reflex events. Keep the joint
+      # thresholds at Franka defaults and raise only Cartesian thresholds.
+      cartesian_collision_threshold_scale: 2.0
+      collision_service_timeout: 2.0
       command_topic: rlinf/joint_targets
       reset_topic: rlinf/reset_joint_target
 

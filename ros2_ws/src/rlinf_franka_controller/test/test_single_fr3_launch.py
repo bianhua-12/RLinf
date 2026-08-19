@@ -16,6 +16,7 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+import yaml
 from launch import LaunchContext
 
 
@@ -55,3 +56,11 @@ def test_control_loop_mode_matches_hardware(
         "controllers.yaml", "<robot/>", use_fake_hardware == "true"
     )
     assert {"robot_driven_loop": robot_driven_loop} in parameters
+
+
+def test_cartesian_collision_thresholds_are_doubled():
+    config_path = Path(__file__).parents[1] / "config" / "controllers.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    params = config["/**"]["joint_impedance_controller"]["ros__parameters"]
+    assert params["cartesian_collision_threshold_scale"] == 2.0
