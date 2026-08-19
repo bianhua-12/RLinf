@@ -252,6 +252,10 @@ The command continuously refreshes output, for example:
 
    joints=[+0.012 -0.604 +0.031 -2.184 +0.019 +1.571 +0.781]  gripper=[0.035]
 
+The GELLO gripper value is continuous: ``0`` maps to a fully open Robotiq
+gripper, ``1`` maps to fully closed, and intermediate values retain partial
+openings (for example, ``0.5`` commands the halfway position).
+
 If values stop updating or jump by about ``2π``, run the calibration below.
 
 GELLO calibration

@@ -48,8 +48,8 @@ override_cfg:
   # Scaling factor for delta mode (rad per unit action). Ignored in absolute.
   joint_action_scale: 0.1
   max_num_steps: 300
-  # Only [2] (gripper channel) is consumed in joint-space; [0] / [1] are
-  # Cartesian-only and ignored here.
+  # Only [2] (continuous gripper channel) is consumed in joint-space;
+  # [0] / [1] are Cartesian-only and ignored here.
   action_scale: [1.0, 1.0, 1.0]
   # Per-arm (2, 6) [xyz, euler_xyz (rad)] bounds used to build the obs / action
   # space and to clip tcp_target. XYZ is a workspace safety box; euler is

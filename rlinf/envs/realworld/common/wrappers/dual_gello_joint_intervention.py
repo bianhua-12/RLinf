@@ -60,7 +60,6 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         self._stream_running = False
         self._stream_error: Exception | None = None
         self._closed = False
-        self._stream_last_gripper_open: list[bool | None] = [None, None]
         self._stream_gate = threading.Event()
         self._stream_gate.set()  # gate open = stream tick allowed
         self._aligned = False
@@ -98,15 +97,13 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         self._stream_thread.start()
 
     def _stream_loop(self) -> None:
-        # Gripper events are edge-triggered: open/close RPCs are ~100 ms
-        # and streaming them at 1 kHz would starve the serial channel.
+        # The environment step owns gripper commands at the collection rate;
+        # sending serial commands from this 1 kHz loop would starve the bus.
         left_ctrl, right_ctrl = self._resolve_controllers()
         if left_ctrl is None or right_ctrl is None:
             return
 
         period = self._stream_period
-        ctrls = (left_ctrl, right_ctrl)
-
         try:
             while self._stream_running:
                 self._stream_gate.wait()
@@ -120,28 +117,13 @@ class DualGelloJointIntervention(gym.ActionWrapper):
                         "GELLO input was lost; controlled realignment is required"
                     )
 
-                left_q, left_g = self.left_expert.get_action()
-                right_q, right_g = self.right_expert.get_action()
+                left_q, _ = self.left_expert.get_action()
+                right_q, _ = self.right_expert.get_action()
 
                 lf = left_ctrl.move_joints(left_q.astype(np.float32))
                 rf = right_ctrl.move_joints(right_q.astype(np.float32))
                 lf.wait()
                 rf.wait()
-
-                if self.gripper_enabled:
-                    for arm_idx, (ctrl, grip) in enumerate(
-                        zip(ctrls, (left_g, right_g))
-                    ):
-                        is_open_now = grip.item() < 0.5
-                        prev = self._stream_last_gripper_open[arm_idx]
-                        if prev is None:
-                            self._stream_last_gripper_open[arm_idx] = is_open_now
-                        elif is_open_now != prev:
-                            if is_open_now:
-                                ctrl.open_gripper()
-                            else:
-                                ctrl.close_gripper()
-                            self._stream_last_gripper_open[arm_idx] = is_open_now
 
                 elapsed = time.time() - loop_start
                 sleep_for = period - elapsed
@@ -173,25 +155,25 @@ class DualGelloJointIntervention(gym.ActionWrapper):
                 arm_a = target_q.copy()
             per_arm.append(arm_a)
 
-        gripper_active = False
         if self.gripper_enabled:
             grippers = []
             for grip in (left_g, right_g):
                 g = -(2 * grip - 1.0)
                 g = np.clip(g, -1.0, 1.0)
                 grippers.append(g)
-                if np.abs(g).item() > 0.5:
-                    gripper_active = True
             expert_a = np.concatenate(
                 [per_arm[0], grippers[0], per_arm[1], grippers[1]], axis=0
             )
         else:
             expert_a = np.concatenate(per_arm, axis=0)
 
+        if self._direct_stream and self._aligned:
+            return expert_a, True
+
         movement = np.linalg.norm(
             np.concatenate([left_q, right_q]) - np.concatenate([current[0], current[1]])
         )
-        if movement > 0.01 or gripper_active:
+        if movement > 0.01 or self.gripper_enabled:
             self.last_intervene = time.time()
 
         if time.time() - self.last_intervene < 0.5:

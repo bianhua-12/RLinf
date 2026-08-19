@@ -96,6 +96,14 @@ class Ros2DualFrankaJointEnv(DualFrankaJointEnv):
         """Return the placeholder reward used by manual data collection."""
         return 0.0
 
+    def _gripper_action(self, ctrl, state, position: float) -> bool:
+        """Map the continuous action to an absolute Robotiq position target."""
+        del state
+        normalized_position = float(np.clip(position, -1.0, 1.0))
+        robotiq_position = round((1.0 - normalized_position) * 255.0 / 2.0)
+        ctrl.move_gripper(robotiq_position)
+        return True
+
     def _setup_hardware(self) -> None:
         self._resolve_hw_overrides()
         required = {

@@ -89,7 +89,8 @@ class Ros2DualFrankaBackend:
         self._grippers = {}
         self._gripper_positions = {"left": None, "right": None}
         self._gripper_open = {"left": True, "right": True}
-        self._gripper_targets = {"left": None, "right": None}
+        # Raw Robotiq position targets: 0 is fully open, 255 is fully closed.
+        self._gripper_targets: dict[str, int | None] = {"left": None, "right": None}
         self._gripper_errors = {"left": None, "right": None}
         self._gripper_running = False
         self._gripper_threads = []
@@ -424,12 +425,20 @@ class Ros2DualFrankaBackend:
         self._check_process(side)
 
     def open_gripper(self, side: str) -> None:
-        with self._lock:
-            self._gripper_targets[side] = True
+        self.move_gripper(side, 0)
 
     def close_gripper(self, side: str) -> None:
+        self.move_gripper(side, 255)
+
+    def move_gripper(self, side: str, position: float) -> None:
+        """Queue an absolute Robotiq position target without blocking."""
+        position = float(position)
+        if not np.isfinite(position) or not 0.0 <= position <= 255.0:
+            raise ValueError(
+                f"{side} gripper position must be finite and within [0, 255]"
+            )
         with self._lock:
-            self._gripper_targets[side] = False
+            self._gripper_targets[side] = int(round(position))
 
     def _start_gripper_threads(self) -> None:
         self._gripper_running = True
@@ -452,15 +461,21 @@ class Ros2DualFrankaBackend:
                 with self._lock:
                     target = self._gripper_targets[side]
                 if target is not None and target != applied_target:
-                    if target:
+                    if target == 0:
                         gripper.open(speed=1.0)
-                    else:
+                    elif target == 255:
                         gripper.close(speed=1.0)
+                    else:
+                        gripper.move(target, speed=1.0)
                     applied_target = target
                 position = gripper.position
                 with self._lock:
                     self._gripper_positions[side] = position
-                    self._gripper_open[side] = gripper.is_open
+                    self._gripper_open[side] = (
+                        gripper.is_open
+                        if applied_target is None
+                        else applied_target < 128
+                    )
             except Exception as exc:
                 with self._lock:
                     self._gripper_errors[side] = exc
@@ -533,3 +548,6 @@ class Ros2FrankaControllerProxy:
 
     def close_gripper(self) -> None:
         self._backend.close_gripper(self._side)
+
+    def move_gripper(self, position: float) -> None:
+        self._backend.move_gripper(self._side, position)

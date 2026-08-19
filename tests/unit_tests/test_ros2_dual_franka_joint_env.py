@@ -50,6 +50,90 @@ def test_robotiq_polling_defaults_to_30_hz():
     assert config.gripper_poll_interval == 1.0 / 30.0
 
 
+@pytest.mark.parametrize(
+    ("action", "expected_position"),
+    [(1.0, 0), (0.0, 128), (-1.0, 255), (2.0, 0), (-2.0, 255)],
+)
+def test_ros2_joint_env_maps_continuous_gripper_action(action, expected_position):
+    class Controller:
+        def __init__(self):
+            self.positions = []
+
+        def move_gripper(self, position):
+            self.positions.append(position)
+
+    env = object.__new__(Ros2DualFrankaJointEnv)
+    controller = Controller()
+
+    assert env._gripper_action(controller, None, action)
+    assert controller.positions == [expected_position]
+
+
+def test_ros2_backend_queues_absolute_gripper_position():
+    backend = object.__new__(Ros2DualFrankaBackend)
+    backend._lock = threading.Lock()
+    backend._gripper_targets = {"left": None, "right": None}
+
+    backend.move_gripper("left", 127.6)
+    backend.open_gripper("right")
+
+    assert backend._gripper_targets == {"left": 128, "right": 0}
+
+
+def test_ros2_backend_applies_intermediate_gripper_position(monkeypatch):
+    class Gripper:
+        def __init__(self):
+            self.calls = []
+
+        def open(self, speed):
+            self.calls.append(("open", speed))
+
+        def close(self, speed):
+            self.calls.append(("close", speed))
+
+        def move(self, position, speed):
+            self.calls.append(("move", position, speed))
+
+        @property
+        def position(self):
+            backend._gripper_running = False
+            return 0.0425
+
+        @property
+        def is_open(self):
+            return True
+
+    gripper = Gripper()
+    backend = object.__new__(Ros2DualFrankaBackend)
+    backend.config = SimpleNamespace(gripper_poll_interval=0.0)
+    backend._lock = threading.Lock()
+    backend._grippers = {"left": gripper}
+    backend._gripper_targets = {"left": 128}
+    backend._gripper_positions = {"left": None}
+    backend._gripper_open = {"left": True}
+    backend._gripper_errors = {"left": None}
+    backend._gripper_running = True
+    monkeypatch.setattr(
+        "rlinf.envs.realworld.franka.ros2_controller.time.sleep", lambda _: None
+    )
+
+    backend._gripper_loop("left")
+
+    assert gripper.calls == [("move", 128, 1.0)]
+    assert backend._gripper_positions["left"] == 0.0425
+    assert not backend._gripper_open["left"]
+
+
+@pytest.mark.parametrize("position", [-1, 256, float("nan"), float("inf")])
+def test_ros2_backend_rejects_invalid_gripper_position(position):
+    backend = object.__new__(Ros2DualFrankaBackend)
+    backend._lock = threading.Lock()
+    backend._gripper_targets = {"left": None, "right": None}
+
+    with pytest.raises(ValueError, match=r"within \[0, 255\]"):
+        backend.move_gripper("left", position)
+
+
 def test_observation_deadline_subtracts_previous_post_read_work(monkeypatch):
     env = object.__new__(Ros2DualFrankaJointEnv)
     env.config = SimpleNamespace(step_frequency=30.0)

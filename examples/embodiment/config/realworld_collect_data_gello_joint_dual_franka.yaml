@@ -92,7 +92,8 @@ env:
         - [0.5,  0.2, 0.5, -3.14, 0.0, 0.0]
       success_hold_steps: 1
       # Keep direct_stream ON so the 1 kHz daemon owns move_joints and
-      # env.step only reads state / grippers.  Pair with
+      # env.step reads state and sends continuous gripper targets at the
+      # collection rate. Pair with
       # use_gello_joint=True above.
       teleop_direct_stream: true
 
