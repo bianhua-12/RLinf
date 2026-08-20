@@ -194,7 +194,9 @@ def build_observation(raw_obs: dict[str, Any], task: str) -> dict[str, Any]:
             [joints[:7], grippers[:1], joints[7:], grippers[1:]], dtype=np.float32
         )
     if state.shape != (ACTION_DIM,) or not np.isfinite(state).all():
-        raise ValueError(f"Franka proprio must be finite shape ({ACTION_DIM},), got {state.shape}")
+        raise ValueError(
+            f"Franka proprio must be finite shape ({ACTION_DIM},), got {state.shape}"
+        )
 
     def image(key: str) -> np.ndarray:
         value = np.asarray(frames[key], dtype=np.uint8)
@@ -254,7 +256,9 @@ def add_rtc_prefix(
     observation: dict[str, Any], previous_actions: np.ndarray, executed: int, delay: int
 ) -> dict[str, Any]:
     if not 1 <= delay <= TRAINING_RTC_MAX_DELAY:
-        raise ValueError(f"RTC delay must be in [1,{TRAINING_RTC_MAX_DELAY}], got {delay}")
+        raise ValueError(
+            f"RTC delay must be in [1,{TRAINING_RTC_MAX_DELAY}], got {delay}"
+        )
     if executed < 0 or executed + delay > ACTION_HORIZON:
         raise ValueError(
             f"RTC prefix [{executed}:{executed + delay}] exceeds horizon {ACTION_HORIZON}"
@@ -379,9 +383,7 @@ def run_policy(env, policy: AsyncPi05Client, task: str) -> str:
             and pending is None
             and 2 <= action_index < ACTION_HORIZON
         ):
-            requested_delay = min(
-                max(delay_history), ACTION_HORIZON - action_index
-            )
+            requested_delay = min(max(delay_history), ACTION_HORIZON - action_index)
             observation = build_observation(latest_obs, task)
             observation = add_rtc_prefix(
                 observation, action_chunk, action_index, requested_delay
@@ -526,7 +528,9 @@ def _joint_reset(value: str) -> list[list[float]]:
         parsed = json.loads(value)
         array = np.asarray(parsed, dtype=np.float64)
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError("joint reset must be a JSON 2x7 array") from exc
+        raise argparse.ArgumentTypeError(
+            "joint reset must be a JSON 2x7 array"
+        ) from exc
     if array.shape != (2, 7) or not np.isfinite(array).all():
         raise argparse.ArgumentTypeError("joint reset must be a finite JSON 2x7 array")
     return array.tolist()
@@ -543,7 +547,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-s", type=float, default=15.0)
     parser.add_argument("--episode-timeout-s", type=float, default=120.0)
     parser.add_argument("--task", default=DEFAULT_TASK)
-    parser.add_argument("--joint-reset-qpos", type=_joint_reset, default=DEFAULT_JOINT_RESET_QPOS)
+    parser.add_argument(
+        "--joint-reset-qpos", type=_joint_reset, default=DEFAULT_JOINT_RESET_QPOS
+    )
     parser.add_argument("--left-robot-ip", default="172.16.0.1")
     parser.add_argument("--right-robot-ip", default="172.16.0.2")
     parser.add_argument("--base-camera-type", default="realsense")
@@ -676,8 +682,7 @@ def main() -> None:
             "port, timeout-s, episode-timeout-s, and num-episodes must be positive and valid"
         )
     if args.enable_pico and (
-        not 0.0 < args.pico_control_threshold <= 1.0
-        or args.pico_ready_timeout_s <= 0.0
+        not 0.0 < args.pico_control_threshold <= 1.0 or args.pico_ready_timeout_s <= 0.0
     ):
         raise SystemExit("PICO threshold and timeout must be positive and valid")
     input("Press Enter to open hardware (Ctrl+C to cancel): ")
@@ -693,9 +698,7 @@ def main() -> None:
         print(f"Saving policy rollouts to {args.rollout_dir}")
         for episode_index in range(args.num_episodes):
             result = run_policy(env, policy, args.task)
-            print(
-                f"Episode {episode_index + 1}/{args.num_episodes} result: {result}"
-            )
+            print(f"Episode {episode_index + 1}/{args.num_episodes} result: {result}")
             if episode_index + 1 < args.num_episodes:
                 print("Resetting arms for the next episode.")
     finally:

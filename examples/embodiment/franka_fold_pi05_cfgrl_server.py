@@ -105,7 +105,9 @@ def warmup_policy(policy: PositiveConditionPolicy) -> None:
         franka_fold_policy.ACTION_DIM,
     )
     if actions.shape != expected:
-        raise ValueError(f"Warmup returned actions shape {actions.shape}, expected {expected}")
+        raise ValueError(
+            f"Warmup returned actions shape {actions.shape}, expected {expected}"
+        )
 
     rtc = policy.infer(
         {

@@ -90,12 +90,11 @@ def test_cfgrl_server_rewrites_prompt_to_one_positive_condition():
     policy.infer(observation)
 
     assert observation["prompt"] == client.DEFAULT_TASK
-    assert delegate.observation["prompt"] == (
-        "fold the clothes\nAdvantage: positive"
+    assert delegate.observation["prompt"] == ("fold the clothes\nAdvantage: positive")
+    assert (
+        cfgrl_server.positive_condition_prompt(delegate.observation["prompt"])
+        == delegate.observation["prompt"]
     )
-    assert cfgrl_server.positive_condition_prompt(
-        delegate.observation["prompt"]
-    ) == delegate.observation["prompt"]
 
 
 def _observation():
