@@ -267,6 +267,116 @@ def test_deferred_video_encoding_requires_no_periodic_finalize(tmp_path):
         )
 
 
+def test_stream_mp4_rejects_conflicting_deferred_mode(tmp_path):
+    with pytest.raises(ValueError, match="conflicts"):
+        CollectEpisode(
+            _FreshObservationEnv(),
+            str(tmp_path),
+            export_format="lerobot",
+            use_videos=True,
+            finalize_interval=0,
+            video_write_mode="stream_mp4",
+            defer_video_encoding_until_finalize=True,
+        )
+
+
+def test_stream_mp4_uses_preceding_observation_and_timestamp(tmp_path):
+    wrapper = CollectEpisode(
+        _FreshObservationEnv(),
+        str(tmp_path),
+        export_format="lerobot",
+        use_videos=True,
+        video_write_mode="stream_mp4",
+        copy_observations=False,
+    )
+    stream = MagicMock()
+    stream.active = True
+    wrapper._ensure_streaming_writer = MagicMock(return_value=stream)
+    wrapper.reset()
+
+    wrapper._record_step(
+        np.asarray([[3.0, 4.0]], dtype=np.float32),
+        _observation(1),
+        np.asarray([0.0]),
+        np.asarray([False]),
+        np.asarray([False]),
+        {"observation_timestamp_ns": np.asarray([200])},
+    )
+    wrapper._record_step(
+        np.asarray([[5.0, 6.0]], dtype=np.float32),
+        _observation(2),
+        np.asarray([0.0]),
+        np.asarray([False]),
+        np.asarray([False]),
+        {"observation_timestamp_ns": np.asarray([300])},
+    )
+
+    first, second = [call.args[0] for call in stream.append_frame.call_args_list]
+    np.testing.assert_array_equal(first["state"], np.asarray([0.0, 0.0]))
+    np.testing.assert_array_equal(first["actions"], np.asarray([3.0, 4.0]))
+    np.testing.assert_array_equal(first["observation_timestamp_ns"], [100])
+    np.testing.assert_array_equal(second["state"], np.asarray([1.0, 1.0]))
+    np.testing.assert_array_equal(second["observation_timestamp_ns"], [200])
+    wrapper._lerobot_writer = stream
+    wrapper.close()
+
+
+def test_stream_mp4_record_reset_aborts_active_episode(tmp_path):
+    wrapper = CollectEpisode(
+        _FreshObservationEnv(),
+        str(tmp_path),
+        export_format="lerobot",
+        use_videos=True,
+        video_write_mode="stream_mp4",
+    )
+    stream = MagicMock()
+    stream.active = True
+    wrapper._lerobot_writer = stream
+    wrapper.reset()
+    stream.abort_episode.reset_mock()
+
+    wrapper._record_step(
+        np.asarray([[1.0, 2.0]], dtype=np.float32),
+        _observation(7),
+        np.asarray([0.0]),
+        np.asarray([False]),
+        np.asarray([False]),
+        {
+            "record_reset": np.asarray([True]),
+            "observation_timestamp_ns": np.asarray([700]),
+        },
+    )
+
+    stream.abort_episode.assert_called_once_with()
+    assert wrapper._buffers[0]["actions"] == []
+    np.testing.assert_array_equal(
+        wrapper._buffers[0]["observations"][0]["main_images"],
+        _observation(7)["main_images"][0],
+    )
+    wrapper.close()
+
+
+def test_stream_mp4_success_commits_before_buffer_reset(tmp_path):
+    wrapper = CollectEpisode(
+        _FreshObservationEnv(),
+        str(tmp_path),
+        export_format="lerobot",
+        use_videos=True,
+        video_write_mode="stream_mp4",
+    )
+    stream = MagicMock()
+    stream.active = True
+    wrapper._lerobot_writer = stream
+    wrapper.reset()
+    wrapper._buffers[0]["actions"].append(np.zeros(2, dtype=np.float32))
+
+    wrapper._flush_episode(0, is_success=True)
+
+    stream.finish_episode.assert_called_once_with(task="test task", is_success=True)
+    assert wrapper._episodes_written == 1
+    wrapper.close()
+
+
 def test_lerobot_writer_receives_deferred_and_isolated_options(tmp_path):
     wrapper = CollectEpisode(
         _FreshObservationEnv(),

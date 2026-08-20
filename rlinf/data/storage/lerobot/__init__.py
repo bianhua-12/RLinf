@@ -24,9 +24,11 @@ from rlinf.data.storage.lerobot.paths import (
     resolve_lerobot_repo_id,
 )
 from rlinf.data.storage.lerobot.writer import LeRobotDatasetWriter
+from rlinf.data.storage.lerobot.streaming_writer import StreamingLeRobotDatasetWriter
 
 __all__ = [
     "LeRobotDatasetWriter",
+    "StreamingLeRobotDatasetWriter",
     "add_frame_to_dataset",
     "episode_boundaries",
     "default_hf_lerobot_home",

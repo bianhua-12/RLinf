@@ -209,7 +209,7 @@ def test_run_policy_reinfers_from_hold_after_pico_takeover():
     )
 
 
-def test_create_env_defers_video_encoding_for_pi05_and_pico(monkeypatch, tmp_path):
+def test_create_env_streams_video_for_pi05_and_pico(monkeypatch, tmp_path):
     class _HardwareEnv(gym.Env):
         action_space = gym.spaces.Box(-1.0, 1.0, (client.ACTION_DIM,))
         observation_space = gym.spaces.Dict({})
@@ -255,9 +255,11 @@ def test_create_env_defers_video_encoding_for_pi05_and_pico(monkeypatch, tmp_pat
         assert kwargs["fps"] == 30
         assert kwargs["use_videos"] is True
         assert kwargs["finalize_interval"] == 0
-        assert kwargs["defer_video_encoding_until_finalize"] is True
-        assert kwargs["isolate_episode_stats"] is True
-        assert kwargs["image_writer_threads"] == 12
+        assert kwargs["video_write_mode"] == "stream_mp4"
+        assert kwargs["stream_video_queue_size"] == 60
+        assert kwargs["defer_video_encoding_until_finalize"] is False
+        assert kwargs["isolate_episode_stats"] is False
+        assert kwargs["image_writer_threads"] == 0
         assert kwargs["image_writer_processes"] == 0
         assert kwargs["copy_observations"] is False
 

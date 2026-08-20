@@ -83,14 +83,16 @@ env:
     data_collection:
       enabled: true
       save_dir: ${runner.logger.log_path}/collected_data
-      resume: false
+      resume: true
       export_format: lerobot
       only_success: true
       robot_type: dual_FR3
       fps: 30
       use_videos: true
-      defer_video_encoding_until_finalize: true
+      video_write_mode: stream_mp4
+      stream_video_queue_size: 60
+      defer_video_encoding_until_finalize: false
       finalize_interval: 0
-      isolate_episode_stats: true
-      image_writer_threads: 12
+      isolate_episode_stats: false
+      image_writer_threads: 0
       image_writer_processes: 0
