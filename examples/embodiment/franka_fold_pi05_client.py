@@ -37,6 +37,10 @@ TRAINING_RTC_MAX_DELAY = 10
 DEFAULT_PEDAL = "/dev/input/by-id/usb-PCsensor_FootSwitch-event-kbd"
 DEFAULT_TASK = "fold the clothes"
 DEFAULT_PICO_ZMQ_ADDR = "ipc:///tmp/vr_data.ipc"
+SUPPORTED_SERVER_CONFIGS = {
+    "pi05_franka_fold_full_rtc",
+    "pi05_franka_fold_recap_cfgrl",
+}
 DEFAULT_JOINT_RESET_QPOS = [
     [
         -0.02556161,
@@ -224,6 +228,26 @@ def _clip_action_chunk(env, actions: np.ndarray) -> np.ndarray:
         np.clip(actions, env.action_space.low, env.action_space.high),
         dtype=np.float32,
     )
+
+
+def validate_server_metadata(metadata: dict[str, Any]) -> None:
+    """Validate that the policy server implements the Franka-fold RTC contract."""
+    config_name = metadata.get("config_name")
+    if config_name not in SUPPORTED_SERVER_CONFIGS:
+        raise RuntimeError(f"Unexpected OpenPI server metadata: {metadata}")
+    expected_fields = {
+        "action_horizon": ACTION_HORIZON,
+        "action_dim": ACTION_DIM,
+    }
+    mismatches = {
+        key: (metadata[key], expected)
+        for key, expected in expected_fields.items()
+        if key in metadata and metadata[key] != expected
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"OpenPI server action contract mismatch: {mismatches}; metadata={metadata}"
+        )
 
 
 def add_rtc_prefix(
@@ -520,8 +544,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint-reset-qpos", type=_joint_reset, default=DEFAULT_JOINT_RESET_QPOS)
     parser.add_argument("--left-robot-ip", default="172.16.0.1")
     parser.add_argument("--right-robot-ip", default="172.16.0.2")
-    parser.add_argument("--base-camera-type", default="hikrobot")
-    parser.add_argument("--base-camera-serial", default="DA6135161")
+    parser.add_argument("--base-camera-type", default="realsense")
+    parser.add_argument("--base-camera-serial", default="327122078534")
     parser.add_argument("--left-camera-serial", default="261922076829")
     parser.add_argument("--right-camera-serial", default="262322073199")
     parser.add_argument(
@@ -661,8 +685,7 @@ def main() -> None:
     env = None
     try:
         metadata = policy.connect()
-        if metadata.get("config_name") != "pi05_franka_fold_full_rtc":
-            raise RuntimeError(f"Unexpected OpenPI server metadata: {metadata}")
+        validate_server_metadata(metadata)
         print(f"Connected to pi0.5 server at {args.host}:{args.port}")
         env = create_env(args)
         print(f"Saving policy rollouts to {args.rollout_dir}")

@@ -14,6 +14,7 @@ from types import ModuleType
 import gymnasium as gym
 import numpy as np
 
+from examples.embodiment import franka_fold_pi05_cfgrl_server as cfgrl_server
 from examples.embodiment import franka_fold_pi05_client as client
 
 
@@ -23,8 +24,8 @@ def test_episode_timeout_defaults_to_120_seconds(monkeypatch):
     args = client.parse_args()
 
     assert args.episode_timeout_s == 120.0
-    assert args.base_camera_type == "hikrobot"
-    assert args.base_camera_serial == "DA6135161"
+    assert args.base_camera_type == "realsense"
+    assert args.base_camera_serial == "327122078534"
 
 
 def test_episode_timeout_terminates_as_failure(monkeypatch):
@@ -47,6 +48,54 @@ def test_episode_timeout_terminates_as_failure(monkeypatch):
     assert not truncated
     assert info["eval_result"] == "failure"
     assert info["success"] is False
+
+
+def test_validate_server_metadata_accepts_baseline_and_cfgrl():
+    for config_name in client.SUPPORTED_SERVER_CONFIGS:
+        client.validate_server_metadata(
+            {
+                "config_name": config_name,
+                "action_horizon": client.ACTION_HORIZON,
+                "action_dim": client.ACTION_DIM,
+            }
+        )
+
+
+def test_validate_server_metadata_rejects_wrong_action_contract():
+    with np.testing.assert_raises_regex(RuntimeError, "action contract mismatch"):
+        client.validate_server_metadata(
+            {
+                "config_name": "pi05_franka_fold_recap_cfgrl",
+                "action_horizon": 20,
+                "action_dim": client.ACTION_DIM,
+            }
+        )
+
+
+def test_cfgrl_server_rewrites_prompt_to_one_positive_condition():
+    class _Delegate:
+        metadata = {"config_name": "delegate"}
+
+        def __init__(self):
+            self.observation = None
+
+        def infer(self, observation):
+            self.observation = observation
+            return {"actions": np.zeros((client.ACTION_HORIZON, client.ACTION_DIM))}
+
+    delegate = _Delegate()
+    policy = cfgrl_server.PositiveConditionPolicy(delegate)
+    observation = {"prompt": client.DEFAULT_TASK, "state": np.zeros(client.ACTION_DIM)}
+
+    policy.infer(observation)
+
+    assert observation["prompt"] == client.DEFAULT_TASK
+    assert delegate.observation["prompt"] == (
+        "fold the clothes\nAdvantage: positive"
+    )
+    assert cfgrl_server.positive_condition_prompt(
+        delegate.observation["prompt"]
+    ) == delegate.observation["prompt"]
 
 
 def _observation():
