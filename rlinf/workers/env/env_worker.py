@@ -436,6 +436,13 @@ class EnvWorker(Worker):
                     image_writer_processes=getattr(
                         env_cfg.data_collection, "image_writer_processes", 0
                     ),
+                    video_write_mode=getattr(
+                        env_cfg.data_collection, "video_write_mode", "lerobot_png"
+                    ),
+                    stream_video_queue_size=getattr(
+                        env_cfg.data_collection, "stream_video_queue_size", 60
+                    ),
+                    resume=getattr(env_cfg.data_collection, "resume", False),
                 )
             env_list.append(env)
         return env_list

@@ -164,6 +164,8 @@ class DataCollector(Worker):
                 image_writer_threads=int(dc_cfg.get("image_writer_threads", 10)),
                 image_writer_processes=int(dc_cfg.get("image_writer_processes", 0)),
                 resume=bool(dc_cfg.get("resume", False)),
+                video_write_mode=dc_cfg.get("video_write_mode", "lerobot_png"),
+                stream_video_queue_size=int(dc_cfg.get("stream_video_queue_size", 60)),
                 # RealWorldEnv allocates fresh observation arrays on every step.
                 copy_observations=False,
             )
