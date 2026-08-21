@@ -14,8 +14,8 @@
 
 """Dual-arm GELLO intervention wrapper for joint-space control.
 
-Step-gated (forwarded via env.step) or direct-stream (daemon pushes
-targets at ~1 kHz, bypassing env.step's rate gate).
+Step-gated (forwarded via ``env.step``) or direct-stream (a daemon pushes
+targets at the configured period, bypassing ``env.step``'s rate gate).
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ import gymnasium as gym
 import numpy as np
 
 from rlinf.envs.realworld.common.gello.gello_joint_expert import GelloJointExpert
+from rlinf.utils.logging import get_logger
 
 
 class DualGelloJointIntervention(gym.ActionWrapper):
@@ -40,6 +41,7 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         action_scale: float = 0.1,
         direct_stream: bool = False,
         stream_period: float = 0.001,
+        stream_watchdog_timeout: float = 0.25,
         ready_timeout: float = 10.0,
         left_expert: GelloJointExpert | None = None,
         right_expert: GelloJointExpert | None = None,
@@ -55,10 +57,13 @@ class DualGelloJointIntervention(gym.ActionWrapper):
 
         self._direct_stream = direct_stream
         self._stream_period = stream_period
+        self._stream_watchdog_timeout = stream_watchdog_timeout
         self._ready_timeout = ready_timeout
+        self._logger = get_logger()
         self._stream_thread: threading.Thread | None = None
         self._stream_running = False
         self._stream_error: Exception | None = None
+        self._stream_last_success_time: float | None = None
         self._closed = False
         self._stream_gate = threading.Event()
         self._stream_gate.set()  # gate open = stream tick allowed
@@ -98,19 +103,20 @@ class DualGelloJointIntervention(gym.ActionWrapper):
 
     def _stream_loop(self) -> None:
         # The environment step owns gripper commands at the collection rate;
-        # sending serial commands from this 1 kHz loop would starve the bus.
-        left_ctrl, right_ctrl = self._resolve_controllers()
-        if left_ctrl is None or right_ctrl is None:
-            return
-
+        # sending serial commands from this loop would starve the bus.
         period = self._stream_period
+        left_target = None
+        right_target = None
         try:
+            left_ctrl, right_ctrl = self._resolve_controllers()
+            if left_ctrl is None or right_ctrl is None:
+                raise RuntimeError("direct GELLO stream requires both arm controllers")
             while self._stream_running:
                 self._stream_gate.wait()
                 if not self._stream_running:
                     break
 
-                loop_start = time.time()
+                loop_start = time.monotonic()
 
                 if not (self.left_expert.ready and self.right_expert.ready):
                     raise RuntimeError(
@@ -120,12 +126,15 @@ class DualGelloJointIntervention(gym.ActionWrapper):
                 left_q, _ = self.left_expert.get_action()
                 right_q, _ = self.right_expert.get_action()
 
-                lf = left_ctrl.move_joints(left_q.astype(np.float32))
-                rf = right_ctrl.move_joints(right_q.astype(np.float32))
+                left_target = np.asarray(left_q, dtype=np.float64)
+                right_target = np.asarray(right_q, dtype=np.float64)
+                lf = left_ctrl.move_joints(left_target)
+                rf = right_ctrl.move_joints(right_target)
                 lf.wait()
                 rf.wait()
+                self._stream_last_success_time = time.monotonic()
 
-                elapsed = time.time() - loop_start
+                elapsed = time.monotonic() - loop_start
                 sleep_for = period - elapsed
                 if sleep_for > 0:
                     time.sleep(sleep_for)
@@ -134,6 +143,38 @@ class DualGelloJointIntervention(gym.ActionWrapper):
             self._aligned = False
             self._stream_running = False
             self._stream_gate.clear()
+            now = time.monotonic()
+            last_success_age = (
+                None
+                if self._stream_last_success_time is None
+                else now - self._stream_last_success_time
+            )
+            self._logger.exception(
+                "Dual GELLO stream stopped: left_target=%s right_target=%s "
+                "last_success_age_s=%s",
+                None if left_target is None else left_target.tolist(),
+                None if right_target is None else right_target.tolist(),
+                ("never" if last_success_age is None else f"{last_success_age:.3f}"),
+            )
+
+    def _raise_if_stream_unhealthy(self) -> None:
+        if self._stream_error is not None:
+            raise RuntimeError("dual GELLO stream failed") from self._stream_error
+        if not (self._direct_stream and self._aligned):
+            return
+        if not self._stream_running:
+            raise RuntimeError("dual GELLO stream stopped unexpectedly")
+        thread = self._stream_thread
+        if thread is None or not thread.is_alive():
+            raise RuntimeError("dual GELLO stream thread exited unexpectedly")
+        if self._stream_last_success_time is None:
+            raise RuntimeError("dual GELLO stream has no successful command heartbeat")
+        heartbeat_age = time.monotonic() - self._stream_last_success_time
+        if heartbeat_age > self._stream_watchdog_timeout:
+            raise RuntimeError(
+                "dual GELLO stream command heartbeat is stale "
+                f"({heartbeat_age:.3f}s > {self._stream_watchdog_timeout:.3f}s)"
+            )
 
     def _get_current_joint_positions(self) -> np.ndarray:
         return self.get_wrapper_attr("get_joint_positions")()
@@ -197,6 +238,7 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         rf.wait()
         setattr(self.unwrapped, "_left_state", left_ctrl.get_state().wait()[0])
         setattr(self.unwrapped, "_right_state", right_ctrl.get_state().wait()[0])
+        self._stream_last_success_time = time.monotonic()
         self._aligned = True
         return True
 
@@ -227,13 +269,13 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         return result
 
     def step(self, action):
-        if self._stream_error is not None:
-            raise RuntimeError("dual GELLO stream failed") from self._stream_error
+        self._raise_if_stream_unhealthy()
         new_action, replaced = self.action(action)
         if self._direct_stream and self._aligned:
             replaced = True
             self._start_stream_thread()
         obs, rew, done, truncated, info = self.env.step(new_action)
+        self._raise_if_stream_unhealthy()
         if replaced:
             info["intervene_action"] = new_action
             info["intervene_flag"] = np.ones(1)

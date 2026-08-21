@@ -229,6 +229,9 @@ def apply_dual_franka_joint_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gy
             action_scale=getattr(config, "joint_action_scale", 0.1),
             direct_stream=getattr(config, "teleop_direct_stream", False),
             stream_period=cfg.get("gello_joint_stream_period", 0.001),
+            stream_watchdog_timeout=cfg.get(
+                "gello_joint_stream_watchdog_timeout", 0.25
+            ),
             ready_timeout=cfg.get("gello_ready_timeout", 10.0),
             **expert_kwargs,
         )

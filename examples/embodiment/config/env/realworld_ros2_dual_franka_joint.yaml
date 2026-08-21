@@ -8,6 +8,8 @@ keyboard_reward_wrapper: start_end
 keyboard_fifo_path: null
 use_gello_joint: true
 gello_joint_stream_period: 0.03333333333333333
+# Fail the foreground collection loop before the 0.5 s ROS controller watchdog.
+gello_joint_stream_watchdog_timeout: 0.25
 
 init_params:
   id: Ros2DualFrankaJointEnv-v1

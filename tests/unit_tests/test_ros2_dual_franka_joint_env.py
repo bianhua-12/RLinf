@@ -15,9 +15,13 @@
 import threading
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from rlinf.envs.realworld.franka.ros2_controller import (
+    FR3_JOINT_LIMITS_LOWER,
+    FR3_JOINT_LIMITS_UPPER,
+    JOINT_LIMIT_ROUNDING_TOLERANCE_RAD,
     Ros2ControllerConfig,
     Ros2DualFrankaBackend,
 )
@@ -50,6 +54,37 @@ def test_robotiq_polling_defaults_to_30_hz():
     assert config.gripper_poll_interval == 1.0 / 30.0
     assert config.left_gripper_close_force == 130.0
     assert config.right_gripper_close_force == 130.0
+
+
+@pytest.mark.parametrize("joint_index", range(7))
+@pytest.mark.parametrize("limits", [FR3_JOINT_LIMITS_LOWER, FR3_JOINT_LIMITS_UPPER])
+def test_backend_accepts_float32_round_trip_at_all_joint_limits(joint_index, limits):
+    backend = object.__new__(Ros2DualFrankaBackend)
+    backend.config = SimpleNamespace(
+        joint_names=[f"fr3_joint{index}" for index in range(1, 8)]
+    )
+    target = (FR3_JOINT_LIMITS_LOWER + FR3_JOINT_LIMITS_UPPER) / 2.0
+    target[joint_index] = np.float64(np.float32(limits[joint_index]))
+
+    sanitized = backend._sanitize_joint_target("right", target)
+
+    assert sanitized.dtype == np.float64
+    assert np.all(sanitized > FR3_JOINT_LIMITS_LOWER)
+    assert np.all(sanitized < FR3_JOINT_LIMITS_UPPER)
+
+
+def test_backend_rejects_real_joint_limit_violation_with_joint_details():
+    backend = object.__new__(Ros2DualFrankaBackend)
+    backend.config = SimpleNamespace(
+        joint_names=[f"fr3_joint{index}" for index in range(1, 8)]
+    )
+    target = (FR3_JOINT_LIMITS_LOWER + FR3_JOINT_LIMITS_UPPER) / 2.0
+    target[0] = FR3_JOINT_LIMITS_UPPER[0] + 2 * JOINT_LIMIT_ROUNDING_TOLERANCE_RAD
+
+    with pytest.raises(
+        ValueError, match=r"right.*fr3_joint1.*\(J1\).*above FR3 software limit"
+    ):
+        backend._sanitize_joint_target("right", target)
 
 
 @pytest.mark.parametrize(
