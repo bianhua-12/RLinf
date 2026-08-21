@@ -6,9 +6,9 @@ description: Test that requirements/install.sh works for an embodied model/env b
 Verify that `requirements/install.sh` actually works for an embodied model/env:
 build its venv, confirm the e2e config's model paths exist, then run the matching
 CI e2e test against that venv. The harness is
-[.codex/skills/test-install/driver.py](.codex/skills/test-install/driver.py) —
+[driver.py](driver.py) —
 it reads the install command, env vars, and test config **straight out of**
-[.github/workflows/embodied-e2e-tests.yml](.github/workflows/embodied-e2e-tests.yml),
+[embodied-e2e-tests.yml](../../../.github/workflows/embodied-e2e-tests.yml),
 so it never drifts from CI. Drive everything through that script.
 
 All paths below are relative to the repo root (the dir with `requirements/install.sh`).

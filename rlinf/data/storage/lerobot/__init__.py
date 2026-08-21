@@ -23,8 +23,8 @@ from rlinf.data.storage.lerobot.paths import (
     resolve_lerobot_dataset_root,
     resolve_lerobot_repo_id,
 )
-from rlinf.data.storage.lerobot.writer import LeRobotDatasetWriter
 from rlinf.data.storage.lerobot.streaming_writer import StreamingLeRobotDatasetWriter
+from rlinf.data.storage.lerobot.writer import LeRobotDatasetWriter
 
 __all__ = [
     "LeRobotDatasetWriter",

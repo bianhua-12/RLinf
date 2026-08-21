@@ -74,7 +74,16 @@ previously collected video.
   LeRobot, produced no PNGs, and rebuilt 100 episode manifests in 1.178 seconds
   without changing MP4 mtimes. Appending after 100 historical manifests flushed
   in 0.335 seconds.
-- A real Franka smoke is intentionally excluded until separately authorized.
+- The main-integration gate passed 105 focused Franka, collection, camera,
+  controller-adapter, and LeRobot writer tests.
+- A separately authorized operational smoke ran on the dual-Franka workstation
+  from tracked-clean commit `22983c58`. It recorded 249 frames from three
+  224x224 cameras at 30 Hz (8.3 seconds), committed in 1.008 seconds, emitted no
+  PNG files, and loaded all three video streams through native LeRobot v3. An
+  idempotent recovery completed in 0.870 seconds without changing MP4 hashes or
+  mtimes. The run used the established live checkout with ignored runtime
+  assets and did not create immutable DSH-style start/completion manifests, so
+  it is hardware-integration evidence, not a formal closed-loop task result.
 
 ## Consequences
 
