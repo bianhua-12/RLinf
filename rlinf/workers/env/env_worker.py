@@ -442,6 +442,14 @@ class EnvWorker(Worker):
                     stream_video_queue_size=getattr(
                         env_cfg.data_collection, "stream_video_queue_size", 60
                     ),
+                    stream_max_pending_commits=getattr(
+                        env_cfg.data_collection, "stream_max_pending_commits", 2
+                    ),
+                    stream_commit_watchdog_timeout=getattr(
+                        env_cfg.data_collection,
+                        "stream_commit_watchdog_timeout",
+                        30.0,
+                    ),
                     resume=getattr(env_cfg.data_collection, "resume", False),
                 )
             env_list.append(env)
