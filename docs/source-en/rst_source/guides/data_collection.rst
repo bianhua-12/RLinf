@@ -29,8 +29,8 @@ evaluation, saving each completed episode to disk asynchronously.
 Two output formats are supported:
 
 - **pickle** — saves the complete raw buffer; suited for custom offline processing.
-- **lerobot** — saves structured Parquet files with metadata; directly compatible
-  with the LeRobot training pipeline.
+- **lerobot** — saves structured Parquet files and metadata, with optional MP4
+  camera streams; directly compatible with the LeRobot training pipeline.
 
 Key Features
 ~~~~~~~~~~~~
@@ -40,13 +40,18 @@ Key Features
 - Compatible with auto-reset environments: the final pre-reset observation is
   correctly attributed to the current episode, and the post-reset observation is
   carried over to the next episode.
-- All write operations run asynchronously in a background thread so they never
-  block the RL training loop.
+- Episode writes run asynchronously in a background thread.
 - The LeRobot writer is lazily initialized on the first episode write, with image
   shape, state dimension, and action dimension inferred automatically.
-- LeRobot export can store ``image`` and ``extra_view_image``. When
+- Set ``use_videos=True`` to store ``image`` and ``extra_view_image`` as MP4
+  video streams. When
   ``extra_view_images`` is a stacked ``[N, H, W, C]`` tensor, the columns are
   fanned out by index (``extra_view_image-0``, ``extra_view_image-1``, …).
+- For timing-sensitive hardware collection, set
+  ``defer_video_encoding_until_finalize=True``, ``isolate_episode_stats=True``,
+  and ``finalize_interval=0``. Collection writes PNGs while the robot is active;
+  image statistics run in a spawned process, and MP4 encoding starts only after
+  hardware collection stops. The command waits for finalization before exiting.
 - Set ``only_success=True`` to filter out failed episodes and save disk space.
 
 Constructor Arguments
@@ -92,6 +97,15 @@ Constructor Arguments
      - ``int``
      - ``10``
      - Dataset frame rate written to LeRobot metadata (lerobot format only)
+   * - ``use_videos``
+     - ``bool``
+     - ``False``
+     - Encode LeRobot camera features as MP4 videos
+   * - ``copy_observations``
+     - ``bool``
+     - ``True``
+     - Deep-copy observations before buffering. Set to ``False`` only when the
+       wrapped environment allocates fresh tensors or arrays on every step
    * - ``only_success``
      - ``bool``
      - ``False``
@@ -100,6 +114,23 @@ Constructor Arguments
      - ``int``
      - ``100``
      - Call ``writer.finalize()`` every N completed episodes as a checkpoint (``0`` disables; lerobot format only)
+   * - ``defer_video_encoding_until_finalize``
+     - ``bool``
+     - ``False``
+     - Encode videos only when the wrapper closes. Requires ``use_videos=True``
+       and ``finalize_interval=0``
+   * - ``isolate_episode_stats``
+     - ``bool``
+     - ``False``
+     - Compute LeRobot image statistics in a spawned process
+   * - ``image_writer_threads``
+     - ``int``
+     - ``10``
+     - Number of asynchronous image-writer threads
+   * - ``image_writer_processes``
+     - ``int``
+     - ``0``
+     - Number of image-writer processes. Keep ``0`` inside Ray actors
 
 Usage Examples
 ~~~~~~~~~~~~~~
@@ -144,6 +175,12 @@ Add a ``data_collection`` block under ``env`` in your YAML config:
         only_success: True
         robot_type: "panda"
         fps: 10
+        use_videos: True
+        defer_video_encoding_until_finalize: True
+        isolate_episode_stats: True
+        image_writer_threads: 12
+        image_writer_processes: 0
+        finalize_interval: 0
 
 Then run the training script as usual; data is collected automatically:
 
@@ -174,6 +211,7 @@ The file contains a single dictionary:
        "episode_id":  int,   # episode counter (per-env, monotonically increasing)
        "success":     bool,  # whether the episode succeeded
        "observations": list, # length = num_steps + 1 (includes the initial reset obs)
+       "observation_timestamps_ns": list, # monotonic time for each observation
        "actions":     list,  # length = num_steps
        "rewards":     list,  # length = num_steps
        "terminated":  list,  # length = num_steps
@@ -225,7 +263,10 @@ Parquet column schema:
    * - ``actions``
      - Action vector, ``float32[action_dim]``
    * - ``timestamp``
-     - Frame timestamp in seconds, ``float``
+     - Nominal frame time in seconds, generated as ``frame_index / fps``
+   * - ``observation_timestamp_ns``
+     - Actual monotonic time when the observation was received, ``int64[1]``;
+       use differences between these values to measure the collection rate
    * - ``frame_index``
      - Frame index within the episode, ``int64``
    * - ``episode_index``
@@ -297,12 +338,14 @@ Core Components
 
 ``DataCollector`` workflow:
 
-1. Initialise ``RealWorldEnv`` and ``TrajectoryReplayBuffer``.
+1. Initialise ``RealWorldEnv`` and, when ``runner.save_demos=True``,
+   ``TrajectoryReplayBuffer``.
 2. Loop over steps, reading the SpaceMouse intervention action from
    ``info["intervene_action"]``.
-3. Construct a ``ChunkStepResult`` and append it to ``EmbodiedTrajectoryBuilder``.
+3. When ``runner.save_demos=True``, construct a ``ChunkStepResult`` and append
+   it to ``EmbodiedTrajectoryBuilder``.
 4. When an episode ends (``done=True``) with reward ``>= 0.5``, count it as a
-   success and write the trajectory to the buffer.
+   success and, when enabled, write the replay trajectory to the buffer.
 5. Stop automatically once ``num_data_episodes`` successes have been collected
    and finalise the buffer.
 
@@ -319,6 +362,10 @@ Configuration Parameters
    * - ``runner.num_data_episodes``
      - ``20``
      - Target number of successful demonstrations; stops when reached
+   * - ``runner.save_demos``
+     - ``True``
+     - Whether to write ``TrajectoryReplayBuffer`` trajectories to ``demos/``;
+       disable it when only the configured episode export is needed
    * - ``cluster.node_groups.hardware.configs.robot_ip``
      - —
      - IP address of the Franka robot
@@ -392,6 +439,11 @@ replay buffer and the ``CollectEpisode`` export in the same run. With
 
 - ``logs/{timestamp}/demos/`` as ``TrajectoryReplayBuffer`` trajectories for RLPD
 - ``logs/{timestamp}/collected_data/`` as episode files in ``pickle`` or LeRobot format
+
+Set ``runner.save_demos=False`` to skip the replay-buffer output while keeping
+the configured ``collected_data/`` export enabled. This mode also skips
+observation conversion, ``EmbodiedTrajectoryBuilder``, and ``ChunkStepResult``
+construction; only the episode exporter retains observations.
 
 To collect LeRobot-format data while still building the replay buffer, keep the
 real-world collection config like this:

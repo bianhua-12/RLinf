@@ -63,15 +63,17 @@ class RealSenseCamera(BaseCamera):
             )
         self.profile = self._pipeline.start(self._config)
 
-        # rs.align allows us to perform alignment of depth frames to color frames
-        self._align = rs.align(rs.stream.color)
+        # Alignment is meaningful only when a depth stream is enabled.
+        self._align = rs.align(rs.stream.color) if self._enable_depth else None
 
     def _read_frame(self) -> tuple[bool, Optional[np.ndarray]]:
         frames = self._pipeline.wait_for_frames()
-        aligned_frames = self._align.process(frames)
-        color_frame = aligned_frames.get_color_frame()
         if self._enable_depth:
+            aligned_frames = self._align.process(frames)
+            color_frame = aligned_frames.get_color_frame()
             depth_frame = aligned_frames.get_depth_frame()
+        else:
+            color_frame = frames.get_color_frame()
 
         if color_frame.is_video_frame():
             frame = np.asarray(color_frame.get_data())

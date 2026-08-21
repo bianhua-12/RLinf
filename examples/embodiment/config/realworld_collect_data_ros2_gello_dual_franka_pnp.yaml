@@ -1,0 +1,98 @@
+defaults:
+  - env/realworld_ros2_dual_franka_joint@env.eval
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env:
+      node_group: franka
+      placement: 0
+  node_groups:
+    - label: franka
+      node_ranks: 0
+      hardware:
+        type: DualFranka
+        configs:
+          - left_robot_ip: 172.16.0.1
+            right_robot_ip: 172.16.0.2
+            base_camera_serials: ["DA6135161"]
+            left_camera_serials: ["327122078534"]
+            right_camera_serials: ["262322073199"]
+            base_camera_type: hikrobot
+            left_camera_type: realsense
+            right_camera_type: realsense
+            left_gripper_type: robotiq
+            right_gripper_type: robotiq
+            left_gripper_connection: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AM6YM2MI-if00-port0
+            right_gripper_connection: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG046F7F-if00-port0
+            left_controller_node_rank: 0
+            right_controller_node_rank: 0
+            node_rank: 0
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: null
+    project_name: rlinf
+    experiment_name: collect-data-ros2-gello-dual-franka-pnp
+    logger_backends: [tensorboard]
+  num_data_episodes: 200
+  record_task_description: false
+  save_demos: false
+
+env:
+  group_name: EnvGroup
+  eval:
+    no_gripper: false
+    ignore_terminations: false
+    auto_reset: false
+    keyboard_device: /dev/input/by-id/usb-PCsensor_FootSwitch-event-kbd
+    left_gello_port: /dev/serial/by-path/pci-0000:00:14.0-usb-0:10.3:1.0-port0
+    right_gello_port: /dev/serial/by-path/pci-0000:00:14.0-usb-0:10.2:1.0-port0
+    left_gello_joint_signs: [1, -1, 1, 1, 1, -1, 1]
+    right_gello_joint_signs: [1, -1, 1, 1, 1, -1, 1]
+    left_gello_joint_offsets: [4.712, 3.142, 3.142, 4.712, 4.712, 4.712, -1.571]
+    right_gello_joint_offsets: [4.712, 3.142, 3.142, 4.712, 3.142, 4.712, 1.571]
+    gello_gripper_id: 8
+    # Measured physical [closed, open] endpoints for the left GELLO.
+    left_gello_gripper_range_rad: [1.01243, 2.00645]
+    right_gello_gripper_range_rad: [1.27801, 2.00756]
+    override_cfg:
+      controlled_motion_tolerance: 0.05
+      # Both 2F-85 grippers use full force at the closed mechanical stop.
+      # Intermediate position commands remain continuous.
+      left_gripper_close_force: 255.0
+      right_gripper_close_force: 255.0
+      task_description: ${oc.env:RLINF_TASK_DESCRIPTION}
+      enable_camera_player: true
+      target_ee_pose:
+        - [0.5, -0.2, 0.4, -3.14, 0.0, 0.0]
+        - [0.5, 0.2, 0.4, -3.14, 0.0, 0.0]
+      reset_ee_pose:
+        - [0.5, -0.2, 0.5, -3.14, 0.0, 0.0]
+        - [0.5, 0.2, 0.5, -3.14, 0.0, 0.0]
+    data_collection:
+      enabled: true
+      save_dir: ${runner.logger.log_path}/collected_data
+      resume: true
+      export_format: lerobot
+      only_success: true
+      robot_type: dual_FR3
+      fps: 30
+      use_videos: true
+      video_write_mode: stream_mp4
+      stream_video_queue_size: 60
+      defer_video_encoding_until_finalize: false
+      finalize_interval: 0
+      isolate_episode_stats: false
+      image_writer_threads: 0
+      image_writer_processes: 0

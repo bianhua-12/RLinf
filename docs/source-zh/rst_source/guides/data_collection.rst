@@ -28,7 +28,7 @@ Episode 数据采集
 支持保存为两种格式：
 
 - **pickle** — 保存完整原始 buffer，适合自定义离线处理。
-- **lerobot** — 保存结构化 Parquet + 元数据，可直接接入 LeRobot 训练流程。
+- **lerobot** — 保存结构化 Parquet 和元数据，并可选保存 MP4 相机视频，可直接接入 LeRobot 训练流程。
 
 核心特性
 ~~~~~~~~
@@ -36,11 +36,16 @@ Episode 数据采集
 - 支持单环境与向量化并行环境（``num_envs > 1``）。
 - 兼容自动重置（auto-reset）环境：正确将重置前的最终观测归入当前 episode，
   将重置后的初始观测带入下一 episode。
-- 写入操作在独立后台线程异步执行，不阻塞 RL 训练主循环。
+- episode 写入操作在独立后台线程异步执行。
 - LeRobot writer 在第一条 episode 写入时懒初始化，自动推断图像尺寸、状态维度、动作维度。
-- LeRobot 导出支持保存 ``image`` 与 ``extra_view_image``；当 ``extra_view_images``
+- 设置 ``use_videos=True`` 可将 ``image`` 与 ``extra_view_image`` 保存为 MP4 视频流；当
+  ``extra_view_images``
   为 ``[N, H, W, C]`` 多视角堆叠时，会自动按索引展开成 ``extra_view_image-0``、
   ``extra_view_image-1`` …… 等列。
+- 对采集节拍敏感的真机任务，应设置
+  ``defer_video_encoding_until_finalize=True``、``isolate_episode_stats=True`` 和
+  ``finalize_interval=0``。机器人运行期间写入 PNG，图像统计在 spawn 子进程执行；硬件采集
+  停止后才开始 MP4 编码，命令会等待最终化完成后退出。
 - ``only_success=True`` 可过滤失败 episode，节省磁盘空间。
 
 构造参数
@@ -86,6 +91,15 @@ Episode 数据采集
      - ``int``
      - ``10``
      - 数据集帧率，写入 LeRobot 元数据（仅 lerobot 格式有效）
+   * - ``use_videos``
+     - ``bool``
+     - ``False``
+     - 将 LeRobot 相机特征编码为 MP4 视频
+   * - ``copy_observations``
+     - ``bool``
+     - ``True``
+     - 写入 buffer 前深拷贝观测；仅当被包裹环境每步都会新建 tensor 或 array
+       时才设为 ``False``
    * - ``only_success``
      - ``bool``
      - ``False``
@@ -94,6 +108,23 @@ Episode 数据采集
      - ``int``
      - ``100``
      - 每写完 N 个 episode 主动调用 ``writer.finalize()`` 生成检查点（``0`` 表示禁用，仅 lerobot 格式有效）
+   * - ``defer_video_encoding_until_finalize``
+     - ``bool``
+     - ``False``
+     - 仅在 wrapper 关闭时编码视频；要求 ``use_videos=True`` 且
+       ``finalize_interval=0``
+   * - ``isolate_episode_stats``
+     - ``bool``
+     - ``False``
+     - 在 spawn 子进程中计算 LeRobot 图像统计
+   * - ``image_writer_threads``
+     - ``int``
+     - ``10``
+     - 异步图像写入线程数量
+   * - ``image_writer_processes``
+     - ``int``
+     - ``0``
+     - 图像写入进程数量；在 Ray actor 内保持为 ``0``
 
 使用示例
 ~~~~~~~~
@@ -137,6 +168,12 @@ Episode 数据采集
         only_success: True
         robot_type: "panda"
         fps: 10
+        use_videos: True
+        defer_video_encoding_until_finalize: True
+        isolate_episode_stats: True
+        image_writer_threads: 12
+        image_writer_processes: 0
+        finalize_interval: 0
 
 然后正常启动训练脚本，数据会在训练过程中自动采集：
 
@@ -167,6 +204,7 @@ Episode 数据采集
        "episode_id":  int,   # Episode 编号（单环境内自增）
        "success":     bool,  # 是否成功
        "observations": list, # 观测列表，长度 = num_steps + 1（含初始观测）
+       "observation_timestamps_ns": list, # 每个观测的单调时钟时间
        "actions":     list,  # 动作列表，长度 = num_steps
        "rewards":     list,  # 奖励列表，长度 = num_steps
        "terminated":  list,  # 终止标志，长度 = num_steps
@@ -215,7 +253,9 @@ Episode 数据采集
    * - ``actions``
      - 动作向量，``float32[action_dim]``
    * - ``timestamp``
-     - 帧时间戳（秒），``float``
+     - 名义帧时间（秒），按 ``frame_index / fps`` 生成
+   * - ``observation_timestamp_ns``
+     - 实际收到观测时的单调时钟时间，``int64[1]``；可用相邻值之差计算真实采集频率
    * - ``frame_index``
      - episode 内帧序号，``int64``
    * - ``episode_index``
@@ -281,10 +321,13 @@ wrapper 从 info 字典中按以下优先级推断 episode 是否成功（从最
 
 ``DataCollector`` 的工作流程：
 
-1. 初始化 ``RealWorldEnv`` 和 ``TrajectoryReplayBuffer``。
+1. 初始化 ``RealWorldEnv``；当 ``runner.save_demos=True`` 时再初始化
+   ``TrajectoryReplayBuffer``。
 2. 循环执行 step，从 ``info["intervene_action"]`` 读取 SpaceMouse 干预动作。
-3. 构造 ``ChunkStepResult``，追加到 ``EmbodiedTrajectoryBuilder``。
-4. episode 结束（``done=True``）且奖励 ``>= 0.5`` 时，记为一次成功，将轨迹写入 buffer。
+3. 当 ``runner.save_demos=True`` 时，构造 ``ChunkStepResult`` 并追加到
+   ``EmbodiedTrajectoryBuilder``。
+4. episode 结束（``done=True``）且奖励 ``>= 0.5`` 时记为一次成功，并在启用时将
+   replay 轨迹写入 buffer。
 5. 成功次数达到 ``num_data_episodes`` 后自动停止并 finalize buffer。
 
 核心配置参数
@@ -300,6 +343,10 @@ wrapper 从 info 字典中按以下优先级推断 episode 是否成功（从最
    * - ``runner.num_data_episodes``
      - ``20``
      - 目标成功轨迹数量，达到后自动停止
+   * - ``runner.save_demos``
+     - ``True``
+     - 是否将 ``TrajectoryReplayBuffer`` 轨迹写入 ``demos/``；仅需配置的
+       episode 导出时可将其关闭
    * - ``cluster.node_groups.hardware.configs.robot_ip``
      - —
      - Franka 机器人 IP 地址
@@ -371,6 +418,11 @@ wrapper 从 info 字典中按以下优先级推断 episode 是否成功（从最
 
 - ``logs/{timestamp}/demos/``：``TrajectoryReplayBuffer`` 轨迹，用于 RLPD
 - ``logs/{timestamp}/collected_data/``：``pickle`` 或 LeRobot 格式的 episode 数据
+
+设置 ``runner.save_demos=False`` 可跳过 replay buffer 输出，同时保留已配置的
+``collected_data/`` 导出。此模式还会跳过观测转换、
+``EmbodiedTrajectoryBuilder`` 和 ``ChunkStepResult`` 的构造，仅由 episode
+导出器接管观测。
 
 若希望在收集真机 replay buffer 的同时额外导出 LeRobot 数据集，可保留如下配置：
 

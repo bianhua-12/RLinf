@@ -415,12 +415,34 @@ class EnvWorker(Worker):
                     ),
                     robot_type=getattr(env_cfg.data_collection, "robot_type", "panda"),
                     fps=getattr(env_cfg.data_collection, "fps", 10),
+                    use_videos=getattr(env_cfg.data_collection, "use_videos", False),
                     only_success=getattr(
                         env_cfg.data_collection, "only_success", False
                     ),
                     finalize_interval=getattr(
                         env_cfg.data_collection, "finalize_interval", 100
                     ),
+                    defer_video_encoding_until_finalize=getattr(
+                        env_cfg.data_collection,
+                        "defer_video_encoding_until_finalize",
+                        False,
+                    ),
+                    isolate_episode_stats=getattr(
+                        env_cfg.data_collection, "isolate_episode_stats", False
+                    ),
+                    image_writer_threads=getattr(
+                        env_cfg.data_collection, "image_writer_threads", 10
+                    ),
+                    image_writer_processes=getattr(
+                        env_cfg.data_collection, "image_writer_processes", 0
+                    ),
+                    video_write_mode=getattr(
+                        env_cfg.data_collection, "video_write_mode", "lerobot_png"
+                    ),
+                    stream_video_queue_size=getattr(
+                        env_cfg.data_collection, "stream_video_queue_size", 60
+                    ),
+                    resume=getattr(env_cfg.data_collection, "resume", False),
                 )
             env_list.append(env)
         return env_list

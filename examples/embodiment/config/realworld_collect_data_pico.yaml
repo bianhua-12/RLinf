@@ -46,6 +46,9 @@ env:
       zmq_addr: "ipc:///tmp/vr_data.ipc"
       position_scale: 1.0
       rotation_scale: 1.0
+      gripper_close_button: "A"
+      gripper_open_button: "B"
+      gripper_close_threshold: 0.5
       calibration:
         button: "trigger"
     max_episode_steps: 10000

@@ -66,6 +66,7 @@ class DualFrankaRobotConfig:
     is_dummy: bool = False
     use_dense_reward: bool = False
     step_frequency: float = 10.0
+    camera_fps: int = 15
 
     # (2, 6) arrays: row 0 = left arm, row 1 = right arm
     target_ee_pose: np.ndarray = field(default_factory=lambda: np.zeros((2, 6)))
@@ -143,6 +144,7 @@ class DualFrankaEnv(gym.Env):
         self._right_state = FrankaRobotState()
 
         self._num_steps = 0
+        self._step_deadline: Optional[float] = None
         self._joint_reset_cycle = cycle(range(self.config.joint_reset_cycle))
         next(self._joint_reset_cycle)
         self._success_hold_counter = 0
@@ -222,7 +224,12 @@ class DualFrankaEnv(gym.Env):
     def _open_cameras(self):
         self._cameras: list[BaseCamera] = []
         camera_infos = [
-            CameraInfo(name=name, serial_number=serial, camera_type=ct)
+            CameraInfo(
+                name=name,
+                serial_number=serial,
+                camera_type=ct,
+                fps=self.config.camera_fps,
+            )
             for name, serial, ct in self._all_camera_specs()
         ]
         for info in camera_infos:
@@ -243,7 +250,10 @@ class DualFrankaEnv(gym.Env):
         start_x = (w - crop_size) // 2
         start_y = (h - crop_size) // 2
         cropped = frame[start_y : start_y + crop_size, start_x : start_x + crop_size]
-        resized = cv2.resize(cropped, reshape_size)
+        if (cropped.shape[1], cropped.shape[0]) == reshape_size:
+            resized = cropped
+        else:
+            resized = cv2.resize(cropped, reshape_size)
         return cropped, resized
 
     def _get_camera_frames(self) -> dict[str, np.ndarray]:
@@ -272,10 +282,9 @@ class DualFrankaEnv(gym.Env):
                 frame = cached
 
             reshape_size = self.observation_space["frames"][name].shape[:2][::-1]
-            cropped, resized = self._crop_frame(frame, reshape_size)
+            _, resized = self._crop_frame(frame, reshape_size)
             frames[name] = resized[..., ::-1]
             display_frames[name] = resized
-            display_frames[f"{name}_full"] = cropped
             self._last_camera_frame[name] = frame
 
         self.camera_player.put_frame(display_frames)
@@ -360,8 +369,10 @@ class DualFrankaEnv(gym.Env):
         except Exception as exc:
             self._logger.warning("open_gripper during reset failed: %s", exc)
 
-        self._left_ctrl.reset_joint(self.config.joint_reset_qpos[0])
-        self._right_ctrl.reset_joint(self.config.joint_reset_qpos[1])
+        left_reset_f = self._left_ctrl.reset_joint(self.config.joint_reset_qpos[0])
+        right_reset_f = self._right_ctrl.reset_joint(self.config.joint_reset_qpos[1])
+        left_reset_f.wait()
+        right_reset_f.wait()
         time.sleep(0.5)
         self._left_state = self._left_ctrl.get_state().wait()[0]
         self._right_state = self._right_ctrl.get_state().wait()[0]
@@ -375,7 +386,9 @@ class DualFrankaEnv(gym.Env):
         self._success_hold_counter = 0
 
         if self.config.is_dummy:
-            return self._get_observation(), {}
+            observation = self._get_observation()
+            self._step_deadline = time.perf_counter()
+            return observation, {}
 
         joint_cycle = next(self._joint_reset_cycle)
         joint_reset = joint_cycle == 0
@@ -398,10 +411,11 @@ class DualFrankaEnv(gym.Env):
         right_st_f = self._right_ctrl.get_state()
         self._left_state = left_st_f.wait()[0]
         self._right_state = right_st_f.wait()[0]
-        return self._get_observation(), {}
+        observation = self._get_observation()
+        self._step_deadline = time.perf_counter()
+        return observation, {}
 
     def step(self, action: np.ndarray):
-        start_time = time.time()
         action = np.clip(action, self.action_space.low, self.action_space.high)
         actions = action.reshape(2, self.PER_ARM_ACTION_DIM)
 
@@ -426,8 +440,7 @@ class DualFrankaEnv(gym.Env):
         self._num_steps += 1
         if not self.config.is_dummy:
             if self._pace_between_action_and_state_read():
-                step_time = time.time() - start_time
-                time.sleep(max(0.0, (1.0 / self.config.step_frequency) - step_time))
+                self._wait_for_observation_deadline()
             left_st_f = ctrls[0].get_state()
             right_st_f = ctrls[1].get_state()
             self._left_state = left_st_f.wait()[0]
@@ -441,6 +454,23 @@ class DualFrankaEnv(gym.Env):
         truncated = self._num_steps >= self.config.max_num_steps
         return observation, reward, terminated, truncated, {}
 
+    def _wait_for_observation_deadline(self) -> None:
+        """Pace observation sampling without accumulating post-read work."""
+        period = 1.0 / self.config.step_frequency
+        now = time.perf_counter()
+        if self._step_deadline is None:
+            self._step_deadline = now
+
+        deadline = self._step_deadline + period
+        if now >= deadline:
+            # A slow policy or device missed the slot. Re-anchor instead of
+            # producing a burst of catch-up samples.
+            self._step_deadline = now
+            return
+
+        time.sleep(deadline - now)
+        self._step_deadline = deadline
+
     def _clear_errors(self):
         l = self._left_ctrl.clear_errors()
         r = self._right_ctrl.clear_errors()
@@ -450,9 +480,8 @@ class DualFrankaEnv(gym.Env):
     # ---------------------------------------------------------------- gripper / utils
 
     def _gripper_action(self, ctrl, state, position: float) -> bool:
-        # Fire-and-forget: collection streams gripper RPCs at 10 Hz and a
-        # blocking .wait() + 0.6 s sleep stretches eval steps to ~700 ms
-        # and rings out j7.
+        # Fire-and-forget: blocking gripper motion would stretch collection
+        # steps to hundreds of milliseconds and ring out j7.
         threshold = self.config.binary_gripper_threshold
         if position <= -threshold and state.gripper_open:
             ctrl.close_gripper()

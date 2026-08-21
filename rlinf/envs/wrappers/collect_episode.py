@@ -20,6 +20,7 @@ import json
 import os
 import pickle
 import re
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
 from typing import Any, Optional
@@ -31,6 +32,7 @@ import torch
 from rlinf.utils.logging import get_logger
 
 _VALID_FORMATS = ("pickle", "lerobot")
+_VALID_VIDEO_WRITE_MODES = ("lerobot_png", "stream_mp4")
 
 
 _ID_DIR_RE = re.compile(r"^id_(\d+)$")
@@ -94,15 +96,34 @@ class CollectEpisode(gym.Wrapper):
             Defaults to ``"pickle"``.
         robot_type: Robot type for LeRobot metadata. Defaults to ``"panda"``.
         fps: FPS for LeRobot metadata. Defaults to 10.
+        use_videos: Whether to encode LeRobot camera features as MP4 videos.
+            Defaults to False.
         only_success: Whether to save only successful episodes. Defaults to False.
         finalize_interval: Call ``writer.finalize()`` every this many completed
             episodes to flush ``info.json`` and ``stats.json`` as a checkpoint.
             ``0`` disables periodic flushing (lerobot only). Defaults to 100.
+        defer_video_encoding_until_finalize: Keep video frames as PNGs while
+            collecting and encode them only after the hardware loop stops.
+            Requires ``use_videos=True`` and ``finalize_interval=0``.
+        isolate_episode_stats: Compute LeRobot image statistics in a spawned
+            process so their Python memory cleanup cannot pause collection.
+        image_writer_threads: Number of LeRobot image-writer threads.
+        image_writer_processes: Number of LeRobot image-writer processes. Use
+            ``0`` inside Ray actors to avoid forking from the actor process.
         resume: If True and ``export_format == "lerobot"``, reuse ``save_dir``
             across sessions — new episodes land in a fresh ``id_{N}`` shard
             (N = sum of episodes across pre-existing shards) so the in-progress
             write never touches previously-finalized data. Ignored for pickle.
             Defaults to False.
+        copy_observations: Whether to deep-copy observations before buffering.
+            Set to False only when the wrapped environment returns newly
+            allocated tensors or arrays on every reset and step. Defaults to
+            True.
+        video_write_mode: ``"lerobot_png"`` keeps the LeRobot compatibility
+            writer. ``"stream_mp4"`` continuously encodes one MP4 per camera
+            and episode, then publishes LeRobot v3 metadata transactionally.
+        stream_video_queue_size: Maximum synchronized camera frame groups
+            waiting for the spawned stream encoder. Queue overflow fails closed.
     """
 
     def __init__(
@@ -115,9 +136,17 @@ class CollectEpisode(gym.Wrapper):
         export_format: str = "pickle",
         robot_type: str = "panda",
         fps: int = 10,
+        use_videos: bool = False,
         only_success: bool = False,
         finalize_interval: int = 100,
+        defer_video_encoding_until_finalize: bool = False,
+        isolate_episode_stats: bool = False,
+        image_writer_threads: int = 10,
+        image_writer_processes: int = 0,
         resume: bool = False,
+        copy_observations: bool = True,
+        video_write_mode: str = "lerobot_png",
+        stream_video_queue_size: int = 60,
     ):
         if isinstance(env, gym.Env):
             super().__init__(env)
@@ -129,7 +158,34 @@ class CollectEpisode(gym.Wrapper):
                 f"Unsupported export_format={export_format!r}, "
                 f"expected one of {_VALID_FORMATS}"
             )
-
+        if defer_video_encoding_until_finalize and not use_videos:
+            raise ValueError(
+                "defer_video_encoding_until_finalize requires use_videos=True"
+            )
+        if defer_video_encoding_until_finalize and finalize_interval != 0:
+            raise ValueError(
+                "defer_video_encoding_until_finalize requires finalize_interval=0"
+            )
+        if video_write_mode not in _VALID_VIDEO_WRITE_MODES:
+            raise ValueError(
+                f"Unsupported video_write_mode={video_write_mode!r}, "
+                f"expected one of {_VALID_VIDEO_WRITE_MODES}"
+            )
+        if video_write_mode == "stream_mp4":
+            if export_format != "lerobot" or not use_videos:
+                raise ValueError(
+                    "video_write_mode='stream_mp4' requires "
+                    "export_format='lerobot' and use_videos=True"
+                )
+            if defer_video_encoding_until_finalize:
+                raise ValueError(
+                    "stream_mp4 writes encoded video continuously and conflicts with "
+                    "defer_video_encoding_until_finalize=True"
+                )
+            if num_envs != 1:
+                raise ValueError("stream_mp4 currently requires num_envs=1")
+            if int(stream_video_queue_size) <= 0:
+                raise ValueError("stream_video_queue_size must be positive")
         self.save_dir = save_dir
         self.rank = rank
         self.num_envs = num_envs
@@ -137,14 +193,28 @@ class CollectEpisode(gym.Wrapper):
         self.export_format = export_format
         self.robot_type = robot_type
         self.fps = fps
+        self.use_videos = use_videos
         self.only_success = only_success
         self.finalize_interval = finalize_interval
+        self.defer_video_encoding_until_finalize = defer_video_encoding_until_finalize
+        self.isolate_episode_stats = isolate_episode_stats
+        self.image_writer_threads = image_writer_threads
+        self.image_writer_processes = image_writer_processes
+        self.copy_observations = copy_observations
+        self.video_write_mode = video_write_mode
+        self.stream_video_queue_size = int(stream_video_queue_size)
 
         self._preexisting_episode_count = 0
         self._next_shard_id = 0
         if export_format == "lerobot":
             self._lerobot_writer: Optional[Any] = None
             self._lerobot_lock = Lock()
+            if resume and video_write_mode == "stream_mp4":
+                from rlinf.data.storage.lerobot.streaming_writer import (
+                    StreamingLeRobotDatasetWriter,
+                )
+
+                StreamingLeRobotDatasetWriter.recover_rank(save_dir, rank)
             if resume:
                 (
                     self._preexisting_episode_count,
@@ -207,6 +277,8 @@ class CollectEpisode(gym.Wrapper):
         Returns:
             Tuple of (observation, info) from the underlying environment.
         """
+        if self.video_write_mode == "stream_mp4":
+            self._abort_stream_episode()
         self._buffers = [self._new_buffer() for _ in range(self.num_envs)]
         self._episode_success = [False] * self.num_envs
         self._pending_obs = [None] * self.num_envs
@@ -218,7 +290,7 @@ class CollectEpisode(gym.Wrapper):
             obs, info = self.env.reset()
 
         self._show_goal_site_visual()
-        self._record_reset_obs(obs)
+        self._record_reset_obs(obs, info)
         return obs, info
 
     def step(self, action, **kwargs):
@@ -291,16 +363,35 @@ class CollectEpisode(gym.Wrapper):
 
     def close(self):
         if self._closed:
+            # Resource shutdown is one-shot, but a transient finalization error
+            # may leave the writer available for an explicit best-effort retry.
+            self._finalize_lerobot()
             return None
         self._closed = True
-        self._finalize_lerobot()
-        self._wait_futures()
-        if self._executor is not None:
-            self._executor.shutdown(wait=True)
-            self._executor = None
-        if hasattr(self.env, "close"):
-            return self.env.close()
-        return None
+        first_error: Optional[BaseException] = None
+        result = None
+        try:
+            self._finalize_lerobot()
+            self._wait_futures()
+        except BaseException as exc:
+            first_error = exc
+        finally:
+            if self._executor is not None:
+                try:
+                    self._executor.shutdown(wait=True)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                self._executor = None
+            if hasattr(self.env, "close"):
+                try:
+                    result = self.env.close()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+        if first_error is not None:
+            raise first_error
+        return result
 
     def _new_buffer(self) -> dict[str, list]:
         return {
@@ -311,26 +402,41 @@ class CollectEpisode(gym.Wrapper):
             "truncated": [],
             "infos": [],
             "segment_ids": [],
+            "observation_timestamps_ns": [],
         }
 
-    def _seed_reset_frame(self, env_idx: int, env_obs: Any) -> None:
+    def _seed_reset_frame(
+        self,
+        env_idx: int,
+        env_obs: Any,
+        observation_timestamp_ns: int,
+        env_info: Any = None,
+    ) -> None:
         """Seed a fresh buffer with the post-reset state-aligned entry.
 
         State-aligned fields (observations / rewards / terminated / truncated /
-        infos) get a leading reset entry; action-aligned fields (actions,
-        segment_ids) stay empty and fill on the first regular step.
+        infos / observation timestamps) get a leading reset entry;
+        action-aligned fields (actions, segment_ids) stay empty and fill on the
+        first regular step.
         """
         buf = self._buffers[env_idx]
         buf["observations"].append(env_obs)
         buf["rewards"].append(0.0)
         buf["terminated"].append(False)
         buf["truncated"].append(False)
-        buf["infos"].append({})
+        buf["infos"].append(env_info if env_info is not None else {})
+        buf["observation_timestamps_ns"].append(observation_timestamp_ns)
 
-    def _record_reset_obs(self, obs) -> None:
+    def _record_reset_obs(self, obs, info) -> None:
         """Record the initial observation from reset into every env's buffer."""
         for env_idx in range(self.num_envs):
-            self._seed_reset_frame(env_idx, self._slice_copy(obs, env_idx))
+            env_info = self._slice_copy(info, env_idx)
+            self._seed_reset_frame(
+                env_idx,
+                self._slice_observation(obs, env_idx),
+                self._observation_timestamp_ns(env_info),
+                env_info,
+            )
 
     @staticmethod
     def _bool_from_env_info(env_info: Any, key: str) -> bool:
@@ -347,9 +453,11 @@ class CollectEpisode(gym.Wrapper):
         if has_final_obs:
             final_observation = info["final_observation"]
             final_info_batch = info["final_info"]
-            info_no_reset = copy.deepcopy(info)
-            info_no_reset.pop("final_observation")
-            info_no_reset.pop("final_info")
+            info_no_reset = {
+                key: value
+                for key, value in info.items()
+                if key not in ("final_observation", "final_info")
+            }
 
         for env_idx in range(self.num_envs):
             # Auto-reset envs store the pre-reset obs in info["final_observation"];
@@ -359,37 +467,68 @@ class CollectEpisode(gym.Wrapper):
                 truncated, env_idx
             )
             if has_final_obs and env_done:
-                env_obs = self._slice_copy(final_observation, env_idx)
-                env_info = self._slice_copy(final_info_batch, env_idx)
-                self._pending_obs[env_idx] = self._slice_copy(obs, env_idx)
+                obs_source = final_observation
+                info_source = final_info_batch
+            else:
+                obs_source = obs
+                info_source = info_no_reset if has_final_obs else info
+
+            # Inspect the small info structure before taking ownership of image
+            # observations. Pre-record frames must not enter the data buffer.
+            env_info_view = self._slice_data(info_source, env_idx)
+            record_reset = self._bool_from_env_info(env_info_view, "record_reset")
+            pre_record = self._bool_from_env_info(env_info_view, "pre_record")
+
+            if pre_record:
+                continue
+
+            env_info = self._slice_copy(info_source, env_idx)
+            env_obs = self._slice_observation(obs_source, env_idx)
+
+            if has_final_obs and env_done:
+                self._pending_obs[env_idx] = self._slice_observation(obs, env_idx)
                 self._pending_info[env_idx] = self._slice_copy(info_no_reset, env_idx)
                 if "intervene_action" in env_info:
                     env_info["intervene_action"] = env_info["intervene_action"][-1]
                     env_info["intervene_flag"] = env_info["intervene_flag"][-1]
-            else:
-                env_obs = self._slice_copy(obs, env_idx)
-                env_info = self._slice_copy(info, env_idx)
-                if "final_observation" in env_info:
-                    env_info.pop("final_observation")
-                    env_info.pop("final_info")
-
-            record_reset = self._bool_from_env_info(env_info, "record_reset")
-            pre_record = self._bool_from_env_info(env_info, "pre_record")
 
             if record_reset:
+                if self.video_write_mode == "stream_mp4":
+                    self._abort_stream_episode()
                 self._buffers[env_idx] = self._new_buffer()
                 self._episode_success[env_idx] = False
                 self._segment_ids[env_idx] = 0
-                self._seed_reset_frame(env_idx, env_obs)
-                continue
-
-            if pre_record:
+                self._seed_reset_frame(
+                    env_idx,
+                    env_obs,
+                    self._observation_timestamp_ns(env_info),
+                    env_info,
+                )
                 continue
 
             if self._bool_from_env_info(env_info, "segment_advance"):
                 self._segment_ids[env_idx] += 1
 
             buf = self._buffers[env_idx]
+            if self.video_write_mode == "stream_mp4":
+                frame = self._transition_to_lerobot_frame(
+                    buf, env_idx, action, env_info
+                )
+                if frame is None:
+                    raise RuntimeError(
+                        "stream_mp4 cannot skip a frame with missing state/action; "
+                        "failing closed to preserve frame alignment"
+                    )
+                self._ensure_streaming_writer(frame).append_frame(frame)
+                # The encoder owns the prior images now. Retain only the task
+                # description needed at successful episode commit.
+                prior = buf["observations"][-1]
+                if isinstance(prior, dict):
+                    buf["observations"][-1] = {
+                        "task_descriptions": prior.get(
+                            "task_descriptions", "unknown task"
+                        )
+                    }
             buf["observations"].append(env_obs)
             buf["actions"].append(self._slice_copy(action, env_idx))
             buf["rewards"].append(self._slice_copy(reward, env_idx))
@@ -397,36 +536,41 @@ class CollectEpisode(gym.Wrapper):
             buf["truncated"].append(self._slice_copy(truncated, env_idx))
             buf["infos"].append(env_info)
             buf["segment_ids"].append(int(self._segment_ids[env_idx]))
+            buf["observation_timestamps_ns"].append(
+                self._observation_timestamp_ns(env_info)
+            )
 
-            self._update_success(env_idx, self._slice_data(env_info, env_idx))
+            self._update_success(env_idx, env_info)
 
     def _reset_env_buffer(self, env_idx: int) -> None:
         """Advance episode counter, clear the buffer, and carry over pending obs."""
+        if self.video_write_mode == "stream_mp4":
+            self._abort_stream_episode()
         self._episode_ids[env_idx] += 1
         self._buffers[env_idx] = self._new_buffer()
         self._episode_success[env_idx] = False
         self._segment_ids[env_idx] = 0
 
         if self._pending_obs[env_idx] is not None:
-            self._buffers[env_idx]["observations"].append(self._pending_obs[env_idx])
+            pending_info = self._pending_info[env_idx]
+            self._seed_reset_frame(
+                env_idx,
+                self._pending_obs[env_idx],
+                self._observation_timestamp_ns(pending_info),
+                pending_info,
+            )
             self._pending_obs[env_idx] = None
-
-            if self._pending_info[env_idx] is not None:
-                self._buffers[env_idx]["infos"].append(self._pending_info[env_idx])
-                self._pending_info[env_idx] = None
-            else:
-                self._buffers[env_idx]["infos"].append({})
-
-            self._buffers[env_idx]["rewards"].append(0.0)
-            self._buffers[env_idx]["terminated"].append(False)
-            self._buffers[env_idx]["truncated"].append(False)
+            self._pending_info[env_idx] = None
 
     def _maybe_flush(self, terminated, truncated) -> None:
         """Save finished episodes and reset their buffers."""
         for env_idx in range(self.num_envs):
-            is_success = self._get_episode_success(self._buffers[env_idx], env_idx)
             done_by_term = self._scalar_flag(terminated, env_idx)
             done_by_trunc = self._scalar_flag(truncated, env_idx)
+            if not (done_by_term or done_by_trunc):
+                continue
+
+            is_success = self._get_episode_success(self._buffers[env_idx], env_idx)
             if self.only_success:
                 if is_success and done_by_term:
                     self._flush_episode(env_idx, is_success)
@@ -447,6 +591,17 @@ class CollectEpisode(gym.Wrapper):
             return
 
         if self.export_format == "lerobot":
+            if self.video_write_mode == "stream_mp4":
+                if self._lerobot_writer is None or not self._lerobot_writer.active:
+                    raise RuntimeError(
+                        "stream_mp4 episode has actions but no active encoder"
+                    )
+                self._lerobot_writer.finish_episode(
+                    task=self._extract_task_description(buf, env_idx),
+                    is_success=is_success,
+                )
+                self._episodes_written += 1
+                return
             ep_data = self._buffer_to_lerobot_ep(buf, env_idx, is_success)
             if ep_data is not None:
                 self._submit(self._write_lerobot_episode, ep_data)
@@ -464,6 +619,7 @@ class CollectEpisode(gym.Wrapper):
                     "terminated": buf["terminated"],
                     "truncated": buf["truncated"],
                     "infos": buf["infos"],
+                    "observation_timestamps_ns": buf["observation_timestamps_ns"],
                 }
             )
             label = "success" if is_success else "fail"
@@ -484,8 +640,8 @@ class CollectEpisode(gym.Wrapper):
         Produces the format expected by ``LeRobotDatasetWriter.add_episode``:
         a ``list[dict]`` where every dict represents one step and carries the
         fields ``image``, ``state``, ``actions``, ``task``, ``is_success``,
-        ``done``, ``intervene_flag``, and optionally ``wrist_image`` /
-        ``extra_view_image``.
+        ``done``, ``intervene_flag``, ``observation_timestamp_ns``, and
+        optionally ``wrist_image`` / ``extra_view_image``.
         The observations list contains one extra entry prepended at reset time,
         so it is aligned to the actions list by taking the leading N entries.
         Steps where any required field (image, state, action) is missing are
@@ -501,6 +657,7 @@ class CollectEpisode(gym.Wrapper):
         actions = buf["actions"]
         terminated = buf["terminated"]
         obs_steps = buf["observations"]
+        observation_timestamps_ns = buf.get("observation_timestamps_ns", [])
         seg_ids = buf.get("segment_ids", [])
         if not actions:
             return None
@@ -548,6 +705,10 @@ class CollectEpisode(gym.Wrapper):
                 "intervene_flag": np.array([intervene_flag], dtype=bool),
                 "segment_id": np.array([seg_id], dtype=np.uint8),
             }
+            if i < len(observation_timestamps_ns):
+                frame["observation_timestamp_ns"] = np.array(
+                    [observation_timestamps_ns[i]], dtype=np.int64
+                )
             if image is not None:
                 frame["image"] = self._to_uint8(np.asarray(image))
             for key, img in self._expand_multi_view_images(
@@ -594,9 +755,109 @@ class CollectEpisode(gym.Wrapper):
                 extra_view_image_keys=extra_view_image_keys,
                 has_intervene_flag="intervene_flag" in first,
                 has_segment_id="segment_id" in first,
+                has_observation_timestamp="observation_timestamp_ns" in first,
+                use_videos=self.use_videos,
+                defer_video_encoding_until_finalize=(
+                    self.defer_video_encoding_until_finalize
+                ),
+                isolate_episode_stats=self.isolate_episode_stats,
+                image_writer_threads=self.image_writer_threads,
+                image_writer_processes=self.image_writer_processes,
             )
             self._next_shard_id = shard_id + 1
         return self._lerobot_writer
+
+    def _transition_to_lerobot_frame(
+        self, buf: dict, env_idx: int, action: Any, env_info: Any
+    ) -> Optional[dict[str, Any]]:
+        """Build the current action-aligned frame from the preceding observation."""
+        if not buf["observations"]:
+            return None
+        observation = buf["observations"][-1]
+        image, wrist_image, extra_view_image, state = self._extract_obs_image_state(
+            observation
+        )
+        np_action = self._to_numpy(self._slice_copy(action, env_idx))
+        if isinstance(env_info, dict):
+            intervene = env_info.get("intervene_flag")
+            intervene_action = env_info.get("intervene_action")
+            if intervene is not None and intervene_action is not None:
+                intervene_array = np.asarray(self._to_numpy(intervene), dtype=bool)
+                if intervene_array.all():
+                    np_action = self._to_numpy(intervene_action)
+        if state is None or np_action is None:
+            return None
+        frame: dict[str, Any] = {
+            "state": np.asarray(state, dtype=np.float32),
+            "actions": np.asarray(np_action, dtype=np.float32).flatten(),
+            "is_success": np.asarray([False], dtype=bool),
+            "done": np.asarray([False], dtype=bool),
+            "intervene_flag": np.asarray(
+                [self._intervene_flag_from_info(env_info)], dtype=bool
+            ),
+            "segment_id": np.asarray([self._segment_ids[env_idx]], dtype=np.uint8),
+        }
+        timestamps = buf.get("observation_timestamps_ns", [])
+        if timestamps:
+            frame["observation_timestamp_ns"] = np.asarray(
+                [timestamps[-1]], dtype=np.int64
+            )
+        if image is not None:
+            frame["image"] = self._to_uint8(np.asarray(image))
+        for key, value in self._expand_multi_view_images(
+            "wrist_image", wrist_image
+        ).items():
+            frame[key] = self._to_uint8(np.asarray(value))
+        for key, value in self._expand_multi_view_images(
+            "extra_view_image", extra_view_image
+        ).items():
+            frame[key] = self._to_uint8(np.asarray(value))
+        return frame
+
+    def _ensure_streaming_writer(self, frame: dict[str, Any]):
+        from rlinf.data.storage.lerobot.streaming_writer import (
+            StreamingLeRobotDatasetWriter,
+        )
+
+        if self._lerobot_writer is None:
+            writer = StreamingLeRobotDatasetWriter(
+                queue_size=self.stream_video_queue_size
+            )
+            try:
+                wrist_image_keys = self._collect_image_keys(frame, "wrist_image")
+                extra_view_image_keys = self._collect_image_keys(
+                    frame, "extra_view_image"
+                )
+                shard_id = self._next_shard_id
+                writer.create(
+                    repo_id=os.path.join(
+                        self.save_dir, f"rank_{self.rank}", f"id_{shard_id}"
+                    ),
+                    robot_type=self.robot_type,
+                    fps=self.fps,
+                    image_shape=frame["image"].shape if "image" in frame else None,
+                    state_dim=int(frame["state"].shape[-1]),
+                    action_dim=int(frame["actions"].shape[-1]),
+                    has_image="image" in frame,
+                    wrist_image_keys=wrist_image_keys,
+                    extra_view_image_keys=extra_view_image_keys,
+                    has_intervene_flag="intervene_flag" in frame,
+                    has_segment_id="segment_id" in frame,
+                    has_observation_timestamp="observation_timestamp_ns" in frame,
+                )
+            except BaseException:
+                try:
+                    writer.finalize()
+                except BaseException:
+                    pass
+                raise
+            self._next_shard_id = shard_id + 1
+            self._lerobot_writer = writer
+        return self._lerobot_writer
+
+    def _abort_stream_episode(self) -> None:
+        if self._lerobot_writer is not None and self._lerobot_writer.active:
+            self._lerobot_writer.abort_episode()
 
     @staticmethod
     def _collect_image_keys(
@@ -621,7 +882,7 @@ class CollectEpisode(gym.Wrapper):
     def _write_lerobot_episode(self, ep_data: dict) -> None:
         with self._lerobot_lock:
             writer = self._ensure_lerobot_writer(ep_data)
-            writer.add_episode(ep_data)
+            writer.add_episode(ep_data, consume=True)
             self._episodes_written += 1
             count = self._episodes_written
             if self.finalize_interval > 0 and count % self.finalize_interval == 0:
@@ -631,11 +892,33 @@ class CollectEpisode(gym.Wrapper):
         """Drain pending futures then write the LeRobot dataset metadata."""
         if self.export_format != "lerobot":
             return
-        self._wait_futures()
-        with self._lerobot_lock:
-            if self._lerobot_writer is not None:
-                self._lerobot_writer.finalize()
+        first_error: Optional[BaseException] = None
+        try:
+            self._wait_futures()
+        except BaseException as exc:
+            first_error = exc
+
+        finalize_succeeded = False
+        try:
+            with self._lerobot_lock:
+                if self._lerobot_writer is not None and (
+                    self.video_write_mode == "stream_mp4"
+                    or self._lerobot_writer.dataset is not None
+                ):
+                    if first_error is None:
+                        self._lerobot_writer.finalize()
+                    else:
+                        self._lerobot_writer.finalize(prior_error=first_error)
+                finalize_succeeded = True
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        finally:
+            if finalize_succeeded:
                 self._lerobot_writer = None
+
+        if first_error is not None:
+            raise first_error
 
     def _write_pickle(self, save_path: str, episode_data: dict) -> None:
         with open(save_path, "wb") as f:
@@ -658,9 +941,16 @@ class CollectEpisode(gym.Wrapper):
         self._futures = remaining
 
     def _wait_futures(self) -> None:
+        first_error: Optional[BaseException] = None
         for f in self._futures:
-            f.result()
+            try:
+                f.result()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
         self._futures = []
+        if first_error is not None:
+            raise first_error
 
     def _finalize_on_exit(self) -> None:
         self.close()
@@ -836,6 +1126,39 @@ class CollectEpisode(gym.Wrapper):
     def _slice_copy(self, data, env_idx: int):
         """Slice batched data for a single env and deep-copy the result."""
         return self._copy(self._slice_data(data, env_idx))
+
+    def _slice_observation(self, data, env_idx: int):
+        """Slice an observation and either copy it or take shared ownership."""
+        sliced = self._slice_data(data, env_idx)
+        if self.copy_observations:
+            return self._copy(sliced)
+        return self._own_observation(sliced)
+
+    def _own_observation(self, data):
+        """Copy containers while retaining fresh CPU tensor and array storage."""
+        if isinstance(data, torch.Tensor):
+            detached = data.detach()
+            return detached.cpu() if detached.device.type != "cpu" else detached
+        if isinstance(data, np.ndarray):
+            return data
+        if isinstance(data, dict):
+            return {key: self._own_observation(value) for key, value in data.items()}
+        if isinstance(data, list):
+            return [self._own_observation(value) for value in data]
+        if isinstance(data, tuple):
+            return tuple(self._own_observation(value) for value in data)
+        return data
+
+    @staticmethod
+    def _observation_timestamp_ns(env_info: Any) -> int:
+        """Extract a monotonic observation timestamp, with a local fallback."""
+        if isinstance(env_info, dict):
+            value = env_info.get("observation_timestamp_ns")
+            if value is not None:
+                array = CollectEpisode._to_numpy(value)
+                if array is not None and array.size:
+                    return int(array.reshape(-1)[0])
+        return time.monotonic_ns()
 
     def _scalar_flag(self, flags, env_idx: int) -> bool:
         """Extract a boolean flag for ``env_idx`` from a batched flag."""
