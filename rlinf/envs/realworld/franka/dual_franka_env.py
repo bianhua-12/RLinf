@@ -17,7 +17,10 @@
 from __future__ import annotations
 
 import queue
+import threading
 import time
+import traceback
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from itertools import cycle
 from typing import Any, Optional
@@ -28,6 +31,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from rlinf.envs.realworld.common.camera import BaseCamera, CameraInfo, create_camera
+from rlinf.envs.realworld.common.camera.base_camera import CameraHealth
 from rlinf.envs.realworld.common.video_player import VideoPlayer
 from rlinf.scheduler import DualFrankaHWInfo, WorkerInfo
 from rlinf.utils.logging import get_logger
@@ -37,9 +41,62 @@ from .franky_controller import FrankyController
 
 # Avoids Ray actor name collision when both arms land on the same node.
 _RIGHT_ARM_ENV_IDX_OFFSET = 1000
-# Per-camera get_frame timeout. Short so a stalled camera doesn't drag the
-# 10 Hz env loop; reconnection is handled by the camera's own capture thread.
-_CAMERA_FRAME_TIMEOUT_S = 0.5
+
+
+class _DaemonCameraRecoveryExecutor:
+    """Single daemon worker with bounded shutdown for camera reconstruction."""
+
+    def __init__(self):
+        self._jobs: queue.Queue = queue.Queue()
+        self._stopping = False
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="franka_camera_recovery",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, function, *args) -> Future:
+        future = Future()
+        with self._lock:
+            if self._stopping:
+                raise RuntimeError("camera recovery executor is stopping")
+            self._jobs.put((future, function, args))
+        return future
+
+    def _run(self) -> None:
+        while True:
+            item = self._jobs.get()
+            if item is None:
+                return
+            future, function, args = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(function(*args))
+            except BaseException as exc:
+                future.set_exception(exc)
+
+    def shutdown(self, timeout: float) -> bool:
+        """Cancel queued work and wait a bounded time for in-flight work."""
+        with self._lock:
+            if not self._stopping:
+                self._stopping = True
+                while True:
+                    try:
+                        item = self._jobs.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is not None:
+                        item[0].cancel()
+                self._jobs.put(None)
+        self._thread.join(timeout=timeout)
+        return not self._thread.is_alive()
+
+    @property
+    def thread_alive(self) -> bool:
+        return self._thread.is_alive()
 
 
 @dataclass
@@ -67,6 +124,11 @@ class DualFrankaRobotConfig:
     use_dense_reward: bool = False
     step_frequency: float = 10.0
     camera_fps: int = 15
+    camera_first_frame_timeout_seconds: float = 3.0
+    camera_max_stale_seconds: float = 1.0
+    camera_recovery_initial_backoff_seconds: float = 0.5
+    camera_recovery_max_backoff_seconds: float = 4.0
+    camera_recovery_shutdown_timeout_seconds: float = 3.0
 
     # (2, 6) arrays: row 0 = left arm, row 1 = right arm
     target_ee_pose: np.ndarray = field(default_factory=lambda: np.zeros((2, 6)))
@@ -106,6 +168,15 @@ class DualFrankaRobotConfig:
         self.action_scale = np.array(self.action_scale)
         self.ee_pose_limit_min = np.array(self.ee_pose_limit_min).reshape(2, 6)
         self.ee_pose_limit_max = np.array(self.ee_pose_limit_max).reshape(2, 6)
+        for name in (
+            "camera_first_frame_timeout_seconds",
+            "camera_max_stale_seconds",
+            "camera_recovery_initial_backoff_seconds",
+            "camera_recovery_max_backoff_seconds",
+            "camera_recovery_shutdown_timeout_seconds",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
 
 
 class DualFrankaEnv(gym.Env):
@@ -177,9 +248,16 @@ class DualFrankaEnv(gym.Env):
         self._left_state = self._left_ctrl.get_state().wait()[0]
         self._right_state = self._right_ctrl.get_state().wait()[0]
 
-        # Cache of last successful frame per camera, for graceful degradation
-        # when a single camera stalls (used by _get_camera_frames).
-        self._last_camera_frame: dict[str, np.ndarray] = {}
+        self._last_camera_frame: dict[str, tuple[np.ndarray, float]] = {}
+        self._last_camera_sequence: dict[str, int] = {}
+        self._camera_stale_since: dict[str, float | None] = {}
+        self._camera_consecutive_stale_steps: dict[str, int] = {}
+        self._camera_diagnostics: dict[str, dict[str, Any]] = {}
+        self._camera_recovery_futures: dict[str, Future] = {}
+        self._camera_recovery_attempts: dict[str, int] = {}
+        self._camera_recovery_next_retry: dict[str, float] = {}
+        self._camera_needs_recovery: dict[str, bool] = {}
+        self._camera_recovery_executor = _DaemonCameraRecoveryExecutor()
 
         self._open_cameras()
         self.camera_player = VideoPlayer(self.config.enable_camera_player)
@@ -232,15 +310,158 @@ class DualFrankaEnv(gym.Env):
             )
             for name, serial, ct in self._all_camera_specs()
         ]
-        for info in camera_infos:
-            camera = create_camera(info)
-            camera.open()
-            self._cameras.append(camera)
+        try:
+            for info in camera_infos:
+                camera = create_camera(info)
+                camera.open()
+                self._cameras.append(camera)
+            deadline = time.monotonic() + self.config.camera_first_frame_timeout_seconds
+            for camera in self._cameras:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "global camera first-frame deadline expired before "
+                        f"{camera.name} became ready"
+                    )
+                camera.wait_for_first_frame(remaining)
+        except BaseException:
+            for camera in self._cameras:
+                try:
+                    camera.close()
+                except BaseException:
+                    self._logger.exception(
+                        "Failed to close camera %s after open failure", camera.name
+                    )
+            self._cameras = []
+            raise
 
     def _close_cameras(self):
+        recovery_executor = getattr(self, "_camera_recovery_executor", None)
+        futures = getattr(self, "_camera_recovery_futures", {})
+        unfinished_names = {
+            name for name, future in futures.items() if not future.done()
+        }
+        if recovery_executor is not None:
+            stopped = recovery_executor.shutdown(
+                timeout=self.config.camera_recovery_shutdown_timeout_seconds
+            )
+            if not stopped:
+                self._logger.error(
+                    "Camera recovery worker did not stop within %.3fs; "
+                    "leaving its daemon thread isolated",
+                    self.config.camera_recovery_shutdown_timeout_seconds,
+                )
+                for name in unfinished_names:
+                    futures[name].add_done_callback(self._close_abandoned_recovery)
+            self._camera_recovery_executor = None
+        unfinished_names = {
+            name for name, future in futures.items() if not future.done()
+        }
+        for future in futures.values():
+            if (
+                not future.done()
+                or future.cancelled()
+                or future.exception() is not None
+            ):
+                continue
+            recovered = future.result()
+            if recovered not in self._cameras:
+                recovered.close()
+        self._camera_recovery_futures = {}
         for camera in self._cameras:
+            if camera.name in unfinished_names:
+                continue
             camera.close()
         self._cameras = []
+
+    def _close_abandoned_recovery(self, future: Future) -> None:
+        if future.cancelled() or future.exception() is not None:
+            return
+        try:
+            future.result().close()
+        except BaseException:
+            self._logger.exception("Failed to close abandoned recovered camera")
+
+    @staticmethod
+    def _replace_camera(camera: BaseCamera, first_frame_timeout: float) -> BaseCamera:
+        camera.close()
+        replacement = create_camera(camera._camera_info)
+        try:
+            replacement.open()
+            replacement.wait_for_first_frame(first_frame_timeout)
+        except BaseException:
+            try:
+                replacement.close()
+            except BaseException:
+                pass
+            raise
+        return replacement
+
+    def _poll_camera_recovery(self, index: int, camera: BaseCamera) -> BaseCamera:
+        name = camera._camera_info.name
+        future = self._camera_recovery_futures.get(name)
+        if future is None or not future.done():
+            return camera
+        del self._camera_recovery_futures[name]
+        try:
+            replacement = future.result()
+        except Exception as exc:
+            attempt = self._camera_recovery_attempts.get(name, 1)
+            backoff = min(
+                self.config.camera_recovery_initial_backoff_seconds
+                * (2 ** max(0, attempt - 1)),
+                self.config.camera_recovery_max_backoff_seconds,
+            )
+            self._camera_recovery_next_retry[name] = time.monotonic() + backoff
+            self._camera_needs_recovery[name] = True
+            self._logger.error(
+                "Camera %s recovery attempt %d failed; retry in %.3fs: %s\n%s",
+                name,
+                attempt,
+                backoff,
+                exc,
+                "".join(traceback.format_exception(exc)),
+            )
+            return camera
+        self._cameras[index] = replacement
+        self._last_camera_sequence[name] = 0
+        self._camera_recovery_attempts[name] = 0
+        self._camera_recovery_next_retry[name] = 0.0
+        self._camera_needs_recovery[name] = False
+        self._logger.info("Camera %s recovery completed after first valid frame.", name)
+        return replacement
+
+    def _schedule_camera_recovery(self, camera: BaseCamera) -> None:
+        name = camera._camera_info.name
+        if name in self._camera_recovery_futures:
+            return
+        if not self._camera_needs_recovery.get(name, False) and (
+            camera.health != CameraHealth.FAILED
+        ):
+            return
+        now = time.monotonic()
+        if now < self._camera_recovery_next_retry.get(name, 0.0):
+            return
+        executor = self._camera_recovery_executor
+        if executor is None:
+            return
+        attempt = self._camera_recovery_attempts.get(name, 0) + 1
+        self._camera_recovery_attempts[name] = attempt
+        self._camera_needs_recovery[name] = True
+        self._logger.error(
+            "Camera %s serial=%s type=%s entered FAILED; scheduling recovery "
+            "attempt=%d last_error=%s",
+            name,
+            camera._camera_info.serial_number,
+            camera._camera_info.camera_type,
+            attempt,
+            camera.snapshot().last_failure,
+        )
+        self._camera_recovery_futures[name] = executor.submit(
+            self._replace_camera,
+            camera,
+            self.config.camera_first_frame_timeout_seconds,
+        )
 
     def _crop_frame(
         self, frame: np.ndarray, reshape_size: tuple[int, int]
@@ -257,38 +478,94 @@ class DualFrankaEnv(gym.Env):
         return cropped, resized
 
     def _get_camera_frames(self) -> dict[str, np.ndarray]:
-        """Read one frame per camera. On stall, fall back to the last-good
-        frame and replace just that camera in-place; other cameras keep
-        producing fresh frames. Raises only when a camera stalls before
-        producing any frame (no cache to fall back to).
-        """
+        """Take non-blocking latest-frame snapshots and bound stale fallback."""
         frames: dict[str, np.ndarray] = {}
         display_frames: dict[str, np.ndarray] = {}
+        now = time.monotonic()
 
         for i, camera in enumerate(self._cameras):
+            camera = self._poll_camera_recovery(i, camera)
             name = camera._camera_info.name
-            try:
-                frame = camera.get_frame(timeout=_CAMERA_FRAME_TIMEOUT_S)
-            except queue.Empty:
+            snapshot = camera.snapshot()
+            if snapshot.health == CameraHealth.FAILED:
+                self._camera_needs_recovery[name] = True
+            if self._camera_needs_recovery.get(name, False):
+                self._schedule_camera_recovery(camera)
+
+            last_sequence = self._last_camera_sequence.get(name, 0)
+            if snapshot.frame is not None and snapshot.frame_sequence != last_sequence:
+                frame = snapshot.frame
+                timestamp = snapshot.frame_timestamp_monotonic or now
+                self._last_camera_frame[name] = (frame, timestamp)
+                self._last_camera_sequence[name] = snapshot.frame_sequence
+                self._camera_stale_since[name] = None
+                self._camera_consecutive_stale_steps[name] = 0
+                is_stale = False
+            else:
                 cached = self._last_camera_frame.get(name)
                 if cached is None:
                     raise RuntimeError(
-                        f"Camera {name} stalled with no cached frame to fall back to."
+                        f"Camera {name} has no valid frame or cache; "
+                        f"health={snapshot.health.value}"
                     )
-                self._logger.error("Camera %s stalled; replacing.", name)
-                camera.close()
-                self._cameras[i] = create_camera(camera._camera_info)
-                self._cameras[i].open()
-                frame = cached
+                frame, timestamp = cached
+                stale_since = self._camera_stale_since.get(name)
+                if stale_since is None:
+                    stale_since = now
+                    self._camera_stale_since[name] = stale_since
+                self._camera_consecutive_stale_steps[name] = (
+                    self._camera_consecutive_stale_steps.get(name, 0) + 1
+                )
+                is_stale = True
+
+            frame_age_ms = max(0.0, (now - timestamp) * 1000.0)
+            stale_since = self._camera_stale_since.get(name)
+            stale_duration = 0.0 if stale_since is None else now - stale_since
+            diagnostic = {
+                "is_stale": is_stale,
+                "frame_age_ms": frame_age_ms,
+                "consecutive_stale_steps": self._camera_consecutive_stale_steps.get(
+                    name, 0
+                ),
+                "stale_since_monotonic": stale_since,
+                "capture_health": snapshot.health.value,
+                "recovery_attempt": self._camera_recovery_attempts.get(name, 0),
+                "last_read_error": snapshot.last_failure,
+                "serial_number": camera._camera_info.serial_number,
+                "camera_type": camera._camera_info.camera_type,
+            }
+            self._camera_diagnostics[name] = diagnostic
+            if stale_duration > self.config.camera_max_stale_seconds:
+                self._logger.error(
+                    "Camera %s serial=%s type=%s stale limit exceeded: "
+                    "frame_age_ms=%.1f stale_duration=%.3fs health=%s "
+                    "recovery_attempt=%d last_error=%s",
+                    name,
+                    camera._camera_info.serial_number,
+                    camera._camera_info.camera_type,
+                    frame_age_ms,
+                    stale_duration,
+                    snapshot.health.value,
+                    self._camera_recovery_attempts.get(name, 0),
+                    snapshot.last_failure,
+                )
+                raise RuntimeError(
+                    f"camera {name} stale for {stale_duration:.3f}s exceeds "
+                    f"camera_max_stale_seconds={self.config.camera_max_stale_seconds:.3f}"
+                )
 
             reshape_size = self.observation_space["frames"][name].shape[:2][::-1]
             _, resized = self._crop_frame(frame, reshape_size)
             frames[name] = resized[..., ::-1]
             display_frames[name] = resized
-            self._last_camera_frame[name] = frame
 
         self.camera_player.put_frame(display_frames)
         return frames
+
+    @property
+    def camera_diagnostics(self) -> dict[str, dict[str, Any]]:
+        """Latest per-camera freshness and recovery diagnostics."""
+        return {name: dict(values) for name, values in self._camera_diagnostics.items()}
 
     # ---------------------------------------------------------------- hardware
 
@@ -413,7 +690,7 @@ class DualFrankaEnv(gym.Env):
         self._right_state = right_st_f.wait()[0]
         observation = self._get_observation()
         self._step_deadline = time.perf_counter()
-        return observation, {}
+        return observation, {"camera_diagnostics": self.camera_diagnostics}
 
     def step(self, action: np.ndarray):
         action = np.clip(action, self.action_space.low, self.action_space.high)
@@ -452,7 +729,13 @@ class DualFrankaEnv(gym.Env):
             self._success_hold_counter >= self.config.success_hold_steps
         )
         truncated = self._num_steps >= self.config.max_num_steps
-        return observation, reward, terminated, truncated, {}
+        return (
+            observation,
+            reward,
+            terminated,
+            truncated,
+            {"camera_diagnostics": self.camera_diagnostics},
+        )
 
     def _wait_for_observation_deadline(self) -> None:
         """Pace observation sampling without accumulating post-read work."""

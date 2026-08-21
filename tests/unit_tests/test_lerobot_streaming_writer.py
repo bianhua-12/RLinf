@@ -1,7 +1,11 @@
 # Copyright 2026 The RLinf Authors.
 
 import json
+import os
 import queue
+import time
+from contextlib import suppress
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -13,6 +17,91 @@ from rlinf.data.storage.lerobot.streaming_writer import (
     StreamingLeRobotDatasetWriter,
     _sampled_image_stats,
 )
+
+
+def _commit_result(episode_index, *, success, error=None, traceback_text=None):
+    now = time.monotonic()
+    return {
+        "kind": "commit_result",
+        "episode_index": episode_index,
+        "started_at": now,
+        "completed_at": now,
+        "success": success,
+        "error": error,
+        "traceback": traceback_text,
+    }
+
+
+def _blocking_commit_worker(commands, results):
+    while True:
+        command = commands.get()
+        if command[0] == "close":
+            results.put({"kind": "closed"})
+            return
+        _, root, partial_dir, manifest = command
+        root = Path(root)
+        Path(partial_dir, "commit-worker-entered").write_text("entered")
+        while not (root / "release-commit-worker").exists():
+            time.sleep(0.01)
+        StreamingLeRobotDatasetWriter._publish_ready(
+            root, Path(partial_dir), manifest, verify_sources=False
+        )
+        StreamingLeRobotDatasetWriter._append_manifest_metadata(root, manifest)
+        results.put(_commit_result(manifest["episode_index"], success=True))
+
+
+def _permanently_blocked_commit_worker(commands, results):
+    command = commands.get()
+    _, _, partial_dir, _ = command
+    Path(partial_dir, "commit-worker-entered").write_text("entered")
+    while True:
+        time.sleep(1.0)
+
+
+def _failing_commit_worker(commands, results):
+    command = commands.get()
+    manifest = command[3]
+    results.put(
+        _commit_result(
+            manifest["episode_index"],
+            success=False,
+            error="RuntimeError: injected publish crash",
+            traceback_text="injected worker traceback",
+        )
+    )
+
+
+def _exiting_commit_worker(commands, results):
+    commands.get()
+    os._exit(17)
+
+
+def _partial_move_commit_worker(commands, results):
+    _, root, partial_dir, manifest = commands.get()
+    root = Path(root)
+    partial_dir = Path(partial_dir)
+    item = next(iter(manifest["files"].values()))
+    source = partial_dir / item["source"]
+    destination = root / item["destination"]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(source, destination)
+    os._exit(19)
+
+
+def _committed_before_metadata_worker(commands, results):
+    _, root, partial_dir, manifest = commands.get()
+    StreamingLeRobotDatasetWriter._publish_ready(
+        Path(root), Path(partial_dir), manifest, verify_sources=False
+    )
+    os._exit(23)
+
+
+def _wait_for(path: Path, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"timed out waiting for {path}")
+        time.sleep(0.01)
 
 
 def _frame(index: int) -> dict:
@@ -172,6 +261,11 @@ def test_multiple_episodes_use_independent_v3_files(tmp_path):
 
 def test_publish_failure_preserves_ready_transaction(monkeypatch, tmp_path):
     root = tmp_path / "rank_0" / "id_0"
+    monkeypatch.setattr(
+        StreamingLeRobotDatasetWriter,
+        "_COMMIT_WORKER_TARGET",
+        staticmethod(_failing_commit_worker),
+    )
     writer = StreamingLeRobotDatasetWriter(queue_size=8)
     writer.create(
         repo_id=str(root),
@@ -189,14 +283,9 @@ def test_publish_failure_preserves_ready_transaction(monkeypatch, tmp_path):
     )
     for index in range(3):
         writer.append_frame(_frame(index))
-    monkeypatch.setattr(
-        StreamingLeRobotDatasetWriter,
-        "_publish_ready",
-        MagicMock(side_effect=RuntimeError("injected publish crash")),
-    )
-    with pytest.raises(RuntimeError, match="injected publish crash"):
-        writer.finish_episode(task="stack boxes", is_success=True)
-    writer.finalize()
+    writer.finish_episode(task="stack boxes", is_success=True)
+    with pytest.raises(RuntimeError, match="injected worker traceback"):
+        writer.finalize()
 
     ready = root / ".streaming" / "partial" / "episode_000000" / "manifest.ready.json"
     assert ready.is_file()
@@ -206,6 +295,224 @@ def test_publish_failure_preserves_ready_transaction(monkeypatch, tmp_path):
     assert (root / ".streaming" / "committed" / "episode_000000.json").is_file()
     with (root / "meta" / "info.json").open() as handle:
         assert json.load(handle)["total_episodes"] == 1
+
+
+def test_finish_returns_after_ready_manifest_before_async_publish(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "rank_0" / "id_0"
+    monkeypatch.setattr(
+        StreamingLeRobotDatasetWriter,
+        "_COMMIT_WORKER_TARGET",
+        staticmethod(_blocking_commit_worker),
+    )
+    writer = _created_writer(root)
+    for index in range(3):
+        writer.append_frame(_frame(index))
+
+    assert writer.finish_episode(task="stack boxes", is_success=True) == 3
+    ready = root / ".streaming" / "partial" / "episode_000000" / "manifest.ready.json"
+    _wait_for(ready.parent / "commit-worker-entered")
+    assert ready.is_file()
+    with (root / "meta" / "info.json").open() as handle:
+        assert json.load(handle)["total_episodes"] == 0
+
+    (root / "release-commit-worker").write_text("release")
+    writer.finalize()
+    with (root / "meta" / "info.json").open() as handle:
+        assert json.load(handle)["total_episodes"] == 1
+
+
+def test_next_episode_can_finish_while_previous_publish_is_blocked(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "rank_0" / "id_0"
+    monkeypatch.setattr(
+        StreamingLeRobotDatasetWriter,
+        "_COMMIT_WORKER_TARGET",
+        staticmethod(_blocking_commit_worker),
+    )
+    writer = _created_writer(root)
+
+    for index in range(3):
+        writer.append_frame(_frame(index))
+    assert writer.finish_episode(task="stack boxes", is_success=True) == 3
+    _wait_for(
+        root / ".streaming" / "partial" / "episode_000000" / "commit-worker-entered"
+    )
+
+    for index in range(2):
+        writer.append_frame(_frame(index + 3))
+    assert writer.finish_episode(task="stack boxes", is_success=True) == 2
+
+    first_ready = root / ".streaming" / "partial" / "episode_000000"
+    second_ready = root / ".streaming" / "partial" / "episode_000001"
+    assert (first_ready / "manifest.ready.json").is_file()
+    assert (second_ready / "manifest.ready.json").is_file()
+    with (second_ready / "manifest.ready.json").open() as handle:
+        second_manifest = json.load(handle)
+    assert second_manifest["episode_index"] == 1
+    import pandas as pd
+
+    second_data = pd.read_parquet(second_ready / "data.parquet")
+    assert second_data["index"].tolist() == [3, 4]
+
+    (root / "release-commit-worker").write_text("release")
+    writer.finalize()
+    with (root / "meta" / "info.json").open() as handle:
+        info = json.load(handle)
+    assert info["total_episodes"] == 2
+    assert info["total_frames"] == 5
+
+
+def test_normal_async_publish_does_not_rehash_staged_sources(monkeypatch, tmp_path):
+    writer = _created_writer(tmp_path / "dataset")
+    for index in range(3):
+        writer.append_frame(_frame(index))
+
+    original_sha256 = __import__(
+        "rlinf.data.storage.lerobot.streaming_writer", fromlist=["_sha256"]
+    )._sha256
+    calls = []
+
+    def counting_sha256(path):
+        calls.append(path)
+        return original_sha256(path)
+
+    monkeypatch.setattr(
+        "rlinf.data.storage.lerobot.streaming_writer._sha256", counting_sha256
+    )
+    writer.finish_episode(task="stack boxes", is_success=True)
+    writer.finalize()
+
+    assert len(calls) == 4
+
+
+def test_permanent_commit_block_is_bounded_and_preserves_ready_manifests(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "rank_0" / "id_0"
+    monkeypatch.setattr(
+        StreamingLeRobotDatasetWriter,
+        "_COMMIT_WORKER_TARGET",
+        staticmethod(_permanently_blocked_commit_worker),
+    )
+    writer = _created_writer(root, max_pending_commits=2, commit_watchdog_timeout=0.3)
+    for episode in range(2):
+        for index in range(2):
+            writer.append_frame(_frame(episode * 2 + index))
+        writer.finish_episode(task="stack boxes", is_success=True)
+    _wait_for(
+        root / ".streaming" / "partial" / "episode_000000" / "commit-worker-entered"
+    )
+
+    with pytest.raises(RuntimeError, match="pending commit limit reached"):
+        writer.append_frame(_frame(4))
+    assert writer.pending_commit_count == 2
+    assert all(
+        (
+            root
+            / ".streaming"
+            / "partial"
+            / f"episode_{episode:06d}"
+            / "manifest.ready.json"
+        ).is_file()
+        for episode in range(2)
+    )
+
+    started = time.monotonic()
+    with pytest.raises(
+        (RuntimeError, TimeoutError), match=r"watchdog|finalizing stream commits"
+    ):
+        writer.finalize()
+    assert time.monotonic() - started < 1.0
+    assert not writer._commit_process.is_alive()
+
+
+def test_commit_worker_error_propagates_traceback_without_reusing_index(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "rank_0" / "id_0"
+    monkeypatch.setattr(
+        StreamingLeRobotDatasetWriter,
+        "_COMMIT_WORKER_TARGET",
+        staticmethod(_failing_commit_worker),
+    )
+    writer = _created_writer(root, commit_watchdog_timeout=1.0)
+    for index in range(2):
+        writer.append_frame(_frame(index))
+    writer.finish_episode(task="stack boxes", is_success=True)
+    try:
+        writer._commit_process.join(timeout=2.0)
+        with pytest.raises(RuntimeError, match="injected worker traceback"):
+            writer.append_frame(_frame(2))
+        assert writer._next_episode == 1
+        with pytest.raises(RuntimeError, match="injected worker traceback"):
+            writer.finalize()
+    finally:
+        if not writer._closed:
+            with suppress(BaseException):
+                writer.finalize()
+
+    monkeypatch.undo()
+    StreamingLeRobotDatasetWriter.recover_rank(str(tmp_path), rank=0)
+    with (root / "meta" / "info.json").open() as handle:
+        info = json.load(handle)
+    assert info["total_episodes"] == 1
+    assert info["total_frames"] == 2
+
+
+def test_unexpected_commit_worker_exit_fails_fast(monkeypatch, tmp_path):
+    root = tmp_path / "dataset"
+    monkeypatch.setattr(
+        StreamingLeRobotDatasetWriter,
+        "_COMMIT_WORKER_TARGET",
+        staticmethod(_exiting_commit_worker),
+    )
+    writer = _created_writer(root, commit_watchdog_timeout=1.0)
+    for index in range(2):
+        writer.append_frame(_frame(index))
+    writer.finish_episode(task="stack boxes", is_success=True)
+    writer._commit_process.join(timeout=2.0)
+    with pytest.raises(
+        RuntimeError, match=r"exited unexpectedly.*pending episodes=\[0\]"
+    ):
+        writer.append_frame(_frame(2))
+    with pytest.raises(RuntimeError, match="exited unexpectedly"):
+        writer.finalize()
+
+
+@pytest.mark.parametrize(
+    ("worker_target", "exit_code"),
+    [(_partial_move_commit_worker, 19), (_committed_before_metadata_worker, 23)],
+)
+def test_recovery_repairs_worker_crash_points(
+    monkeypatch, tmp_path, worker_target, exit_code
+):
+    root = tmp_path / "rank_0" / "id_0"
+    monkeypatch.setattr(
+        StreamingLeRobotDatasetWriter,
+        "_COMMIT_WORKER_TARGET",
+        staticmethod(worker_target),
+    )
+    writer = _created_writer(root, commit_watchdog_timeout=1.0)
+    for index in range(2):
+        writer.append_frame(_frame(index))
+    writer.finish_episode(task="stack boxes", is_success=True)
+    writer._commit_process.join(timeout=2.0)
+    assert writer._commit_process.exitcode == exit_code
+    with pytest.raises(RuntimeError, match="exited unexpectedly"):
+        writer.finalize()
+
+    monkeypatch.undo()
+    StreamingLeRobotDatasetWriter.recover_rank(str(tmp_path), rank=0)
+    StreamingLeRobotDatasetWriter.recover_rank(str(tmp_path), rank=0)
+    with (root / "meta" / "info.json").open() as handle:
+        info = json.load(handle)
+    assert info["total_episodes"] == 1
+    assert info["total_frames"] == 2
+    assert len(list((root / "data").rglob("*.parquet"))) == 1
+    assert len(list((root / "videos").rglob("*.mp4"))) == 3
 
 
 def test_streaming_writer_fails_closed_on_version_drift(monkeypatch):
@@ -238,8 +545,49 @@ def test_recovery_checks_version_before_touching_partial_data(monkeypatch, tmp_p
     assert sentinel.read_bytes() == b"do not touch"
 
 
-def _created_writer(root):
-    writer = StreamingLeRobotDatasetWriter(queue_size=8)
+def test_recovery_discards_partial_episode_without_ready_marker(tmp_path):
+    root = tmp_path / "rank_0" / "id_0"
+    writer = _created_writer(root)
+    writer.finalize()
+    partial = root / ".streaming" / "partial" / "episode_000000"
+    partial.mkdir(parents=True)
+    (partial / "unfinished.mp4").write_bytes(b"incomplete")
+
+    StreamingLeRobotDatasetWriter.recover_rank(str(tmp_path), rank=0)
+
+    assert not partial.exists()
+
+
+def test_recovery_fails_closed_on_destination_hash_conflict(monkeypatch, tmp_path):
+    root = tmp_path / "rank_0" / "id_0"
+    monkeypatch.setattr(
+        StreamingLeRobotDatasetWriter,
+        "_COMMIT_WORKER_TARGET",
+        staticmethod(_permanently_blocked_commit_worker),
+    )
+    writer = _created_writer(root, commit_watchdog_timeout=0.2)
+    for index in range(2):
+        writer.append_frame(_frame(index))
+    writer.finish_episode(task="stack boxes", is_success=True)
+    ready = root / ".streaming" / "partial" / "episode_000000"
+    _wait_for(ready / "commit-worker-entered")
+    with (ready / "manifest.ready.json").open() as handle:
+        manifest = json.load(handle)
+    first = next(iter(manifest["files"].values()))
+    destination = root / first["destination"]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(b"conflicting destination")
+    with pytest.raises((RuntimeError, TimeoutError)):
+        writer.finalize()
+
+    monkeypatch.undo()
+    with pytest.raises(RuntimeError, match="stream transaction conflict"):
+        StreamingLeRobotDatasetWriter.recover_rank(str(tmp_path), rank=0)
+    assert (ready / "manifest.ready.json").is_file()
+
+
+def _created_writer(root, **kwargs):
+    writer = StreamingLeRobotDatasetWriter(queue_size=8, **kwargs)
     writer.create(
         repo_id=str(root),
         robot_type="dual_FR3",

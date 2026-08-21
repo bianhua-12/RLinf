@@ -54,6 +54,7 @@ class HikrobotCamera(BaseCamera):
     _NATIVE_H = 1080
     _REFERENCE_OUTPUT_SIZE = 1080
     _OUTPUT_SIZE = 224
+    _SDK_FRAME_TIMEOUT_MS = 200
     _K = np.array(
         [
             [329.3108299651, 0.0, 755.1510914205],
@@ -206,7 +207,10 @@ class HikrobotCamera(BaseCamera):
 
     def _read_frame(self) -> tuple[bool, Optional[np.ndarray]]:
         result = self._camera.MV_CC_GetImageForBGR(
-            self._buffer, len(self._buffer), self._frame_info, 1000
+            self._buffer,
+            len(self._buffer),
+            self._frame_info,
+            self._SDK_FRAME_TIMEOUT_MS,
         )
         if result != self._sdk.MV_OK:
             return False, None

@@ -124,6 +124,10 @@ class CollectEpisode(gym.Wrapper):
             and episode, then publishes LeRobot v3 metadata transactionally.
         stream_video_queue_size: Maximum synchronized camera frame groups
             waiting for the spawned stream encoder. Queue overflow fails closed.
+        stream_max_pending_commits: Maximum ready episodes awaiting the isolated
+            metadata commit process.
+        stream_commit_watchdog_timeout: Maximum age in seconds for the oldest
+            pending metadata commit before collection fails closed.
     """
 
     def __init__(
@@ -147,6 +151,8 @@ class CollectEpisode(gym.Wrapper):
         copy_observations: bool = True,
         video_write_mode: str = "lerobot_png",
         stream_video_queue_size: int = 60,
+        stream_max_pending_commits: int = 2,
+        stream_commit_watchdog_timeout: float = 30.0,
     ):
         if isinstance(env, gym.Env):
             super().__init__(env)
@@ -186,6 +192,10 @@ class CollectEpisode(gym.Wrapper):
                 raise ValueError("stream_mp4 currently requires num_envs=1")
             if int(stream_video_queue_size) <= 0:
                 raise ValueError("stream_video_queue_size must be positive")
+            if int(stream_max_pending_commits) <= 0:
+                raise ValueError("stream_max_pending_commits must be positive")
+            if float(stream_commit_watchdog_timeout) <= 0:
+                raise ValueError("stream_commit_watchdog_timeout must be positive")
         self.save_dir = save_dir
         self.rank = rank
         self.num_envs = num_envs
@@ -203,6 +213,8 @@ class CollectEpisode(gym.Wrapper):
         self.copy_observations = copy_observations
         self.video_write_mode = video_write_mode
         self.stream_video_queue_size = int(stream_video_queue_size)
+        self.stream_max_pending_commits = int(stream_max_pending_commits)
+        self.stream_commit_watchdog_timeout = float(stream_commit_watchdog_timeout)
 
         self._preexisting_episode_count = 0
         self._next_shard_id = 0
@@ -821,7 +833,9 @@ class CollectEpisode(gym.Wrapper):
 
         if self._lerobot_writer is None:
             writer = StreamingLeRobotDatasetWriter(
-                queue_size=self.stream_video_queue_size
+                queue_size=self.stream_video_queue_size,
+                max_pending_commits=self.stream_max_pending_commits,
+                commit_watchdog_timeout=self.stream_commit_watchdog_timeout,
             )
             try:
                 wrist_image_keys = self._collect_image_keys(frame, "wrist_image")

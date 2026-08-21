@@ -30,6 +30,7 @@ import os
 import queue
 import shutil
 import time
+import traceback
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,8 @@ from rlinf.utils.logging import get_logger
 PROTOCOL_ID = "rlinf_lerobot_stream_mp4_v1"
 SUPPORTED_LEROBOT_VERSION = "0.3.4"
 DEFAULT_QUEUE_SIZE = 60
+DEFAULT_MAX_PENDING_COMMITS = 2
+DEFAULT_COMMIT_WATCHDOG_TIMEOUT_S = 30.0
 ENCODING_CONTRACT = {
     "container": "mp4",
     "encoder": "libsvtav1",
@@ -243,14 +246,77 @@ def _encoder_worker(command_queue, result_connection) -> None:
             result_connection.send(("error", f"{type(exc).__name__}: {exc}"))
 
 
+def _commit_worker(command_queue, result_queue) -> None:
+    """Publish staged episodes in order from a separately killable process."""
+    while True:
+        command = command_queue.get()
+        kind = command[0]
+        if kind == "close":
+            result_queue.put({"kind": "closed"})
+            return
+        if kind != "commit":
+            raise ValueError(f"unknown stream commit command {kind!r}")
+
+        _, root, partial_dir, manifest = command
+        episode_index = int(manifest["episode_index"])
+        started_at = time.monotonic()
+        try:
+            StreamingLeRobotDatasetWriter._publish_ready(
+                Path(root),
+                Path(partial_dir),
+                manifest,
+                verify_sources=False,
+            )
+            StreamingLeRobotDatasetWriter._append_manifest_metadata(
+                Path(root), manifest
+            )
+        except BaseException as exc:
+            result_queue.put(
+                {
+                    "kind": "commit_result",
+                    "episode_index": episode_index,
+                    "started_at": started_at,
+                    "completed_at": time.monotonic(),
+                    "success": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc(),
+                }
+            )
+            return
+        result_queue.put(
+            {
+                "kind": "commit_result",
+                "episode_index": episode_index,
+                "started_at": started_at,
+                "completed_at": time.monotonic(),
+                "success": True,
+                "error": None,
+                "traceback": None,
+            }
+        )
+
+
 class StreamingLeRobotDatasetWriter:
     """Direct MP4 writer pinned to LeRobot 0.3.4 / dataset format v3.0."""
 
-    def __init__(self, queue_size: int = DEFAULT_QUEUE_SIZE):
+    _COMMIT_WORKER_TARGET = staticmethod(_commit_worker)
+
+    def __init__(
+        self,
+        queue_size: int = DEFAULT_QUEUE_SIZE,
+        max_pending_commits: int = DEFAULT_MAX_PENDING_COMMITS,
+        commit_watchdog_timeout: float = DEFAULT_COMMIT_WATCHDOG_TIMEOUT_S,
+    ):
         if queue_size <= 0:
             raise ValueError("stream_video_queue_size must be positive")
+        if max_pending_commits <= 0:
+            raise ValueError("stream_max_pending_commits must be positive")
+        if commit_watchdog_timeout <= 0:
+            raise ValueError("stream_commit_watchdog_timeout must be positive")
         _require_supported_lerobot_version()
         self.queue_size = queue_size
+        self.max_pending_commits = int(max_pending_commits)
+        self.commit_watchdog_timeout = float(commit_watchdog_timeout)
         self.dataset = None
         self.root: Path | None = None
         self.fps = 0
@@ -259,6 +325,17 @@ class StreamingLeRobotDatasetWriter:
         self._partial_dir: Path | None = None
         self._active = False
         self._closed = False
+        self._next_episode = 0
+        self._next_frame_index = 0
+        self._tasks: list[str] = []
+        self._pending_commits: dict[int, dict[str, float]] = {}
+        self._commit_error: RuntimeError | None = None
+        self._last_successful_commit_monotonic = time.monotonic()
+        self._commit_worker_closed = False
+        self._max_pending_commit_count = 0
+        self._max_encoder_queue_depth = 0
+        self._rejected_frame_count = 0
+        self._last_commit_duration = 0.0
         self._context = mp.get_context("spawn")
         self._queue = self._context.Queue(maxsize=queue_size)
         receive, send = self._context.Pipe(duplex=False)
@@ -270,6 +347,14 @@ class StreamingLeRobotDatasetWriter:
         )
         self._process.start()
         send.close()
+        self._commit_queue = self._context.Queue(maxsize=self.max_pending_commits)
+        self._commit_results = self._context.Queue()
+        self._commit_process = self._context.Process(
+            target=self._COMMIT_WORKER_TARGET,
+            args=(self._commit_queue, self._commit_results),
+            name="lerobot_stream_commit",
+        )
+        self._commit_process.start()
         self.logger = get_logger()
 
     def create(
@@ -317,6 +402,8 @@ class StreamingLeRobotDatasetWriter:
             "protocol_id": PROTOCOL_ID,
             "lerobot_version": SUPPORTED_LEROBOT_VERSION,
             "queue_size_frame_groups": self.queue_size,
+            "max_pending_commits": self.max_pending_commits,
+            "commit_watchdog_timeout_seconds": self.commit_watchdog_timeout,
             "encoding": dict(ENCODING_CONTRACT),
             "episode_file_layout": "one_file_per_episode",
         }
@@ -324,15 +411,66 @@ class StreamingLeRobotDatasetWriter:
         (self.root / ".streaming" / "partial").mkdir(parents=True, exist_ok=True)
         (self.root / ".streaming" / "committed").mkdir(parents=True, exist_ok=True)
         self._rebuild_from_manifests(self.root)
+        with (self.root / "meta" / "info.json").open(encoding="utf-8") as handle:
+            info = json.load(handle)
+        self._next_episode = int(info["total_episodes"])
+        self._next_frame_index = int(info["total_frames"])
+        for path in sorted(
+            (self.root / ".streaming" / "committed").glob("episode_*.json")
+        ):
+            with path.open(encoding="utf-8") as handle:
+                task = json.load(handle)["task"]
+            if task not in self._tasks:
+                self._tasks.append(task)
 
     @property
     def active(self) -> bool:
         return self._active
 
+    @property
+    def pending_commit_count(self) -> int:
+        """Number of staged episodes awaiting durable metadata commit."""
+        self._drain_commit_results()
+        return len(self._pending_commits)
+
+    @property
+    def oldest_pending_commit_age(self) -> float:
+        """Age in seconds of the oldest staged but uncommitted episode."""
+        if not self._pending_commits:
+            return 0.0
+        oldest = min(item["queued_at"] for item in self._pending_commits.values())
+        return max(0.0, time.monotonic() - oldest)
+
+    @property
+    def last_successful_commit_heartbeat(self) -> float:
+        """Monotonic timestamp of the last completed commit."""
+        return self._last_successful_commit_monotonic
+
+    @property
+    def max_pending_commit_count(self) -> int:
+        """High-water mark of ready episodes awaiting commit."""
+        return self._max_pending_commit_count
+
+    @property
+    def max_encoder_queue_depth(self) -> int:
+        """Observed high-water mark of queued synchronized frame groups."""
+        return self._max_encoder_queue_depth
+
+    @property
+    def rejected_frame_count(self) -> int:
+        """Number of frame groups rejected because the encoder queue was full."""
+        return self._rejected_frame_count
+
+    @property
+    def last_commit_duration(self) -> float:
+        """Worker-side duration in seconds of the most recent commit."""
+        return self._last_commit_duration
+
     def append_frame(self, frame: dict[str, Any]) -> None:
         if self.dataset is None or self.root is None:
             raise RuntimeError("streaming dataset not created")
         self._raise_worker_error()
+        self._check_commit_health(reject_if_full=not self._active)
         video_keys = set(self.dataset.meta.video_keys)
         images = {key: frame[key] for key in video_keys if key in frame}
         if set(images) != video_keys:
@@ -362,16 +500,24 @@ class StreamingLeRobotDatasetWriter:
         try:
             self._queue.put_nowait(("frame", len(self._frames), images))
         except queue.Full as exc:
+            self._rejected_frame_count += 1
             raise RuntimeError(
                 f"stream MP4 queue exceeded {self.queue_size} frame groups; "
                 "failing closed to prevent silent frame loss"
             ) from exc
+        try:
+            self._max_encoder_queue_depth = max(
+                self._max_encoder_queue_depth, self._queue.qsize()
+            )
+        except (AttributeError, NotImplementedError):
+            pass
         self._frames.append(numeric)
 
     def finish_episode(self, *, task: str, is_success: bool) -> int:
         if not self._active or self._partial_dir is None or not self._frames:
             raise RuntimeError("cannot finish an empty streaming episode")
         started_at = time.monotonic()
+        self._check_commit_health()
         frame_count = len(self._frames)
         self._queue.put(("finish", frame_count), timeout=10)
         result = self._expect("finished", timeout=max(30.0, frame_count / self.fps))
@@ -383,21 +529,135 @@ class StreamingLeRobotDatasetWriter:
             frame["is_success"] = np.asarray([is_success], dtype=bool)
             frame["done"] = np.asarray([False], dtype=bool)
         self._frames[-1]["done"] = np.asarray([True], dtype=bool)
-        manifest = self._stage_ready_manifest(task, result["stats"])
-        self._publish_ready(self.root, self._partial_dir, manifest)
-        self._append_manifest_metadata(self.root, manifest)
-        with (self.root / "meta" / "info.json").open(encoding="utf-8") as handle:
-            self.dataset.meta.info = json.load(handle)
+        partial_dir = self._partial_dir
+        if task not in self._tasks:
+            self._tasks.append(task)
+        manifest = self._stage_ready_manifest(
+            task,
+            result["stats"],
+            episode_index=self._next_episode,
+            dataset_from_index=self._next_frame_index,
+            task_index=self._tasks.index(task),
+        )
         self._frames = []
         self._camera_shapes = {}
         self._partial_dir = None
+        self._next_episode += 1
+        self._next_frame_index += frame_count
+        staged_seconds = time.monotonic() - started_at
+        episode_index = int(manifest["episode_index"])
+        self._pending_commits[episode_index] = {
+            "queued_at": time.monotonic(),
+            "staged_at": started_at,
+        }
+        self._max_pending_commit_count = max(
+            self._max_pending_commit_count, len(self._pending_commits)
+        )
+        try:
+            self._commit_queue.put_nowait(
+                ("commit", str(self.root), str(partial_dir), manifest)
+            )
+        except queue.Full as exc:
+            self._commit_error = RuntimeError(
+                "stream commit queue is full; ready manifest preserved for "
+                f"episode {episode_index}"
+            )
+            raise self._commit_error from exc
         self.logger.info(
-            "Committed streaming LeRobot episode %d (%d frames) in %.3fs",
+            "Staged streaming LeRobot episode %d (%d frames) in %.3fs; "
+            "metadata commit queued",
             manifest["episode_index"],
             frame_count,
-            time.monotonic() - started_at,
+            staged_seconds,
         )
         return frame_count
+
+    def _drain_commit_results(self) -> None:
+        while True:
+            try:
+                result = self._commit_results.get_nowait()
+            except queue.Empty:
+                return
+            if result["kind"] == "closed":
+                self._commit_worker_closed = True
+                continue
+            if result["kind"] != "commit_result":
+                self._commit_error = RuntimeError(
+                    f"unexpected stream commit result: {result!r}"
+                )
+                continue
+            episode_index = int(result["episode_index"])
+            if not result["success"]:
+                self._commit_error = RuntimeError(
+                    f"stream commit failed for episode {episode_index}: "
+                    f"{result['error']}\n{result['traceback']}"
+                )
+                continue
+            self._pending_commits.pop(episode_index, None)
+            self._last_successful_commit_monotonic = float(result["completed_at"])
+            self._last_commit_duration = float(result["completed_at"]) - float(
+                result["started_at"]
+            )
+            if self.root is not None and self.dataset is not None:
+                with (self.root / "meta" / "info.json").open(
+                    encoding="utf-8"
+                ) as handle:
+                    self.dataset.meta.info = json.load(handle)
+            self.logger.info(
+                "Committed streaming LeRobot episode %d asynchronously in %.3fs",
+                episode_index,
+                self._last_commit_duration,
+            )
+
+    def _terminate_commit_process(self) -> None:
+        if self._commit_process.is_alive():
+            self._commit_process.terminate()
+            self._commit_process.join(timeout=2.0)
+
+    def _check_commit_health(self, *, reject_if_full: bool = False) -> None:
+        self._drain_commit_results()
+        if self._commit_error is not None:
+            raise self._commit_error
+        if not self._commit_process.is_alive() and not self._commit_worker_closed:
+            pending = sorted(self._pending_commits)
+            self._commit_error = RuntimeError(
+                "stream commit worker exited unexpectedly with code "
+                f"{self._commit_process.exitcode}; pending episodes={pending}"
+            )
+            raise self._commit_error
+        age = self.oldest_pending_commit_age
+        if self._pending_commits and age > self.commit_watchdog_timeout:
+            pending = sorted(self._pending_commits)
+            self._terminate_commit_process()
+            self._commit_error = RuntimeError(
+                "stream commit watchdog expired after "
+                f"{age:.3f}s; pending episodes={pending}"
+            )
+            raise self._commit_error
+        if reject_if_full and len(self._pending_commits) >= self.max_pending_commits:
+            raise RuntimeError(
+                "stream pending commit limit reached "
+                f"({len(self._pending_commits)}/{self.max_pending_commits}); "
+                f"oldest_age={age:.3f}s"
+            )
+
+    def _wait_commits_bounded(self) -> None:
+        deadline = time.monotonic() + self.commit_watchdog_timeout
+        while self._pending_commits:
+            self._check_commit_health()
+            if time.monotonic() >= deadline:
+                pending = sorted(self._pending_commits)
+                self._terminate_commit_process()
+                raise TimeoutError(
+                    f"timed out finalizing stream commits; pending episodes={pending}"
+                )
+            time.sleep(0.01)
+        self._commit_queue.put(("close",), timeout=1.0)
+        self._commit_process.join(timeout=2.0)
+        self._drain_commit_results()
+        if self._commit_process.is_alive():
+            self._terminate_commit_process()
+            raise TimeoutError("stream commit worker did not close within 2 seconds")
 
     def abort_episode(self) -> None:
         if not self._active:
@@ -429,21 +689,28 @@ class StreamingLeRobotDatasetWriter:
         except BaseException as exc:
             if first_error is None:
                 first_error = exc
+        try:
+            self._wait_commits_bounded()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
         finally:
             self._process.join(timeout=10)
             if self._process.is_alive():
                 self._process.terminate()
                 self._process.join(timeout=5)
             self._queue.close()
+            self._terminate_commit_process()
+            self._commit_queue.cancel_join_thread()
+            self._commit_results.cancel_join_thread()
+            self._commit_queue.close()
+            self._commit_results.close()
             self._closed = True
         if first_error is not None:
             raise first_error
 
     def _next_episode_index(self) -> int:
-        committed = list(
-            (self.root / ".streaming" / "committed").glob("episode_*.json")
-        )
-        return len(committed)
+        return self._next_episode
 
     def _expect(self, expected: str, timeout: float = 15.0) -> Any:
         if not self._results.poll(timeout):
@@ -479,33 +746,27 @@ class StreamingLeRobotDatasetWriter:
             )
 
     def _stage_ready_manifest(
-        self, task: str, image_stats: dict[str, dict[str, Any]]
+        self,
+        task: str,
+        image_stats: dict[str, dict[str, Any]],
+        *,
+        episode_index: int,
+        dataset_from_index: int,
+        task_index: int,
     ) -> dict[str, Any]:
         import datasets
         from lerobot.datasets.compute_stats import compute_episode_stats
 
-        episode_index = self._next_episode_index()
         frame_count = len(self._frames)
         tasks = [task] * frame_count
-        committed_tasks: list[str] = []
-        for path in sorted(
-            (self.root / ".streaming" / "committed").glob("episode_*.json")
-        ):
-            with path.open(encoding="utf-8") as handle:
-                prior_task = json.load(handle)["task"]
-            if prior_task not in committed_tasks:
-                committed_tasks.append(prior_task)
-        if task not in committed_tasks:
-            committed_tasks.append(task)
-        task_index = committed_tasks.index(task)
         episode_buffer: dict[str, Any] = {}
         for key, feature in self.dataset.features.items():
             if feature["dtype"] in ("image", "video"):
                 continue
             if key == "index":
                 episode_buffer[key] = np.arange(
-                    self.dataset.meta.info["total_frames"],
-                    self.dataset.meta.info["total_frames"] + frame_count,
+                    dataset_from_index,
+                    dataset_from_index + frame_count,
                 )
             elif key == "frame_index":
                 episode_buffer[key] = np.arange(frame_count)
@@ -622,7 +883,12 @@ class StreamingLeRobotDatasetWriter:
 
     @classmethod
     def _publish_ready(
-        cls, root: Path, partial_dir: Path, manifest: dict[str, Any]
+        cls,
+        root: Path,
+        partial_dir: Path,
+        manifest: dict[str, Any],
+        *,
+        verify_sources: bool = True,
     ) -> None:
         for item in manifest["files"].values():
             source = partial_dir / item["source"]
@@ -634,7 +900,9 @@ class StreamingLeRobotDatasetWriter:
                 if source.exists():
                     source.unlink()
             else:
-                if not source.exists() or _sha256(source) != item["sha256"]:
+                if not source.exists() or (
+                    verify_sources and _sha256(source) != item["sha256"]
+                ):
                     raise RuntimeError(
                         f"stream transaction source missing/corrupt: {source}"
                     )
