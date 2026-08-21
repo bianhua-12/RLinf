@@ -76,6 +76,10 @@ previously collected video.
   in 0.335 seconds.
 - The main-integration gate passed 105 focused Franka, collection, camera,
   controller-adapter, and LeRobot writer tests.
+- A final-main CPU smoke at `c2b2cc6f` wrote 300 frames from three 224x224
+  cameras at 30 Hz, flushed in 0.962 seconds, decoded through native LeRobot,
+  emitted no PNG files, recovered 10 manifests in 0.068 seconds without
+  transcoding, and appended after that history in 0.333 seconds.
 - A separately authorized operational smoke ran on the dual-Franka workstation
   from tracked-clean commit `22983c58`. It recorded 249 frames from three
   224x224 cameras at 30 Hz (8.3 seconds), committed in 1.008 seconds, emitted no
