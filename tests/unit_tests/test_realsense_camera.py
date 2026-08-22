@@ -22,14 +22,18 @@ from rlinf.envs.realworld.common.camera.realsense_camera import RealSenseCamera
 
 
 class _ColorFrame:
-    def __init__(self, image: np.ndarray):
+    def __init__(self, image: np.ndarray, frame_number: int = 0):
         self._image = image
+        self._frame_number = frame_number
 
     def is_video_frame(self) -> bool:
         return True
 
     def get_data(self) -> np.ndarray:
         return self._image
+
+    def get_frame_number(self) -> int:
+        return self._frame_number
 
 
 class _FrameSet:
