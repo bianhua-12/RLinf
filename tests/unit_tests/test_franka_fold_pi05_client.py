@@ -357,6 +357,12 @@ def test_create_env_streams_video_for_pi05_and_pico(monkeypatch, tmp_path):
     assert pico_configs[0]["gripper_trigger"] == "trigger"
     assert pico_configs[0]["gripper_trigger_scale"] == 2.0
     assert pico_configs[0]["calibration"]["button"] is None
+    assert len(env_configs) == 2
+    for override_cfg in env_configs:
+        assert override_cfg["base_camera_serials"] == ["base", "secondary-base"]
+        assert override_cfg["base_camera_types"] == ["hikrobot", "realsense"]
+        assert override_cfg["left_camera_serials"] == ["left-camera"]
+        assert override_cfg["right_camera_serials"] == ["right-camera"]
     for kwargs in captured:
         assert kwargs["fps"] == 30
         assert kwargs["use_videos"] is True
