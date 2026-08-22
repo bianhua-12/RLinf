@@ -423,8 +423,8 @@ class DualFrankaEnv(gym.Env):
 
         if skip_reset_to_home:
             self._logger.info(
-                "skip_reset_to_home=True: holding arms at episode-end pose "
-                "(teleop wrapper will realign to device)."
+                "skip_reset_to_home=True: skipping the home command "
+                "(teleop wrapper retains control or performs initial alignment)."
             )
         else:
             self._go_to_rest(joint_reset)

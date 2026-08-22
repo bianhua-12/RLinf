@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -56,6 +57,7 @@ def _stream_wrapper():
     wrapper = object.__new__(DualGelloJointIntervention)
     wrapper._stream_gate = threading.Event()
     wrapper._stream_gate.set()
+    wrapper._stream_command_lock = threading.Lock()
     wrapper._stream_period = 0.0
     wrapper._stream_error = None
     wrapper._stream_last_success_time = None
@@ -149,3 +151,163 @@ def test_direct_stream_rejects_stale_command_heartbeat(monkeypatch):
 
     with pytest.raises(RuntimeError, match=r"heartbeat is stale \(0.500s > 0.250s\)"):
         wrapper._raise_if_stream_unhealthy()
+
+
+def _reset_wrapper(*, aligned: bool):
+    wrapper = _stream_wrapper()
+    wrapper._direct_stream = True
+    wrapper._aligned = aligned
+    wrapper._stream_running = aligned
+    wrapper._stream_thread = SimpleNamespace(is_alive=lambda: aligned)
+    wrapper._stream_last_success_time = time.monotonic() if aligned else None
+    wrapper._stream_watchdog_timeout = 1.0
+    wrapper._wait_for_experts = lambda: None
+    return wrapper
+
+
+def test_healthy_direct_stream_stays_open_across_episode_reset():
+    wrapper = _reset_wrapper(aligned=True)
+    calls = []
+
+    class Env:
+        def reset(self, **kwargs):
+            calls.append(("reset", kwargs))
+            assert wrapper._stream_gate.is_set()
+            return "observation", {"episode": 2}
+
+    wrapper.env = Env()
+    wrapper._align_to_gello = lambda: calls.append(("align", {}))
+    wrapper._start_stream_thread = lambda: calls.append(("start", {}))
+
+    result = wrapper.reset()
+
+    assert result == ("observation", {"episode": 2})
+    assert calls == [
+        ("reset", {"options": {"skip_reset_to_home": True}}),
+    ]
+    assert wrapper._aligned
+    assert wrapper._stream_gate.is_set()
+
+
+def test_initial_direct_stream_reset_aligns_before_opening_gate():
+    wrapper = _reset_wrapper(aligned=False)
+    calls = []
+
+    class Env:
+        def reset(self, **kwargs):
+            calls.append(("reset", kwargs))
+            assert not wrapper._stream_gate.is_set()
+            return "pre_alignment_observation", {"episode": 1}
+
+        def get_wrapper_attr(self, name):
+            assert name == "_get_observation"
+            calls.append(("observation", {}))
+            return lambda: "aligned_observation"
+
+    def align():
+        calls.append(("align", {}))
+        assert not wrapper._stream_gate.is_set()
+        wrapper._aligned = True
+        return True
+
+    def start():
+        calls.append(("start", {}))
+        assert wrapper._stream_gate.is_set()
+
+    wrapper.env = Env()
+    wrapper._align_to_gello = align
+    wrapper._start_stream_thread = start
+
+    result = wrapper.reset()
+
+    assert result == ("aligned_observation", {"episode": 1})
+    assert [name for name, _ in calls] == ["reset", "align", "observation", "start"]
+    assert wrapper._aligned
+    assert wrapper._stream_gate.is_set()
+
+
+def test_explicit_home_reset_pauses_stream_before_realigning():
+    wrapper = _reset_wrapper(aligned=True)
+    calls = []
+
+    class Env:
+        def reset(self, **kwargs):
+            calls.append(("reset", kwargs))
+            assert not wrapper._stream_gate.is_set()
+            return "home_observation", {"episode": 2}
+
+        def get_wrapper_attr(self, name):
+            assert name == "_get_observation"
+            return lambda: "realigned_observation"
+
+    def align():
+        calls.append(("align", {}))
+        assert not wrapper._stream_gate.is_set()
+        wrapper._aligned = True
+        return True
+
+    wrapper.env = Env()
+    wrapper._align_to_gello = align
+    wrapper._start_stream_thread = lambda: calls.append(("start", {}))
+
+    result = wrapper.reset(options={"skip_reset_to_home": False})
+
+    assert result == ("realigned_observation", {"episode": 2})
+    assert calls[0] == ("reset", {"options": {"skip_reset_to_home": False}})
+    assert [name for name, _ in calls] == ["reset", "align", "start"]
+    assert wrapper._stream_gate.is_set()
+
+
+def test_explicit_home_reset_waits_for_inflight_stream_tick():
+    wrapper = _reset_wrapper(aligned=True)
+    reset_entered = threading.Event()
+    result = []
+
+    class Env:
+        def reset(self, **kwargs):
+            reset_entered.set()
+            return "home_observation", {}
+
+        def get_wrapper_attr(self, name):
+            assert name == "_get_observation"
+            return lambda: "realigned_observation"
+
+    wrapper.env = Env()
+    wrapper._align_to_gello = lambda: True
+    wrapper._start_stream_thread = lambda: None
+
+    wrapper._stream_command_lock.acquire()
+    reset_thread = threading.Thread(
+        target=lambda: result.append(
+            wrapper.reset(options={"skip_reset_to_home": False})
+        )
+    )
+    reset_thread.start()
+    deadline = time.monotonic() + 1.0
+    while wrapper._stream_gate.is_set() and time.monotonic() < deadline:
+        time.sleep(0.001)
+
+    assert not wrapper._stream_gate.is_set()
+    assert not reset_entered.is_set()
+
+    wrapper._stream_command_lock.release()
+    assert reset_entered.wait(timeout=1.0)
+    reset_thread.join(timeout=1.0)
+
+    assert not reset_thread.is_alive()
+    assert result == [("realigned_observation", {})]
+
+
+def test_direct_stream_reset_failure_closes_gate():
+    wrapper = _reset_wrapper(aligned=True)
+    wrapper.env = SimpleNamespace(
+        reset=lambda **kwargs: (_ for _ in ()).throw(
+            RuntimeError("camera reset failed")
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="camera reset failed"):
+        wrapper.reset()
+
+    assert not wrapper._aligned
+    assert not wrapper._stream_gate.is_set()

@@ -67,6 +67,7 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         self._closed = False
         self._stream_gate = threading.Event()
         self._stream_gate.set()  # gate open = stream tick allowed
+        self._stream_command_lock = threading.Lock()
         self._aligned = False
         try:
             self._wait_for_experts()
@@ -113,26 +114,31 @@ class DualGelloJointIntervention(gym.ActionWrapper):
                 raise RuntimeError("direct GELLO stream requires both arm controllers")
             while self._stream_running:
                 self._stream_gate.wait()
-                if not self._stream_running:
-                    break
+                with self._stream_command_lock:
+                    if not self._stream_running:
+                        break
+                    # The gate may close after wait() returns but before this
+                    # tick acquires the command lock.
+                    if not self._stream_gate.is_set():
+                        continue
 
-                loop_start = time.monotonic()
+                    loop_start = time.monotonic()
 
-                if not (self.left_expert.ready and self.right_expert.ready):
-                    raise RuntimeError(
-                        "GELLO input was lost; controlled realignment is required"
-                    )
+                    if not (self.left_expert.ready and self.right_expert.ready):
+                        raise RuntimeError(
+                            "GELLO input was lost; controlled realignment is required"
+                        )
 
-                left_q, _ = self.left_expert.get_action()
-                right_q, _ = self.right_expert.get_action()
+                    left_q, _ = self.left_expert.get_action()
+                    right_q, _ = self.right_expert.get_action()
 
-                left_target = np.asarray(left_q, dtype=np.float64)
-                right_target = np.asarray(right_q, dtype=np.float64)
-                lf = left_ctrl.move_joints(left_target)
-                rf = right_ctrl.move_joints(right_target)
-                lf.wait()
-                rf.wait()
-                self._stream_last_success_time = time.monotonic()
+                    left_target = np.asarray(left_q, dtype=np.float64)
+                    right_target = np.asarray(right_q, dtype=np.float64)
+                    lf = left_ctrl.move_joints(left_target)
+                    rf = right_ctrl.move_joints(right_target)
+                    lf.wait()
+                    rf.wait()
+                    self._stream_last_success_time = time.monotonic()
 
                 elapsed = time.monotonic() - loop_start
                 sleep_for = period - elapsed
@@ -156,6 +162,12 @@ class DualGelloJointIntervention(gym.ActionWrapper):
                 None if right_target is None else right_target.tolist(),
                 ("never" if last_success_age is None else f"{last_success_age:.3f}"),
             )
+
+    def _pause_stream(self) -> None:
+        """Close the gate and wait for any in-flight command tick to finish."""
+        self._stream_gate.clear()
+        with self._stream_command_lock:
+            pass
 
     def _raise_if_stream_unhealthy(self) -> None:
         if self._stream_error is not None:
@@ -249,7 +261,27 @@ class DualGelloJointIntervention(gym.ActionWrapper):
         options.setdefault("skip_reset_to_home", True)
         kwargs["options"] = options
 
-        self._stream_gate.clear()
+        # Once direct streaming is healthy, keep it running across episode
+        # resets. Pausing here lets the leader move while the follower holds;
+        # reopening the gate would then apply the accumulated target jump.
+        if (
+            self._direct_stream
+            and self._aligned
+            and bool(options["skip_reset_to_home"])
+        ):
+            try:
+                self._raise_if_stream_unhealthy()
+                result = self.env.reset(**kwargs)
+                self._raise_if_stream_unhealthy()
+            except Exception:
+                self._aligned = False
+                self._pause_stream()
+                raise
+            return result
+
+        # Initial startup still needs controlled alignment before direct
+        # streaming can begin.
+        self._pause_stream()
         try:
             self._wait_for_experts()
             result = self.env.reset(**kwargs)
@@ -264,7 +296,7 @@ class DualGelloJointIntervention(gym.ActionWrapper):
                 self._start_stream_thread()
         except Exception:
             self._aligned = False
-            self._stream_gate.clear()
+            self._pause_stream()
             raise
         return result
 
