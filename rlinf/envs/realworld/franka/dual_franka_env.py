@@ -54,6 +54,7 @@ class DualFrankaRobotConfig:
     base_camera_serials: Optional[list[str]] = None
     camera_type: Optional[str] = None
     base_camera_type: Optional[str] = None
+    base_camera_types: Optional[list[str]] = None
     left_camera_type: Optional[str] = None
     right_camera_type: Optional[str] = None
 
@@ -106,6 +107,15 @@ class DualFrankaRobotConfig:
         self.action_scale = np.array(self.action_scale)
         self.ee_pose_limit_min = np.array(self.ee_pose_limit_min).reshape(2, 6)
         self.ee_pose_limit_max = np.array(self.ee_pose_limit_max).reshape(2, 6)
+        if self.base_camera_types is not None:
+            self.base_camera_types = list(self.base_camera_types)
+            if not self.base_camera_serials or len(self.base_camera_types) != len(
+                self.base_camera_serials
+            ):
+                raise ValueError(
+                    "base_camera_types must contain one entry per "
+                    "base_camera_serials entry"
+                )
 
 
 class DualFrankaEnv(gym.Env):
@@ -200,12 +210,24 @@ class DualFrankaEnv(gym.Env):
         """Camera specs as ``[(name, serial, camera_type), ...]`` with pi0-aligned names.
 
         Per-slot ``*_camera_type`` falls back to the global ``camera_type``.
+        ``base_camera_types`` can override the backend for each base serial.
         """
         default_ct = self.config.camera_type or "realsense"
         specs: list[tuple[str, str, str]] = []
         if self.config.base_camera_serials:
-            ct = self.config.base_camera_type or default_ct
-            for j, serial in enumerate(self.config.base_camera_serials):
+            if self.config.base_camera_types is None:
+                ct = self.config.base_camera_type or default_ct
+                camera_types = [ct] * len(self.config.base_camera_serials)
+            else:
+                camera_types = self.config.base_camera_types
+                if len(camera_types) != len(self.config.base_camera_serials):
+                    raise ValueError(
+                        "base_camera_types must contain one entry per "
+                        "base_camera_serials entry"
+                    )
+            for j, (serial, ct) in enumerate(
+                zip(self.config.base_camera_serials, camera_types, strict=True)
+            ):
                 specs.append((f"base_{j}_rgb", serial, ct))
         for arm, serials, slot_ct in (
             ("left", self.config.left_camera_serials, self.config.left_camera_type),
@@ -308,6 +330,7 @@ class DualFrankaEnv(gym.Env):
             ("base_camera_serials", None),
             ("camera_type", "realsense"),
             ("base_camera_type", None),
+            ("base_camera_types", None),
             ("left_camera_type", None),
             ("right_camera_type", None),
             ("left_gripper_connection", None),

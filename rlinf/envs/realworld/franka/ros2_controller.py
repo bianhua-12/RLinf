@@ -518,11 +518,13 @@ class Ros2DualFrankaBackend:
             return
         self._closed = True
         for process in self._processes.values():
-            if process.poll() is None:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+            try:
+                # The ros2 launch leader can exit before its controller children.
+                # Always signal the dedicated session so those children cannot
+                # retain the Franka control interface between collection stages.
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
         for process in self._processes.values():
             try:
                 process.wait(timeout=5.0)

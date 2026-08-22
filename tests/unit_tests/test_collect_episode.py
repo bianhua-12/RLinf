@@ -146,6 +146,94 @@ def test_realworld_numpy_observations_own_reused_vector_storage():
     assert not obs["extra_view_images"].any()
 
 
+def test_realworld_four_camera_extra_views_follow_configured_order():
+    env = RealWorldEnv.__new__(RealWorldEnv)
+    env.main_image_key = "base_0_rgb"
+    env.extra_view_image_keys = (
+        "left_wrist_0_rgb",
+        "right_wrist_0_rgb",
+        "base_1_rgb",
+    )
+    env.task_descriptions = ["test task"]
+    env.return_numpy = True
+
+    def image(value):
+        return np.full((1, 2, 2, 3), value, dtype=np.uint8)
+
+    obs = env._wrap_obs(
+        {
+            "state": {"joint": np.zeros((1, 2), dtype=np.float32)},
+            "frames": {
+                "base_0_rgb": image(0),
+                "base_1_rgb": image(3),
+                "left_wrist_0_rgb": image(1),
+                "right_wrist_0_rgb": image(2),
+            },
+        }
+    )
+
+    assert obs["extra_view_images"].shape == (1, 3, 2, 2, 3)
+    np.testing.assert_array_equal(
+        obs["extra_view_images"][:, :, 0, 0, 0], np.array([[1, 2, 3]])
+    )
+
+
+def test_realworld_close_releases_vector_env_once():
+    class VectorEnv:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    env = RealWorldEnv.__new__(RealWorldEnv)
+    env._closed = False
+    env.env = VectorEnv()
+
+    env.close()
+    env.close()
+
+    assert env.env.close_calls == 1
+
+
+def test_four_camera_extra_views_fan_out_to_three_lerobot_fields():
+    images = np.stack(
+        [np.full((2, 2, 3), value, dtype=np.uint8) for value in (1, 2, 3)]
+    )
+
+    expanded = CollectEpisode._expand_multi_view_images("extra_view_image", images)
+
+    assert list(expanded) == [
+        "extra_view_image-0",
+        "extra_view_image-1",
+        "extra_view_image-2",
+    ]
+    np.testing.assert_array_equal(
+        [expanded[key][0, 0, 0] for key in expanded], np.array([1, 2, 3])
+    )
+
+
+def test_realworld_explicit_extra_views_fail_on_unlisted_camera():
+    env = RealWorldEnv.__new__(RealWorldEnv)
+    env.main_image_key = "base_0_rgb"
+    env.extra_view_image_keys = ("left_wrist_0_rgb",)
+    env.task_descriptions = ["test task"]
+    env.return_numpy = True
+    image = np.zeros((1, 2, 2, 3), dtype=np.uint8)
+
+    with pytest.raises(KeyError, match="missing=.*right_wrist_0_rgb"):
+        env._wrap_obs(
+            {
+                "state": {"joint": np.zeros((1, 2), dtype=np.float32)},
+                "frames": {
+                    "base_0_rgb": image,
+                    "left_wrist_0_rgb": image,
+                    "right_wrist_0_rgb": image,
+                },
+            }
+        )
+
+
 def test_realworld_numpy_step_never_tensorizes(monkeypatch):
     class FakeVectorEnv:
         def step(self, actions):
