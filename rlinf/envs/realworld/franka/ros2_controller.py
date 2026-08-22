@@ -37,6 +37,10 @@ FR3_JOINT_LIMITS_LOWER = np.array(
 FR3_JOINT_LIMITS_UPPER = np.array(
     [2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159]
 )
+# A float32 round trip can move an exact FR3 boundary by roughly 1e-7 rad.
+# Accept only that numerical fuzz, then publish a float64 value strictly inside
+# the software limits. This does not expand the commanded joint range.
+JOINT_LIMIT_ROUNDING_TOLERANCE_RAD = 1e-6
 
 _T = TypeVar("_T")
 
@@ -378,14 +382,37 @@ class Ros2DualFrankaBackend:
                 raise TimeoutError(f"no ROS 2 controller subscriber for {side}")
             time.sleep(0.05)
 
-    def _publish(self, side: str, target: np.ndarray, reset: bool) -> np.ndarray:
+    def _sanitize_joint_target(self, side: str, target: np.ndarray) -> np.ndarray:
         target = np.asarray(target, dtype=np.float64)
         if target.shape != (7,) or not np.isfinite(target).all():
             raise ValueError(f"{side} joint target must contain seven finite values")
-        if np.any(target < FR3_JOINT_LIMITS_LOWER) or np.any(
-            target > FR3_JOINT_LIMITS_UPPER
-        ):
-            raise ValueError(f"{side} joint target is outside FR3 joint limits")
+
+        below = FR3_JOINT_LIMITS_LOWER - target
+        above = target - FR3_JOINT_LIMITS_UPPER
+        violations = np.maximum(np.maximum(below, above), 0.0)
+        worst_index = int(np.argmax(violations))
+        worst_violation = float(violations[worst_index])
+        if worst_violation > JOINT_LIMIT_ROUNDING_TOLERANCE_RAD:
+            is_below = below[worst_index] > 0.0
+            bound = (
+                FR3_JOINT_LIMITS_LOWER[worst_index]
+                if is_below
+                else FR3_JOINT_LIMITS_UPPER[worst_index]
+            )
+            direction = "below" if is_below else "above"
+            joint_name = self.config.joint_names[worst_index]
+            raise ValueError(
+                f"{side} joint target {joint_name} (J{worst_index + 1}) "
+                f"{target[worst_index]:.17g} is {worst_violation:.3e} rad "
+                f"{direction} FR3 software limit {bound:.17g}"
+            )
+
+        lower_interior = np.nextafter(FR3_JOINT_LIMITS_LOWER, FR3_JOINT_LIMITS_UPPER)
+        upper_interior = np.nextafter(FR3_JOINT_LIMITS_UPPER, FR3_JOINT_LIMITS_LOWER)
+        return np.clip(target, lower_interior, upper_interior)
+
+    def _publish(self, side: str, target: np.ndarray, reset: bool) -> np.ndarray:
+        target = self._sanitize_joint_target(side, target)
         publisher = (
             self._reset_publishers[side] if reset else self._command_publishers[side]
         )
@@ -491,11 +518,13 @@ class Ros2DualFrankaBackend:
             return
         self._closed = True
         for process in self._processes.values():
-            if process.poll() is None:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+            try:
+                # The ros2 launch leader can exit before its controller children.
+                # Always signal the dedicated session so those children cannot
+                # retain the Franka control interface between collection stages.
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
         for process in self._processes.values():
             try:
                 process.wait(timeout=5.0)

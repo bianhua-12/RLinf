@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import signal
 import threading
 import time
 from concurrent.futures import Future
@@ -25,15 +26,45 @@ from rlinf.envs.realworld.common.camera.base_camera import (
     CameraSnapshot,
 )
 from rlinf.envs.realworld.franka.dual_franka_env import (
+    DualFrankaEnv,
+    DualFrankaRobotConfig,
     _DaemonCameraRecoveryExecutor,
 )
 from rlinf.envs.realworld.franka.ros2_controller import (
+    FR3_JOINT_LIMITS_LOWER,
+    FR3_JOINT_LIMITS_UPPER,
+    JOINT_LIMIT_ROUNDING_TOLERANCE_RAD,
     Ros2ControllerConfig,
     Ros2DualFrankaBackend,
 )
 from rlinf.envs.realworld.franka.tasks.ros2_dual_franka_joint_env import (
     Ros2DualFrankaJointEnv,
 )
+
+
+def test_dual_franka_supports_mixed_base_camera_backends():
+    env = object.__new__(DualFrankaEnv)
+    env.config = DualFrankaRobotConfig(
+        base_camera_serials=["hik-main", "rs-main"],
+        base_camera_types=["hikrobot", "realsense"],
+        left_camera_serials=["left"],
+        right_camera_serials=["right"],
+    )
+
+    assert env._all_camera_specs() == [
+        ("base_0_rgb", "hik-main", "hikrobot"),
+        ("base_1_rgb", "rs-main", "realsense"),
+        ("left_wrist_0_rgb", "left", "realsense"),
+        ("right_wrist_0_rgb", "right", "realsense"),
+    ]
+
+
+def test_dual_franka_rejects_misaligned_base_camera_types():
+    with pytest.raises(ValueError, match="one entry per"):
+        DualFrankaRobotConfig(
+            base_camera_serials=["hik-main", "rs-main"],
+            base_camera_types=["hikrobot"],
+        )
 
 
 class _SnapshotCamera:
@@ -257,6 +288,37 @@ def test_robotiq_polling_defaults_to_30_hz():
     assert config.right_gripper_close_force == 130.0
 
 
+@pytest.mark.parametrize("joint_index", range(7))
+@pytest.mark.parametrize("limits", [FR3_JOINT_LIMITS_LOWER, FR3_JOINT_LIMITS_UPPER])
+def test_backend_accepts_float32_round_trip_at_all_joint_limits(joint_index, limits):
+    backend = object.__new__(Ros2DualFrankaBackend)
+    backend.config = SimpleNamespace(
+        joint_names=[f"fr3_joint{index}" for index in range(1, 8)]
+    )
+    target = (FR3_JOINT_LIMITS_LOWER + FR3_JOINT_LIMITS_UPPER) / 2.0
+    target[joint_index] = np.float64(np.float32(limits[joint_index]))
+
+    sanitized = backend._sanitize_joint_target("right", target)
+
+    assert sanitized.dtype == np.float64
+    assert np.all(sanitized > FR3_JOINT_LIMITS_LOWER)
+    assert np.all(sanitized < FR3_JOINT_LIMITS_UPPER)
+
+
+def test_backend_rejects_real_joint_limit_violation_with_joint_details():
+    backend = object.__new__(Ros2DualFrankaBackend)
+    backend.config = SimpleNamespace(
+        joint_names=[f"fr3_joint{index}" for index in range(1, 8)]
+    )
+    target = (FR3_JOINT_LIMITS_LOWER + FR3_JOINT_LIMITS_UPPER) / 2.0
+    target[0] = FR3_JOINT_LIMITS_UPPER[0] + 2 * JOINT_LIMIT_ROUNDING_TOLERANCE_RAD
+
+    with pytest.raises(
+        ValueError, match=r"right.*fr3_joint1.*\(J1\).*above FR3 software limit"
+    ):
+        backend._sanitize_joint_target("right", target)
+
+
 @pytest.mark.parametrize(
     ("action", "expected_position"),
     [(1.0, 0), (0.0, 128), (-1.0, 255), (2.0, 0), (-2.0, 255)],
@@ -285,6 +347,35 @@ def test_ros2_backend_queues_absolute_gripper_position():
     backend.open_gripper("right")
 
     assert backend._gripper_targets == {"left": 128, "right": 0}
+
+
+def test_ros2_backend_closes_process_group_after_launch_leader_exits(monkeypatch):
+    class ExitedLaunchProcess:
+        pid = 1234
+
+        def poll(self):
+            return 17
+
+        def wait(self, timeout):
+            del timeout
+            return 17
+
+    signals = []
+    backend = object.__new__(Ros2DualFrankaBackend)
+    backend._closed = False
+    backend._processes = {"left": ExitedLaunchProcess()}
+    backend._logs = {}
+    backend._gripper_running = False
+    backend._gripper_threads = []
+    backend._grippers = {}
+    monkeypatch.setattr(
+        "rlinf.envs.realworld.franka.ros2_controller.os.killpg",
+        lambda process_group, sig: signals.append((process_group, sig)),
+    )
+
+    backend.close()
+
+    assert signals == [(1234, signal.SIGTERM)]
 
 
 def test_ros2_backend_applies_intermediate_gripper_position(monkeypatch):

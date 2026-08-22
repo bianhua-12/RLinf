@@ -23,10 +23,10 @@ cluster:
         configs:
           - left_robot_ip: 172.16.0.1
             right_robot_ip: 172.16.0.2
-            base_camera_serials: ["327122078534"]
+            base_camera_serials: ["DA6135161", "327122078534"]
+            base_camera_types: [hikrobot, realsense]
             left_camera_serials: ["261922076829"]
             right_camera_serials: ["262322073199"]
-            base_camera_type: realsense
             left_camera_type: realsense
             right_camera_type: realsense
             left_gripper_type: robotiq
@@ -56,6 +56,11 @@ env:
     use_gello: False
     use_gello_joint: False
     use_pico: True
+    main_image_key: base_0_rgb
+    extra_view_image_keys:
+      - left_wrist_0_rgb
+      - right_wrist_0_rgb
+      - base_1_rgb
 
     # Keep long enough for manual collection. The keyboard wrapper normally
     # terminates successful episodes before this limit.

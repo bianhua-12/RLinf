@@ -181,8 +181,8 @@ YAML 中 ``pico.zmq_addr`` 使用的 TCP 地址：
 YAML 配置说明
 -------------------
 
-要使用 PICO 进行数据采集，请使用配置文件
-``examples/embodiment/config/realworld_collect_data_pico.yaml``。
+要使用 PICO 进行双臂 Franka 数据采集，请使用配置文件
+``examples/embodiment/config/realworld_dual_franka_collect_data_pico.yaml``。
 RLinf consumer 侧的 ZeroMQ 连接地址配置在 ``env.eval.pico.zmq_addr``。
 该地址必须与 ``configs/vr_bridge.yaml`` 中的 publisher bind 地址匹配：
 同机运行时可使用 ``ipc:///tmp/vr_data.ipc``；跨机器运行时应使用
@@ -204,6 +204,77 @@ consumer 连接地址。
          rotation_scale: 1.0
          calibration:
            button: "trigger"
+
+
+四路相机采集
+-------------------
+
+双臂 Franka 的数采、pi0.5 rollout 和 PICO 遥操介入统一使用以下四路相机映射：
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 24 24 24
+
+   * - 角色
+     - 序列号
+     - 原始帧键
+     - LeRobot 字段
+   * - 主视角 1
+     - ``DA6135161``
+     - ``base_0_rgb``
+     - ``image``
+   * - 左腕
+     - ``261922076829``
+     - ``left_wrist_0_rgb``
+     - ``extra_view_image-0``
+   * - 右腕
+     - ``262322073199``
+     - ``right_wrist_0_rgb``
+     - ``extra_view_image-1``
+   * - 主视角 2
+     - ``327122078534``
+     - ``base_1_rgb``
+     - ``extra_view_image-2``
+
+两路主视角使用不同的相机后端，因此序列号和类型必须按位置一一对应配置。
+同时显式指定 extra view 顺序，保证 GELLO 数采与独立 PICO 数采的数据列一致：
+
+.. code-block:: yaml
+
+   cluster:
+     node_groups:
+       - hardware:
+           type: DualFranka
+           configs:
+             - base_camera_serials: ["DA6135161", "327122078534"]
+               base_camera_types: [hikrobot, realsense]
+               left_camera_serials: ["261922076829"]
+               right_camera_serials: ["262322073199"]
+
+   env:
+     eval:
+       main_image_key: base_0_rgb
+       extra_view_image_keys:
+         - left_wrist_0_rgb
+         - right_wrist_0_rgb
+         - base_1_rgb
+
+GELLO 数采使用
+``examples/embodiment/config/realworld_collect_data_ros2_gello_dual_franka_pnp.yaml``。
+``examples/embodiment/franka_fold_pi05_client.py`` 在自动 rollout 和 PICO 接管期间
+沿用相同顺序；PICO intervention 只替换 action，不会改写相机 observation。
+
+当前 Franka-fold pi0.5 checkpoint 只有三个图像槽位，它会消费主视角 1、D435
+主视角 2 和右腕相机。为保持 checkpoint 训练时的输入契约，D435 图像通过旧的
+``observation.extra_view_image-0`` 槽位传入。左腕相机仍会在每次 rollout 中采集并
+写入 ``extra_view_image-0``，但不会传入这个 checkpoint。若要让策略消费四路
+图像，需要配套修改 OpenPI 模型与数据配置并重新训练；不要隐式增加第四路策略
+输入。
+
+如需可重复的无头 rollout 检查，可创建命名管道，并向
+``franka_fold_pi05_client.py`` 传入 ``--keyboard-fifo-path <path>``。向管道写入
+``a`` 开始，写入 ``b`` 以失败结束，或写入 ``c`` 以成功结束。该入口仅在显式
+指定时启用；省略此参数时，客户端仍从 ``--pedal-device`` 指定的设备读取输入。
 
 
 夹爪配置
@@ -231,6 +302,26 @@ consumer 连接地址。
    B -> open gripper
 
 如果 A/B 都不按，夹爪动作输出为 ``0.0``，不会因为松开按钮而自动打开。
+
+如需连续控制夹爪，并避免 PICO 接管瞬间发生跳变，可使用 trigger 相对模式：
+
+.. code-block:: yaml
+
+   env:
+     eval:
+       pico:
+         gripper_control_mode: "relative_trigger"
+         gripper_trigger: "trigger"
+         gripper_trigger_scale: 2.0
+         calibration:
+           button: null
+
+当 ``grip`` 首次越过 ``control_threshold`` 时，RLinf 会同时记录当前夹爪动作和
+当前 trigger 值。之后的 trigger 行程相对于这两个参考值计算，并裁剪到
+``[-1, 1]``。默认方向下，增大 trigger 会闭合夹爪；设置
+``gripper_invert: true`` 可反转方向。``2.0`` 的缩放值会把 trigger 的完整行程
+映射到完整动作范围。不要同时把同一个 trigger 用于标定；请像上例一样将
+``calibration.button`` 设为 ``null``，或改绑其他按键。
 
 集群配置注意事项
 ---------------------
@@ -266,7 +357,7 @@ consumer 连接地址。
 .. code-block:: bash
 
    cd /path/to/RLinf
-   bash examples/embodiment/collect_data.sh realworld_collect_data_pico
+   bash examples/embodiment/collect_data.sh realworld_dual_franka_collect_data_pico
 
 .. warning::
 

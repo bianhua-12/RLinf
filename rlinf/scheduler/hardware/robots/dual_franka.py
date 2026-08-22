@@ -129,11 +129,15 @@ class DualFrankaConfig(HardwareConfig):
 
     camera_type: str = "realsense"
     """Default camera backend when a per-slot type is not set.
-    Supported: ``"realsense"``, ``"zed"``, ``"lumos"``."""
+    Supported: ``"realsense"``, ``"zed"``, ``"lumos"``, ``"hikrobot"``."""
 
     base_camera_type: Optional[str] = None
     """Camera backend for the base (third-person) camera(s).
     Falls back to :attr:`camera_type` when ``None``."""
+
+    base_camera_types: Optional[list[str]] = None
+    """Per-camera backends aligned with :attr:`base_camera_serials`.
+    When set, these entries take precedence over :attr:`base_camera_type`."""
 
     left_camera_type: Optional[str] = None
     """Camera backend for the left wrist camera(s).
@@ -182,6 +186,15 @@ class DualFrankaConfig(HardwareConfig):
             self.right_camera_serials = list(self.right_camera_serials)
         if self.base_camera_serials:
             self.base_camera_serials = list(self.base_camera_serials)
+        if self.base_camera_types is not None:
+            self.base_camera_types = list(self.base_camera_types)
+            if not self.base_camera_serials or len(self.base_camera_types) != len(
+                self.base_camera_serials
+            ):
+                raise ValueError(
+                    "'base_camera_types' in DualFranka config must contain one "
+                    "entry per 'base_camera_serials' entry."
+                )
 
     @staticmethod
     def _validate_ip(label: str, ip: str) -> None:

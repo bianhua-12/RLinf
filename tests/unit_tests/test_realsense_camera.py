@@ -12,20 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+from types import SimpleNamespace
+
 import numpy as np
 
+from rlinf.envs.realworld.common.camera.base_camera import CameraInfo
 from rlinf.envs.realworld.common.camera.realsense_camera import RealSenseCamera
 
 
 class _ColorFrame:
-    def __init__(self, image: np.ndarray):
+    def __init__(self, image: np.ndarray, frame_number: int = 0):
         self._image = image
+        self._frame_number = frame_number
 
     def is_video_frame(self) -> bool:
         return True
 
     def get_data(self) -> np.ndarray:
         return self._image
+
+    def get_frame_number(self) -> int:
+        return self._frame_number
 
 
 class _FrameSet:
@@ -39,8 +47,10 @@ class _FrameSet:
 class _Pipeline:
     def __init__(self, frames: _FrameSet):
         self._frames = frames
+        self.timeout_ms = None
 
-    def wait_for_frames(self) -> _FrameSet:
+    def wait_for_frames(self, timeout_ms: int) -> _FrameSet:
+        self.timeout_ms = timeout_ms
         return self._frames
 
 
@@ -48,6 +58,27 @@ class _UnexpectedAlign:
     def process(self, frames):
         del frames
         raise AssertionError("RGB-only capture must not align frames")
+
+
+class _Config:
+    def __init__(self):
+        self.serial_number = None
+        self.streams = []
+
+    def enable_device(self, serial_number):
+        self.serial_number = serial_number
+
+    def enable_stream(self, *args):
+        self.streams.append(args)
+
+
+class _StartingPipeline:
+    def __init__(self):
+        self.config = None
+
+    def start(self, config):
+        self.config = config
+        return "profile"
 
 
 def test_read_frame_skips_alignment_when_depth_is_disabled():
@@ -61,3 +92,35 @@ def test_read_frame_skips_alignment_when_depth_is_disabled():
 
     assert success
     assert frame is image
+    assert camera._pipeline.timeout_ms == RealSenseCamera._SDK_FRAME_TIMEOUT_MS
+
+
+def test_init_binds_target_without_enumerating_all_devices(monkeypatch):
+    pipeline = _StartingPipeline()
+
+    def unexpected_context():
+        raise AssertionError("initialization must not enumerate all devices")
+
+    fake_rs = SimpleNamespace(
+        pipeline=lambda: pipeline,
+        config=_Config,
+        context=unexpected_context,
+        stream=SimpleNamespace(color="color", depth="depth"),
+        format=SimpleNamespace(bgr8="bgr8", z16="z16"),
+        align=lambda stream: ("align", stream),
+    )
+    monkeypatch.setitem(sys.modules, "pyrealsense2", fake_rs)
+    camera_info = CameraInfo(
+        name="left_wrist_0_rgb",
+        serial_number="261922076829",
+        resolution=(640, 480),
+        fps=30,
+    )
+
+    camera = RealSenseCamera(camera_info)
+
+    assert camera._serial_number == "261922076829"
+    assert pipeline.config.serial_number == "261922076829"
+    assert pipeline.config.streams == [("color", 640, 480, "bgr8", 30)]
+    assert camera.profile == "profile"
+    assert camera._align is None

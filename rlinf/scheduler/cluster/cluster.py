@@ -33,6 +33,12 @@ from ray._private import ray_logging
 from ray.actor import ActorHandle
 from ray.util.state import list_actors
 
+from rlinf.utils.repo_state import (
+    check_worktree_commit,
+    is_python_source_environment_variable,
+    require_clean_worktree,
+)
+
 from ..hardware.accelerators.accelerator import ProfileConfig
 from .config import ClusterConfig
 from .node import NodeGroupInfo, NodeInfo, NodeProbe
@@ -126,6 +132,7 @@ class Cluster:
         f"{SYS_NAME.upper()}_{ClusterEnvVar.LOG_LEVEL.value}", "INFO"
     ).upper()
     TIMEOUT_WARN_TIME = 3600000
+    WORKTREE_CHECK_TIMEOUT = 60
     DEFAULT_SYS_ENV_VAR = {
         ClusterEnvVar.CATCH_FAILURE: "0",
         ClusterEnvVar.LOG_LEVEL: "INFO",
@@ -193,9 +200,16 @@ class Cluster:
             cluster_cfg (Optional[DictConfig]): The cluster's configuration dictionary. If set, num_nodes will be ignored and inferred from the config.
             distributed_log_dir (Optional[str]): Output directory for split logs. This must be provided when ``distributed_logging`` is True.
         """
+        launch_requested = num_nodes is not None or cluster_cfg is not None
+        if launch_requested:
+            self._source_commit = require_clean_worktree()
         if self._has_initialized:
             return
         self._setup_logger()
+        if launch_requested:
+            self._logger.info(
+                "Verified clean RLinf worktree at commit %s.", self._source_commit
+            )
         self._distributed_log_collector: Optional[DistributedRayLogCollector] = None
         self._ray_code_sync_fragment: Optional[dict[str, Any]] = None
         self._runtime_code_sync_strip_roots: tuple[str, ...] = ()
@@ -219,14 +233,12 @@ class Cluster:
         else:
             try:
                 self._init_from_existing_managers()
-            except ConnectionError:
-                self._logger.warning(
-                    "Could not connect to an existing Ray cluster. Initializing a new cluster with all connected nodes."
-                )
-                return self.__init__(
-                    num_nodes=0,
-                    distributed_log_dir=distributed_log_dir,
-                )
+            except ConnectionError as exc:
+                raise RuntimeError(
+                    "Cluster() is attach-only, but no existing RLinf managers "
+                    "were found. Create a validated run explicitly with "
+                    "Cluster(num_nodes=0) or Cluster(cluster_cfg=...)."
+                ) from exc
 
         self._has_initialized = True
 
@@ -331,6 +343,7 @@ class Cluster:
         self._ray_code_sync_fragment, self._runtime_code_sync_strip_roots = (
             Cluster._prepare_ray_code_sync_runtime_env_fragment()
         )
+        self._verify_code_sync_source()
 
         try:
             # First try to connect to an existing Ray cluster
@@ -359,6 +372,29 @@ class Cluster:
                 ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
             ray.init(**ray_init_kwargs)
 
+        # If num_nodes is 0, infer the number of nodes from the connected Ray cluster
+        if self._num_nodes == 0:
+            self._num_nodes = len(Cluster.get_alive_nodes())
+
+        # Wait for the cluster to be ready
+        while len(Cluster.get_alive_nodes()) < self._num_nodes:
+            self._logger.warning(
+                f"Waiting for {self._num_nodes} nodes to be ready, currently {len(Cluster.get_alive_nodes())} nodes available."
+            )
+            time.sleep(1)
+
+        alive_nodes = Cluster.get_alive_nodes()
+        try:
+            self._verify_execution_node_worktrees(alive_nodes)
+        except Exception:
+            try:
+                ray.shutdown()
+            except Exception:
+                self._logger.exception(
+                    "Failed to disconnect from Ray after worktree validation failed."
+                )
+            raise
+
         Cluster._install_failure_hook()
         atexit.register(Cluster._shutdown_ray_at_exit)
 
@@ -370,17 +406,6 @@ class Cluster:
                 namespace=Cluster.NAMESPACE,
             )
             self._distributed_log_collector.start()
-
-        # If num_nodes is 0, infer the number of nodes from the connected Ray cluster
-        if self._num_nodes == 0:
-            self._num_nodes = len(Cluster.get_alive_nodes())
-
-        # Wait for the cluster to be ready
-        while len(Cluster.get_alive_nodes()) < self._num_nodes:
-            self._logger.warning(
-                f"Waiting for {self._num_nodes} nodes to be ready, currently {len(Cluster.get_alive_nodes())} nodes available."
-            )
-            time.sleep(1)
 
         # Get node info
         self._node_probe = NodeProbe(self._num_nodes, self._cluster_cfg)
@@ -486,6 +511,263 @@ class Cluster:
             exit(-1)
 
         signal.signal(signal.SIGUSR1, signal_handler)
+
+    @staticmethod
+    def _source_environment(env_vars: dict[str, str]) -> dict[str, str]:
+        """Return environment entries that can redirect Python code loading."""
+        merge_mode_key = Cluster.get_full_env_var_name(
+            ClusterEnvVar.PATH_ENV_MERGE_MODE
+        )
+        return {
+            key: value
+            for key, value in env_vars.items()
+            if is_python_source_environment_variable(key) or key == merge_mode_key
+        }
+
+    @classmethod
+    def _merge_source_environment(
+        cls,
+        base: dict[str, str],
+        incoming: dict[str, str],
+    ) -> dict[str, str]:
+        """Merge source-affecting environment entries with worker precedence."""
+        return cls.merge_worker_env_vars(
+            base,
+            incoming,
+            cls.get_path_env_merge_mode(base),
+        )
+
+    def _verify_code_sync_source(self) -> None:
+        """Require an explicit Ray code-sync source to match the clean driver."""
+        if self._ray_code_sync_fragment is None:
+            return
+        sync_paths = self._ray_code_sync_fragment.get("py_modules") or ()
+        if len(sync_paths) != 1:
+            raise RuntimeError(
+                "The clean-worktree gate requires exactly one RLinf code-sync "
+                f"package, found {tuple(sync_paths)!r}."
+            )
+        sync_commit = require_clean_worktree(sync_paths[0])
+        if sync_commit != self._source_commit:
+            raise RuntimeError(
+                "Refusing to start RLinf because the code-sync source is at "
+                f"{sync_commit}, but the imported driver is at "
+                f"{self._source_commit}."
+            )
+
+    def _configured_worktree_runtimes(
+        self,
+        default_results: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Build the non-default Python runtimes that can execute RLinf workers."""
+        driver_node_id = str(ray.get_runtime_context().get_node_id())
+        head_result = next(
+            (
+                result
+                for result in default_results
+                if str(result["node_id"]) == driver_node_id
+            ),
+            None,
+        )
+        if head_result is None:
+            raise RuntimeError(
+                "Cannot identify the Ray node hosting the RLinf launch driver."
+            )
+
+        head_default_env = dict(head_result.get("source_env") or {})
+        driver_runtime_env = self._source_environment(dict(os.environ))
+        driver_overrides = {
+            key: value
+            for key, value in driver_runtime_env.items()
+            if head_default_env.get(key) != value
+        }
+
+        runtimes: list[dict[str, object]] = []
+        seen: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
+        for result in default_results:
+            node_id = str(result["node_id"])
+            node_ip = str(result["node_ip"])
+            node_rank = int(result["node_rank"])
+            ray_python = str(result["python_executable"])
+            worker_python = sys.executable if node_id == driver_node_id else ray_python
+            node_default_env = dict(result.get("source_env") or {})
+            node_worker_env = self._merge_source_environment(
+                node_default_env,
+                driver_overrides,
+            )
+
+            candidates: list[tuple[str, dict[str, str], str]] = []
+            if node_worker_env != node_default_env or worker_python != ray_python:
+                candidates.append(
+                    (worker_python, node_worker_env, "driver worker environment")
+                )
+
+            if self._cluster_cfg is not None:
+                for node_group in self._cluster_cfg.node_groups or []:
+                    if node_rank not in node_group.node_ranks:
+                        continue
+                    for env_config in node_group.env_configs or []:
+                        if node_rank not in env_config.node_ranks:
+                            continue
+                        configured_env: dict[str, str] = {}
+                        for env_entry in env_config.env_vars or []:
+                            configured_env.update(env_entry)
+                        configured_source_env = self._source_environment(configured_env)
+                        source_env = self._merge_source_environment(
+                            node_worker_env,
+                            configured_source_env,
+                        )
+                        python_executable = (
+                            env_config.python_interpreter_path or worker_python
+                        )
+                        if (
+                            env_config.python_interpreter_path is not None
+                            or configured_source_env
+                        ):
+                            candidates.append(
+                                (
+                                    python_executable,
+                                    source_env,
+                                    f"node group {node_group.label!r}",
+                                )
+                            )
+
+            for python_executable, source_env, label in candidates:
+                key = (
+                    node_id,
+                    python_executable,
+                    tuple(sorted(source_env.items())),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                runtimes.append(
+                    {
+                        "node_id": node_id,
+                        "node_ip": node_ip,
+                        "node_rank": node_rank,
+                        "python_executable": python_executable,
+                        "source_env": source_env,
+                        "runtime": label,
+                    }
+                )
+        return runtimes
+
+    def _raise_for_worktree_failures(
+        self,
+        results: list[dict[str, object]],
+    ) -> None:
+        """Raise one diagnostic containing every failed runtime validation."""
+        failures = [result for result in results if not result.get("ok")]
+        if not failures:
+            return
+        details = "\n".join(
+            "  - node "
+            f"{result.get('node_ip', 'unknown')} "
+            f"({result.get('node_id', 'unknown')}): "
+            f"{result.get('runtime', 'unknown runtime')}: "
+            f"{result.get('error', 'worktree validation failed')}"
+            for result in failures
+        )
+        raise RuntimeError(
+            "Refusing to start RLinf because every execution runtime must "
+            f"use a clean worktree at {self._source_commit}:\n{details}"
+        )
+
+    def _verify_execution_node_worktrees(self, node_infos: list[dict[str, Any]]):
+        """Require every execution node to use clean source at the driver SHA."""
+        if self._ray_code_sync_fragment is not None:
+            self._logger.info(
+                "Ray code sync will distribute the clean driver snapshot at %s.",
+                self._source_commit,
+            )
+            return
+
+        remote_check = ray.remote(num_cpus=0)(check_worktree_commit)
+        default_refs = []
+        ray_node_count = len(node_infos)
+        for node_info in node_infos:
+            node_id = node_info["NodeID"]
+            node_ip = node_info["NodeManagerAddress"]
+            default_refs.append(
+                remote_check.options(
+                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                        node_id=node_id,
+                        soft=False,
+                    )
+                ).remote(
+                    self._source_commit,
+                    node_id,
+                    node_ip,
+                    None,
+                    ray_node_count,
+                    "default Ray runtime",
+                )
+            )
+
+        try:
+            default_results = ray.get(default_refs, timeout=self.WORKTREE_CHECK_TIMEOUT)
+        except Exception as exc:
+            raise RuntimeError(
+                "Refusing to start RLinf because execution-node worktree "
+                f"validation did not complete: {exc}"
+            ) from exc
+
+        self._raise_for_worktree_failures(default_results)
+        node_ranks = [result.get("node_rank") for result in default_results]
+        if sorted(node_ranks) != list(range(ray_node_count)):
+            raise RuntimeError(
+                "Refusing to start RLinf because RLINF_NODE_RANK must be unique "
+                f"and continuous across alive Ray nodes; found {node_ranks}."
+            )
+
+        configured_runtimes = self._configured_worktree_runtimes(default_results)
+        configured_refs = []
+        for runtime in configured_runtimes:
+            node_id = str(runtime["node_id"])
+            node_ip = str(runtime["node_ip"])
+            runtime_env = {
+                "py_executable": str(runtime["python_executable"]),
+                "env_vars": dict(runtime["source_env"]),
+            }
+            configured_refs.append(
+                remote_check.options(
+                    runtime_env=runtime_env,
+                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                        node_id=node_id,
+                        soft=False,
+                    ),
+                ).remote(
+                    self._source_commit,
+                    node_id,
+                    node_ip,
+                    None,
+                    ray_node_count,
+                    str(runtime["runtime"]),
+                )
+            )
+
+        if configured_refs:
+            try:
+                configured_results = ray.get(
+                    configured_refs, timeout=self.WORKTREE_CHECK_TIMEOUT
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Refusing to start RLinf because configured Python runtime "
+                    f"validation did not complete: {exc}"
+                ) from exc
+        else:
+            configured_results = []
+
+        results = default_results + configured_results
+        self._raise_for_worktree_failures(results)
+
+        self._logger.info(
+            "Verified %d Ray execution node(s) at commit %s.",
+            len(default_results),
+            self._source_commit,
+        )
 
     @staticmethod
     def _install_failure_hook():
@@ -763,6 +1045,18 @@ class Cluster:
         node = self._nodes[node_rank]
         node_group = self.get_node_group(node_group_label)
         remote_cls = ray.remote(cls)
+
+        if self._ray_code_sync_fragment is None:
+            source_env_keys = sorted(
+                key for key in env_vars if is_python_source_environment_variable(key)
+            )
+            if source_env_keys:
+                raise RuntimeError(
+                    "Worker-specific Python source environment changes were not "
+                    "covered by the clean-worktree launch gate. Move these keys "
+                    "to cluster.node_groups.env_configs or enable Ray code sync: "
+                    f"{source_env_keys}."
+                )
 
         merged_env_vars = node.env_vars.copy()
         path_env_merge_mode = self.get_path_env_merge_mode(merged_env_vars)

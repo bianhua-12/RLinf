@@ -16,7 +16,11 @@ from typing import Optional
 
 import numpy as np
 
+from rlinf.utils.logging import get_logger
+
 from .base_camera import BaseCamera, CameraInfo
+
+_logger = get_logger()
 
 
 class RealSenseCamera(BaseCamera):
@@ -34,17 +38,12 @@ class RealSenseCamera(BaseCamera):
 
         super().__init__(camera_info)
 
-        self._device_info = {}
-        for device in rs.context().devices:
-            self._device_info[device.get_info(rs.camera_info.serial_number)] = device
-        assert camera_info.serial_number in self._device_info.keys(), (
-            f"{self._device_info.keys()=}"
-        )
-
         self._serial_number = camera_info.serial_number
-        self._device = self._device_info[self._serial_number]
         self._enable_depth = camera_info.enable_depth
 
+        # Bind the pipeline directly to the requested device. Enumerating every
+        # RealSense here can query UVC controls on cameras that are already
+        # streaming, which makes multi-camera startup prone to timeouts.
         self._pipeline = rs.pipeline()
         self._config = rs.config()
         self._config.enable_device(self._serial_number)
@@ -64,6 +63,8 @@ class RealSenseCamera(BaseCamera):
                 camera_info.fps,
             )
         self.profile = self._pipeline.start(self._config)
+        self._last_frame_number: int | None = None
+        self._dropped_frames = 0
 
         # Alignment is meaningful only when a depth stream is enabled.
         self._align = rs.align(rs.stream.color) if self._enable_depth else None
@@ -78,6 +79,18 @@ class RealSenseCamera(BaseCamera):
             color_frame = frames.get_color_frame()
 
         if color_frame.is_video_frame():
+            frame_number = color_frame.get_frame_number()
+            last_frame_number = getattr(self, "_last_frame_number", None)
+            if last_frame_number is not None and frame_number > last_frame_number + 1:
+                dropped = frame_number - last_frame_number - 1
+                self._dropped_frames = getattr(self, "_dropped_frames", 0) + dropped
+                _logger.warning(
+                    "RealSense %s skipped %d SDK frame(s); total=%d",
+                    self._serial_number,
+                    dropped,
+                    self._dropped_frames,
+                )
+            self._last_frame_number = frame_number
             frame = np.asarray(color_frame.get_data())
             if self._enable_depth and depth_frame.is_depth_frame():
                 depth = np.expand_dims(np.asarray(depth_frame.get_data()), axis=2)

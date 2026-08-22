@@ -24,8 +24,13 @@ def test_episode_timeout_defaults_to_120_seconds(monkeypatch):
     args = client.parse_args()
 
     assert args.episode_timeout_s == 120.0
-    assert args.base_camera_type == "realsense"
-    assert args.base_camera_serial == "327122078534"
+    assert args.base_camera_type == "hikrobot"
+    assert args.base_camera_serial == "DA6135161"
+    assert args.secondary_base_camera_type == "realsense"
+    assert args.secondary_base_camera_serial == "327122078534"
+    assert args.left_camera_serial == "261922076829"
+    assert args.right_camera_serial == "262322073199"
+    assert args.keyboard_fifo_path is None
 
 
 def test_episode_timeout_terminates_as_failure(monkeypatch):
@@ -98,15 +103,48 @@ def test_cfgrl_server_rewrites_prompt_to_one_positive_condition():
 
 
 def _observation():
-    image = np.zeros((8, 9, 3), dtype=np.uint8)
+    def image(value):
+        return np.full((8, 9, 3), value, dtype=np.uint8)
+
     return {
         "state": {"proprio": np.zeros(client.ACTION_DIM, dtype=np.float32)},
         "frames": {
-            "base_0_rgb": image,
-            "left_wrist_0_rgb": image,
-            "right_wrist_0_rgb": image,
+            "base_0_rgb": image(0),
+            "base_1_rgb": image(3),
+            "left_wrist_0_rgb": image(1),
+            "right_wrist_0_rgb": image(2),
         },
     }
+
+
+def test_four_camera_collection_preserves_pi05_three_view_contract():
+    raw_obs = _observation()
+
+    policy_obs = client.build_observation(raw_obs, client.DEFAULT_TASK)
+    collected = client.collection_observation(raw_obs, client.DEFAULT_TASK)
+
+    np.testing.assert_array_equal(
+        policy_obs["observation.image"], raw_obs["frames"]["base_0_rgb"]
+    )
+    np.testing.assert_array_equal(
+        policy_obs["observation.extra_view_image-0"],
+        raw_obs["frames"]["base_1_rgb"],
+    )
+    np.testing.assert_array_equal(
+        policy_obs["observation.extra_view_image-1"],
+        raw_obs["frames"]["right_wrist_0_rgb"],
+    )
+    assert "observation.extra_view_image-2" not in policy_obs
+    np.testing.assert_array_equal(
+        collected["extra_view_images"],
+        np.stack(
+            [
+                raw_obs["frames"]["left_wrist_0_rgb"],
+                raw_obs["frames"]["right_wrist_0_rgb"],
+                raw_obs["frames"]["base_1_rgb"],
+            ]
+        ),
+    )
 
 
 def _response(delay=None):
@@ -263,25 +301,41 @@ def test_create_env_streams_video_for_pi05_and_pico(monkeypatch, tmp_path):
         observation_space = gym.spaces.Dict({})
 
     captured = []
+    pico_configs = []
 
     class _CollectEpisode:
         def __init__(self, env, **kwargs):
             captured.append(kwargs)
 
-    monkeypatch.setattr(client.gym, "make", lambda *args, **kwargs: _HardwareEnv())
+    env_configs = []
+    env_runtime_configs = []
+
+    def _make_env(*args, **kwargs):
+        env_configs.append(kwargs["override_cfg"])
+        env_runtime_configs.append(kwargs["env_cfg"])
+        return _HardwareEnv()
+
+    monkeypatch.setattr(client.gym, "make", _make_env)
     monkeypatch.setattr("rlinf.envs.wrappers.CollectEpisode", _CollectEpisode)
     pico_module = ModuleType(
         "rlinf.envs.realworld.common.wrappers.pico_joint_intervention"
     )
-    pico_module.DualFrankaJointPicoIntervention = lambda env, **kwargs: env
+
+    def _pico_wrapper(env, **kwargs):
+        pico_configs.append(kwargs)
+        return env
+
+    pico_module.DualFrankaJointPicoIntervention = _pico_wrapper
     monkeypatch.setitem(sys.modules, pico_module.__name__, pico_module)
     args = Namespace(
         left_robot_ip="left",
         right_robot_ip="right",
         base_camera_serial="base",
+        secondary_base_camera_serial="secondary-base",
         left_camera_serial="left-camera",
         right_camera_serial="right-camera",
-        base_camera_type="realsense",
+        base_camera_type="hikrobot",
+        secondary_base_camera_type="realsense",
         left_gripper_connection="left-gripper",
         right_gripper_connection="right-gripper",
         joint_reset_qpos=client.DEFAULT_JOINT_RESET_QPOS,
@@ -291,6 +345,7 @@ def test_create_env_streams_video_for_pi05_and_pico(monkeypatch, tmp_path):
         pico_control_threshold=0.85,
         pico_ready_timeout_s=1.0,
         episode_timeout_s=120.0,
+        keyboard_fifo_path="/tmp/pi05-eval-control.fifo",
         rollout_dir=str(tmp_path),
     )
 
@@ -299,6 +354,20 @@ def test_create_env_streams_video_for_pi05_and_pico(monkeypatch, tmp_path):
     client.create_env(args)
 
     assert len(captured) == 2
+    assert len(pico_configs) == 1
+    assert pico_configs[0]["gripper_control_mode"] == "relative_trigger"
+    assert pico_configs[0]["gripper_trigger"] == "trigger"
+    assert pico_configs[0]["gripper_trigger_scale"] == 2.0
+    assert pico_configs[0]["calibration"]["button"] is None
+    assert len(env_configs) == 2
+    assert len(env_runtime_configs) == 2
+    for override_cfg in env_configs:
+        assert override_cfg["base_camera_serials"] == ["base", "secondary-base"]
+        assert override_cfg["base_camera_types"] == ["hikrobot", "realsense"]
+        assert override_cfg["left_camera_serials"] == ["left-camera"]
+        assert override_cfg["right_camera_serials"] == ["right-camera"]
+    for env_cfg in env_runtime_configs:
+        assert env_cfg["keyboard_fifo_path"] == "/tmp/pi05-eval-control.fifo"
     for kwargs in captured:
         assert kwargs["fps"] == 30
         assert kwargs["use_videos"] is True

@@ -199,8 +199,8 @@ corresponding values or button states should update with the incoming data.
 YAML Configuration
 -------------------
 
-To use PICO for data collection, use the config file
-``examples/embodiment/config/realworld_collect_data_pico.yaml``.
+To use PICO for dual-Franka data collection, use the config file
+``examples/embodiment/config/realworld_dual_franka_collect_data_pico.yaml``.
 The RLinf consumer-side ZeroMQ address is configured by
 ``env.eval.pico.zmq_addr``. It must match the publisher bind address in
 ``configs/vr_bridge.yaml``: use ``ipc:///tmp/vr_data.ipc`` for same-machine
@@ -223,6 +223,83 @@ The key configuration is:
          rotation_scale: 1.0
          calibration:
            button: "trigger"
+
+
+Four-Camera Capture
+-------------------
+
+The dual-Franka collection, pi0.5 rollout, and PICO intervention paths use the
+same four-camera hardware mapping:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 24 24 24
+
+   * - Role
+     - Serial
+     - Raw frame key
+     - LeRobot field
+   * - Main view 1
+     - ``DA6135161``
+     - ``base_0_rgb``
+     - ``image``
+   * - Left wrist
+     - ``261922076829``
+     - ``left_wrist_0_rgb``
+     - ``extra_view_image-0``
+   * - Right wrist
+     - ``262322073199``
+     - ``right_wrist_0_rgb``
+     - ``extra_view_image-1``
+   * - Main view 2
+     - ``327122078534``
+     - ``base_1_rgb``
+     - ``extra_view_image-2``
+
+The two base cameras use different backends, so configure their serials and
+types as aligned lists. Explicitly configure the extra-view order so dataset
+columns stay identical across GELLO collection and standalone PICO collection:
+
+.. code-block:: yaml
+
+   cluster:
+     node_groups:
+       - hardware:
+           type: DualFranka
+           configs:
+             - base_camera_serials: ["DA6135161", "327122078534"]
+               base_camera_types: [hikrobot, realsense]
+               left_camera_serials: ["261922076829"]
+               right_camera_serials: ["262322073199"]
+
+   env:
+     eval:
+       main_image_key: base_0_rgb
+       extra_view_image_keys:
+         - left_wrist_0_rgb
+         - right_wrist_0_rgb
+         - base_1_rgb
+
+Use
+``examples/embodiment/config/realworld_collect_data_ros2_gello_dual_franka_pnp.yaml``
+for GELLO collection. ``examples/embodiment/franka_fold_pi05_client.py`` uses
+the same ordering for autonomous rollout and keeps recording it while PICO is
+active; PICO intervention changes actions only and does not rewrite camera
+observations.
+
+The current Franka-fold pi0.5 checkpoint has three image slots. It consumes
+main view 1, the D435 main view 2, and the right wrist camera. The D435 image is
+sent through the legacy ``observation.extra_view_image-0`` slot to preserve the
+checkpoint's training-time input contract. The left wrist camera is still
+captured as ``extra_view_image-0`` in every rollout but is not passed to this
+checkpoint. A four-image policy requires a matching OpenPI model/data
+configuration and retraining; do not add a fourth policy image implicitly.
+
+For a repeatable headless rollout check, create a named pipe and pass it with
+``--keyboard-fifo-path <path>`` to ``franka_fold_pi05_client.py``. Write ``a``
+to start, ``b`` to finish as failure, or ``c`` to finish as success. This input
+is opt-in; when the option is omitted, the client continues to read the device
+selected by ``--pedal-device``.
 
 
 Gripper Configuration
@@ -253,6 +330,28 @@ Current button semantics:
 
 If neither A nor B is pressed, the gripper action is ``0.0``. Releasing the
 button does not automatically open the gripper.
+
+For continuous gripper control without a jump when PICO takes over, use the
+trigger-relative mode:
+
+.. code-block:: yaml
+
+   env:
+     eval:
+       pico:
+         gripper_control_mode: "relative_trigger"
+         gripper_trigger: "trigger"
+         gripper_trigger_scale: 2.0
+         calibration:
+           button: null
+
+When ``grip`` first crosses ``control_threshold``, RLinf records both the
+current gripper action and the current trigger value. Further trigger travel is
+applied relative to those references and clipped to ``[-1, 1]``. With the
+default direction, increasing the trigger closes the gripper; set
+``gripper_invert: true`` to reverse it. A scale of ``2.0`` maps a full trigger
+stroke to the full action range. Do not bind the same trigger to calibration;
+set ``calibration.button`` to ``null`` as above or choose another button.
 
 
 Cluster Setup Notes
@@ -305,7 +404,7 @@ Startup Order
 .. code-block:: bash
 
    cd /path/to/RLinf
-   bash examples/embodiment/collect_data.sh realworld_collect_data_pico
+   bash examples/embodiment/collect_data.sh realworld_dual_franka_collect_data_pico
 
 .. warning::
 

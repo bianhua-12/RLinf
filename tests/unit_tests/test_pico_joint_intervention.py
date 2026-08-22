@@ -42,10 +42,20 @@ class _Expert:
     def __init__(self, responses):
         self.responses = list(responses)
         self.index = 0
+        self.current_gripper_actions = []
 
-    def get_action(self, tcp_pose, action_scale, *, gripper_enabled, direct):
+    def get_action(
+        self,
+        tcp_pose,
+        action_scale,
+        *,
+        gripper_enabled,
+        direct,
+        current_gripper_action,
+    ):
         del tcp_pose, action_scale, gripper_enabled
         assert direct
+        self.current_gripper_actions.append(current_gripper_action)
         response = self.responses[min(self.index, len(self.responses) - 1)]
         self.index += 1
         return response
@@ -157,6 +167,25 @@ def test_takeover_uses_model_kinematics():
     wrapper.step(np.zeros(16, dtype=np.float32))
 
     assert wrapper.env.last_action[0] > 0.0
+
+
+def test_takeover_passes_previous_gripper_targets_as_relative_baselines():
+    wrapper = _wrapper(
+        [_response(), _response(active=True, action=np.zeros(7))],
+        [_response(), _response(active=True, action=np.zeros(7))],
+    )
+    policy_action = np.zeros(16, dtype=np.float32)
+    policy_action[[7, 15]] = [0.4, -0.3]
+    wrapper.step(policy_action)
+
+    next_policy_action = policy_action.copy()
+    next_policy_action[[7, 15]] = [-0.9, 0.8]
+    wrapper.step(next_policy_action)
+
+    assert wrapper.experts["left"].current_gripper_actions == pytest.approx([0.0, 0.4])
+    assert wrapper.experts["right"].current_gripper_actions == pytest.approx(
+        [0.0, -0.3]
+    )
 
 
 def test_invalid_pico_pose_keeps_takeover_latched():

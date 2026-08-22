@@ -194,6 +194,11 @@ class PicoIntervention(gym.ActionWrapper):
                 tcp_pose,
                 action_scale,
                 gripper_enabled=self.gripper_enabled,
+                current_gripper_action=(
+                    float(action_flat[-1])
+                    if self.gripper_enabled and action_flat.size
+                    else None
+                ),
             )
             active = bool(pico_info.get("pico_active", False))
             self._update_hand_flags(side, active)
@@ -233,6 +238,11 @@ class PicoIntervention(gym.ActionWrapper):
             tcp_pose[tcp_slice],
             action_scale,
             gripper_enabled=self.gripper_enabled,
+            current_gripper_action=(
+                float(action_flat[action_slice][-1])
+                if self.gripper_enabled and per_arm_dim
+                else None
+            ),
         )
 
         active = bool(pico_info.get("pico_active", False))
@@ -287,6 +297,11 @@ class PicoIntervention(gym.ActionWrapper):
                 tcp_pose[tcp_slice],
                 action_scale,
                 gripper_enabled=self.gripper_enabled,
+                current_gripper_action=(
+                    float(action_flat[action_slice][-1])
+                    if self.gripper_enabled and per_arm_dim
+                    else None
+                ),
             )
 
             side_active = bool(side_info.get("pico_active", False))
@@ -496,6 +511,11 @@ class DualFrankaTcpPicoIntervention(gym.ActionWrapper):
                 tcp_pose[tcp_slice],
                 action_scale,
                 gripper_enabled=self.gripper_enabled,
+                current_gripper_action=(
+                    float(new_action[action_slice][-1])
+                    if self.gripper_enabled and per_arm_dim
+                    else None
+                ),
             )
 
             side_active = bool(side_info.get("pico_active", False))

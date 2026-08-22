@@ -62,17 +62,29 @@ class RealWorldEnv(gym.Env):
         self.num_group = num_envs // cfg.group_size
         self.group_size = cfg.group_size
         self.main_image_key = cfg.main_image_key
+        extra_view_image_keys = cfg.get("extra_view_image_keys")
+        self.extra_view_image_keys = (
+            tuple(extra_view_image_keys) if extra_view_image_keys is not None else None
+        )
         self.manual_episode_control_only = bool(
             self.override_cfg.get("manual_episode_control_only", False)
         )
         self.return_numpy = return_numpy
+        self._closed = False
 
         self._init_env()
-
         self._is_start = True
         self._init_metrics()
         self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
         self._init_reset_state_ids()
+
+    def close(self) -> None:
+        """Close the vector environment and all owned real-world hardware."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        if hasattr(self, "env"):
+            self.env.close()
 
     def _create_env(self, env_idx: int):
         worker_info: WorkerInfo = self.worker_info
@@ -246,8 +258,23 @@ class RealWorldEnv(gym.Env):
         # The copy=False vector buffer is reused on the next step. Collection
         # keeps observations for the full episode, so take ownership once here.
         obs["main_images"] = main_images.copy() if self.return_numpy else main_images
-        raw_images = OrderedDict(sorted(frames.items()))
-        raw_images.pop(self.main_image_key)
+        extra_view_image_keys = getattr(self, "extra_view_image_keys", None)
+        if extra_view_image_keys is None:
+            raw_images = OrderedDict(sorted(frames.items()))
+            raw_images.pop(self.main_image_key)
+        else:
+            configured_keys = extra_view_image_keys
+            available_keys = set(frames) - {self.main_image_key}
+            if len(configured_keys) != len(set(configured_keys)):
+                raise ValueError("extra_view_image_keys must not contain duplicates")
+            if set(configured_keys) != available_keys:
+                missing = sorted(available_keys - set(configured_keys))
+                unexpected = sorted(set(configured_keys) - available_keys)
+                raise KeyError(
+                    "extra_view_image_keys must list every non-main camera exactly "
+                    f"once; missing={missing}, unexpected={unexpected}"
+                )
+            raw_images = OrderedDict((key, frames[key]) for key in configured_keys)
 
         if raw_images:
             obs["extra_view_images"] = np.stack(list(raw_images.values()), axis=1)

@@ -22,7 +22,7 @@ Topology:
     - >=2-node cluster: receivers run on node 1 (inter-node).
 
 The benchmark infers the node count from the already-running Ray cluster
-(``Cluster()`` with auto-detect), so the only prerequisite is that
+(``Cluster(num_nodes=0)`` with auto-detect), so the only prerequisite is that
 ``ray start`` has been run on every node you want to include. Workers are
 placed by node rank via ``NodePlacementStrategy``, so the benchmark works
 on clusters with or without accelerators. The device is selected per run

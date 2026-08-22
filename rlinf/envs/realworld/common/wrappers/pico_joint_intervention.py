@@ -150,6 +150,7 @@ class DualFrankaJointPicoIntervention(gym.ActionWrapper):
                     None,
                     gripper_enabled=True,
                     direct=True,
+                    current_gripper_action=float(self._gripper_action[arm_index]),
                 )
                 active = bool(side_info.get("pico_active", False))
                 data_ready = bool(side_info.get("pico_ready", False))
@@ -240,6 +241,7 @@ class DualFrankaJointPicoIntervention(gym.ActionWrapper):
                 None,
                 gripper_enabled=True,
                 direct=True,
+                current_gripper_action=float(self._gripper_action[arm_index]),
             )
             if not side_info.get("pico_ready", False):
                 raise RuntimeError(f"PICO {side} controller data timed out")

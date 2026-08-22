@@ -24,10 +24,10 @@ cluster:
         configs:
           - left_robot_ip: 172.16.0.1
             right_robot_ip: 172.16.0.2
-            base_camera_serials: ["DA6135161"]
-            left_camera_serials: ["327122078534"]
+            base_camera_serials: ["DA6135161", "327122078534"]
+            base_camera_types: [hikrobot, realsense]
+            left_camera_serials: ["261922076829"]
             right_camera_serials: ["262322073199"]
-            base_camera_type: hikrobot
             left_camera_type: realsense
             right_camera_type: realsense
             left_gripper_type: robotiq
@@ -55,6 +55,10 @@ env:
     no_gripper: false
     ignore_terminations: false
     auto_reset: false
+    extra_view_image_keys:
+      - left_wrist_0_rgb
+      - right_wrist_0_rgb
+      - base_1_rgb
     keyboard_device: /dev/input/by-id/usb-PCsensor_FootSwitch-event-kbd
     left_gello_port: /dev/serial/by-path/pci-0000:00:14.0-usb-0:10.3:1.0-port0
     right_gello_port: /dev/serial/by-path/pci-0000:00:14.0-usb-0:10.2:1.0-port0

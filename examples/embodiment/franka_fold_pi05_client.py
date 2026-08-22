@@ -37,6 +37,11 @@ TRAINING_RTC_MAX_DELAY = 10
 DEFAULT_PEDAL = "/dev/input/by-id/usb-PCsensor_FootSwitch-event-kbd"
 DEFAULT_TASK = "fold the clothes"
 DEFAULT_PICO_ZMQ_ADDR = "ipc:///tmp/vr_data.ipc"
+COLLECTION_EXTRA_VIEW_KEYS = (
+    "left_wrist_0_rgb",
+    "right_wrist_0_rgb",
+    "base_1_rgb",
+)
 SUPPORTED_SERVER_CONFIGS = {
     "pi05_franka_fold_full_rtc",
     "pi05_franka_fold_recap_cfgrl",
@@ -206,7 +211,7 @@ def build_observation(raw_obs: dict[str, Any], task: str) -> dict[str, Any]:
 
     return {
         "observation.image": image("base_0_rgb"),
-        "observation.extra_view_image-0": image("left_wrist_0_rgb"),
+        "observation.extra_view_image-0": image("base_1_rgb"),
         "observation.extra_view_image-1": image("right_wrist_0_rgb"),
         "observation.state": state,
         "prompt": task,
@@ -279,7 +284,7 @@ def collection_observation(raw_obs: dict[str, Any], task: str) -> dict[str, Any]
     adapted["states"] = build_observation(raw_obs, task)["observation.state"]
     adapted["main_images"] = frames["base_0_rgb"]
     adapted["extra_view_images"] = np.stack(
-        [frames["left_wrist_0_rgb"], frames["right_wrist_0_rgb"]]
+        [frames[key] for key in COLLECTION_EXTRA_VIEW_KEYS]
     )
     adapted["task_descriptions"] = task
     return adapted
@@ -427,10 +432,16 @@ def create_env(args: argparse.Namespace):
     override_cfg = {
         "left_robot_ip": args.left_robot_ip,
         "right_robot_ip": args.right_robot_ip,
-        "base_camera_serials": [args.base_camera_serial],
+        "base_camera_serials": [
+            args.base_camera_serial,
+            args.secondary_base_camera_serial,
+        ],
+        "base_camera_types": [
+            args.base_camera_type,
+            args.secondary_base_camera_type,
+        ],
         "left_camera_serials": [args.left_camera_serial],
         "right_camera_serials": [args.right_camera_serial],
-        "base_camera_type": args.base_camera_type,
         "left_camera_type": "realsense",
         "right_camera_type": "realsense",
         "left_gripper_type": "robotiq",
@@ -451,6 +462,7 @@ def create_env(args: argparse.Namespace):
         "use_pico": False,
         "use_spacemouse": False,
         "keyboard_reward_wrapper": "eval_control",
+        "keyboard_fifo_path": args.keyboard_fifo_path,
     }
     env = gym.make(
         "Ros2DualFrankaJointEnv-v1",
@@ -471,6 +483,9 @@ def create_env(args: argparse.Namespace):
                 zmq_addr=args.pico_zmq_addr,
                 control_trigger="grip",
                 control_threshold=args.pico_control_threshold,
+                gripper_control_mode="relative_trigger",
+                gripper_trigger="trigger",
+                gripper_trigger_scale=2.0,
                 max_stale_s=0.2,
                 ready_timeout_s=args.pico_ready_timeout_s,
                 trajectory_filter={
@@ -482,13 +497,11 @@ def create_env(args: argparse.Namespace):
                     "enabled": True,
                     "required": True,
                     "auto_calibrate_on_start": True,
-                    "button": "trigger",
+                    "button": None,
                     "threshold": 0.5,
                     "head_forward_axis": "-z",
                     "base_position": [0.0, 0.0, 0.0],
                 },
-                left={"gripper_close_button": "X", "gripper_open_button": "Y"},
-                right={"gripper_close_button": "A", "gripper_open_button": "B"},
             )
         except Exception:
             env.close()
@@ -552,8 +565,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--left-robot-ip", default="172.16.0.1")
     parser.add_argument("--right-robot-ip", default="172.16.0.2")
-    parser.add_argument("--base-camera-type", default="realsense")
-    parser.add_argument("--base-camera-serial", default="327122078534")
+    parser.add_argument("--base-camera-type", default="hikrobot")
+    parser.add_argument("--base-camera-serial", default="DA6135161")
+    parser.add_argument("--secondary-base-camera-type", default="realsense")
+    parser.add_argument("--secondary-base-camera-serial", default="327122078534")
     parser.add_argument("--left-camera-serial", default="261922076829")
     parser.add_argument("--right-camera-serial", default="262322073199")
     parser.add_argument(
@@ -565,6 +580,7 @@ def parse_args() -> argparse.Namespace:
         default="/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG046F7F-if00-port0",
     )
     parser.add_argument("--pedal-device", default=DEFAULT_PEDAL)
+    parser.add_argument("--keyboard-fifo-path")
     parser.add_argument("--enable-pico", action="store_true")
     parser.add_argument("--pico-zmq-addr", default=DEFAULT_PICO_ZMQ_ADDR)
     parser.add_argument("--pico-control-threshold", type=float, default=0.85)
@@ -598,6 +614,7 @@ def self_test() -> None:
     raw_obs = {
         "frames": {
             "base_0_rgb": np.zeros((8, 9, 3), dtype=np.uint8),
+            "base_1_rgb": np.full((8, 9, 3), 3, dtype=np.uint8),
             "left_wrist_0_rgb": np.ones((8, 9, 3), dtype=np.uint8),
             "right_wrist_0_rgb": np.full((8, 9, 3), 2, dtype=np.uint8),
         },
@@ -629,10 +646,13 @@ def self_test() -> None:
     collected = collection_observation(raw_obs, DEFAULT_TASK)
     np.testing.assert_array_equal(collected["states"], expected_state)
     assert collected["main_images"] is raw_obs["frames"]["base_0_rgb"]
-    assert collected["extra_view_images"].shape == (2, 8, 9, 3)
+    assert collected["extra_view_images"].shape == (3, 8, 9, 3)
+    np.testing.assert_array_equal(
+        collected["extra_view_images"][2], raw_obs["frames"]["base_1_rgb"]
+    )
     print(
-        "Self-test passed: state layout, images, 30x16 actions, RTC prefix, "
-        "wire format, and rollout observation mapping."
+        "Self-test passed: state layout, four-camera collection, 30x16 actions, "
+        "RTC prefix, wire format, and rollout observation mapping."
     )
 
 
@@ -687,7 +707,10 @@ def main() -> None:
         raise SystemExit("PICO threshold and timeout must be positive and valid")
     input("Press Enter to open hardware (Ctrl+C to cancel): ")
 
-    os.environ["RLINF_KEYBOARD_DEVICE"] = args.pedal_device
+    if args.keyboard_fifo_path is None:
+        os.environ["RLINF_KEYBOARD_DEVICE"] = args.pedal_device
+    else:
+        os.environ.pop("RLINF_KEYBOARD_DEVICE", None)
     policy = AsyncPi05Client(args.host, args.port, args.timeout_s)
     env = None
     try:
