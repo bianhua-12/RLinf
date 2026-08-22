@@ -16,6 +16,11 @@ init_params:
 
 override_cfg:
   camera_fps: 30
+  camera_first_frame_timeout_seconds: 3.0
+  camera_max_stale_seconds: 1.0
+  camera_recovery_initial_backoff_seconds: 0.5
+  camera_recovery_max_backoff_seconds: 4.0
+  camera_recovery_shutdown_timeout_seconds: 3.0
   step_frequency: 30
   joint_action_mode: absolute
   max_num_steps: 1000000

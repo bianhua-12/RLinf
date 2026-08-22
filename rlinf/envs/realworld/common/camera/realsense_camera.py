@@ -27,6 +27,8 @@ class RealSenseCamera(BaseCamera):
     https://github.com/IntelRealSense/librealsense/blob/jupyter/notebooks/quick_start_live.ipynb.
     """
 
+    _SDK_FRAME_TIMEOUT_MS = 200
+
     def __init__(self, camera_info: CameraInfo):
         import pyrealsense2 as rs
 
@@ -62,7 +64,7 @@ class RealSenseCamera(BaseCamera):
         self._align = rs.align(rs.stream.color) if self._enable_depth else None
 
     def _read_frame(self) -> tuple[bool, Optional[np.ndarray]]:
-        frames = self._pipeline.wait_for_frames()
+        frames = self._pipeline.wait_for_frames(self._SDK_FRAME_TIMEOUT_MS)
         if self._enable_depth:
             aligned_frames = self._align.process(frames)
             color_frame = aligned_frames.get_color_frame()

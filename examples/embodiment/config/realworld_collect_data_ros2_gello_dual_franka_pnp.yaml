@@ -95,6 +95,8 @@ env:
       use_videos: true
       video_write_mode: stream_mp4
       stream_video_queue_size: 60
+      stream_max_pending_commits: 2
+      stream_commit_watchdog_timeout: 30.0
       defer_video_encoding_until_finalize: false
       finalize_interval: 0
       isolate_episode_stats: false

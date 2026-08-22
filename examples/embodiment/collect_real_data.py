@@ -166,6 +166,12 @@ class DataCollector(Worker):
                 resume=bool(dc_cfg.get("resume", False)),
                 video_write_mode=dc_cfg.get("video_write_mode", "lerobot_png"),
                 stream_video_queue_size=int(dc_cfg.get("stream_video_queue_size", 60)),
+                stream_max_pending_commits=int(
+                    dc_cfg.get("stream_max_pending_commits", 2)
+                ),
+                stream_commit_watchdog_timeout=float(
+                    dc_cfg.get("stream_commit_watchdog_timeout", 30.0)
+                ),
                 # RealWorldEnv allocates fresh observation arrays on every step.
                 copy_observations=False,
             )

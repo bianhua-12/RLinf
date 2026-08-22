@@ -43,8 +43,10 @@ class _FrameSet:
 class _Pipeline:
     def __init__(self, frames: _FrameSet):
         self._frames = frames
+        self.timeout_ms = None
 
-    def wait_for_frames(self) -> _FrameSet:
+    def wait_for_frames(self, timeout_ms: int) -> _FrameSet:
+        self.timeout_ms = timeout_ms
         return self._frames
 
 
@@ -86,6 +88,7 @@ def test_read_frame_skips_alignment_when_depth_is_disabled():
 
     assert success
     assert frame is image
+    assert camera._pipeline.timeout_ms == RealSenseCamera._SDK_FRAME_TIMEOUT_MS
 
 
 def test_init_binds_target_without_enumerating_all_devices(monkeypatch):

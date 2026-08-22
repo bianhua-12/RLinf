@@ -6,8 +6,10 @@ installation; it does not require the GELLO repository at runtime.
 
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/pnp/franka/franka_ros2_ws/install/setup.bash
-cd /home/pnp/workspaces/RLinf/ros2_ws
+# Point this at the host's franka_ros2 checkout.
+export FRANKA_ROS2_WS=/path/to/franka_ros2_ws
+source "$FRANKA_ROS2_WS/install/setup.bash"
+cd "$(git rev-parse --show-toplevel)/ros2_ws"
 colcon build --packages-select rlinf_franka_controller --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
