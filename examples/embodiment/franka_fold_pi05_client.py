@@ -462,6 +462,7 @@ def create_env(args: argparse.Namespace):
         "use_pico": False,
         "use_spacemouse": False,
         "keyboard_reward_wrapper": "eval_control",
+        "keyboard_fifo_path": args.keyboard_fifo_path,
     }
     env = gym.make(
         "Ros2DualFrankaJointEnv-v1",
@@ -579,6 +580,7 @@ def parse_args() -> argparse.Namespace:
         default="/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG046F7F-if00-port0",
     )
     parser.add_argument("--pedal-device", default=DEFAULT_PEDAL)
+    parser.add_argument("--keyboard-fifo-path")
     parser.add_argument("--enable-pico", action="store_true")
     parser.add_argument("--pico-zmq-addr", default=DEFAULT_PICO_ZMQ_ADDR)
     parser.add_argument("--pico-control-threshold", type=float, default=0.85)
@@ -705,7 +707,10 @@ def main() -> None:
         raise SystemExit("PICO threshold and timeout must be positive and valid")
     input("Press Enter to open hardware (Ctrl+C to cancel): ")
 
-    os.environ["RLINF_KEYBOARD_DEVICE"] = args.pedal_device
+    if args.keyboard_fifo_path is None:
+        os.environ["RLINF_KEYBOARD_DEVICE"] = args.pedal_device
+    else:
+        os.environ.pop("RLINF_KEYBOARD_DEVICE", None)
     policy = AsyncPi05Client(args.host, args.port, args.timeout_s)
     env = None
     try:

@@ -35,9 +35,13 @@ class KeyboardEvalControlWrapper(gym.Wrapper):
     PEDAL_DEBOUNCE_S = 0.2
     WAIT_HEARTBEAT_S = 10.0
 
-    def __init__(self, env: gym.Env):
+    def __init__(self, env: gym.Env, fifo_path: str | None = None):
         super().__init__(env)
-        self.listener = KeyboardListener()
+        self.listener = (
+            KeyboardListener(fifo_path=fifo_path)
+            if fifo_path is not None
+            else KeyboardListener()
+        )
         self._running = False
         self._last_obs: Any = None
         self._last_press_ts: dict[str, float] = {}

@@ -295,6 +295,13 @@ captured as ``extra_view_image-0`` in every rollout but is not passed to this
 checkpoint. A four-image policy requires a matching OpenPI model/data
 configuration and retraining; do not add a fourth policy image implicitly.
 
+For a repeatable headless rollout check, create a named pipe and pass it with
+``--keyboard-fifo-path <path>`` to ``franka_fold_pi05_client.py``. Write ``a``
+to start, ``b`` to finish as failure, or ``c`` to finish as success. This input
+is opt-in; when the option is omitted, the client continues to read the device
+selected by ``--pedal-device``.
+
+
 Gripper Configuration
 ---------------------
 

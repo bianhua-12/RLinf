@@ -71,6 +71,20 @@ def test_reset_refreshes_observation_after_start_pedal(monkeypatch):
     np.testing.assert_array_equal(env._last_obs, observation)
 
 
+def test_eval_control_passes_explicit_fifo_to_listener(monkeypatch):
+    listener = _Listener()
+    received = []
+    monkeypatch.setattr(
+        "rlinf.envs.realworld.common.wrappers.keyboard_eval_control_wrapper.KeyboardListener",
+        lambda fifo_path: received.append(fifo_path) or listener,
+    )
+
+    env = KeyboardEvalControlWrapper(_Env(), fifo_path="/tmp/eval-control.fifo")
+
+    assert env.listener is listener
+    assert received == ["/tmp/eval-control.fifo"]
+
+
 @pytest.mark.parametrize(
     ("key", "expected_result", "expected_reward", "expected_success"),
     [("c", "success", 1.0, True), ("b", "failure", 0.0, False)],

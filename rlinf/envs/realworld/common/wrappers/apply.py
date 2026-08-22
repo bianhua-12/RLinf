@@ -90,7 +90,7 @@ def _apply_keyboard_wrapper(
     if mode == "start_end":
         return KeyboardStartEndWrapper(env, fifo_path=fifo_path)
     if mode == "eval_control":
-        return KeyboardEvalControlWrapper(env)
+        return KeyboardEvalControlWrapper(env, fifo_path=fifo_path)
     if mode == "rlt_policy_switch":
         return KeyboardRLTPolicySwitchWrapper(env)
     return env

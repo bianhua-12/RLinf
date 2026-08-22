@@ -30,6 +30,7 @@ def test_episode_timeout_defaults_to_120_seconds(monkeypatch):
     assert args.secondary_base_camera_serial == "327122078534"
     assert args.left_camera_serial == "261922076829"
     assert args.right_camera_serial == "262322073199"
+    assert args.keyboard_fifo_path is None
 
 
 def test_episode_timeout_terminates_as_failure(monkeypatch):
@@ -344,6 +345,7 @@ def test_create_env_streams_video_for_pi05_and_pico(monkeypatch, tmp_path):
         pico_control_threshold=0.85,
         pico_ready_timeout_s=1.0,
         episode_timeout_s=120.0,
+        keyboard_fifo_path="/tmp/pi05-eval-control.fifo",
         rollout_dir=str(tmp_path),
     )
 
@@ -358,11 +360,14 @@ def test_create_env_streams_video_for_pi05_and_pico(monkeypatch, tmp_path):
     assert pico_configs[0]["gripper_trigger_scale"] == 2.0
     assert pico_configs[0]["calibration"]["button"] is None
     assert len(env_configs) == 2
+    assert len(env_runtime_configs) == 2
     for override_cfg in env_configs:
         assert override_cfg["base_camera_serials"] == ["base", "secondary-base"]
         assert override_cfg["base_camera_types"] == ["hikrobot", "realsense"]
         assert override_cfg["left_camera_serials"] == ["left-camera"]
         assert override_cfg["right_camera_serials"] == ["right-camera"]
+    for env_cfg in env_runtime_configs:
+        assert env_cfg["keyboard_fifo_path"] == "/tmp/pi05-eval-control.fifo"
     for kwargs in captured:
         assert kwargs["fps"] == 30
         assert kwargs["use_videos"] is True
