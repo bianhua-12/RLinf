@@ -80,8 +80,13 @@ sync owns the package source.
   and Ray launch, `Cluster()` cannot fall back to launch, remote checks are
   pinned to each node, configured Python runtimes are included, and a node
   failure aborts initialization. This is evidence level 1.
+- A post-commit single-node Ray integration test launches an actor through a
+  configured interpreter and `PYTHONPATH` after the runtime gate. The full
+  `test_cluster_config.py` file still contains an unrelated actor-import hang
+  in path-merge tests; the same `ModuleNotFoundError: test_cluster_config` was
+  reproduced at parent commit `c52a94ac`.
 - Ruff, format, and diff checks cover the changed Python and documentation
-  surface. No training, Ray cluster, or real-hardware run is claimed.
+  surface. No training or real-hardware run is claimed.
 
 ## Consequences
 
