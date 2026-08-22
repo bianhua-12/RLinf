@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPENPI_PATH="${OPENPI_PATH:-${HOME}/openpi}"
-CHECKPOINT_DIR="${RLINF_PI05_CHECKPOINT:-${HOME}/checkpoints/openpi/pi05_franka_fold_recap_cfgrl_29999}"
+CHECKPOINT_DIR="${RLINF_PI05_CHECKPOINT:-${HOME}/checkpoints/openpi/pi05_franka_fold_steam_cfgrl_a8004_29999}"
 SERVER_HOST="${OPENPI_SERVER_HOST:-127.0.0.1}"
 SERVER_PORT="${OPENPI_SERVER_PORT:-8000}"
 SERVER_START_TIMEOUT="${OPENPI_SERVER_START_TIMEOUT:-600}"
