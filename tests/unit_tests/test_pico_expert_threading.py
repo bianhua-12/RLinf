@@ -12,6 +12,7 @@ import threading
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation as R
 
 from rlinf.envs.realworld.common.pico import pico_expert
@@ -151,3 +152,100 @@ def test_direct_action_returns_full_tcp_error():
 
     assert replaced
     np.testing.assert_allclose(action, [0.5, -0.4, 0.3, 0.8, 0.0, 0.0])
+
+
+def test_relative_trigger_gripper_anchors_on_each_takeover(monkeypatch):
+    monkeypatch.setattr(pico_expert.PicoExpert, "start", lambda self: None)
+    expert = pico_expert.PicoExpert(
+        hand="left",
+        control_threshold=0.5,
+        gripper_control_mode="relative_trigger",
+        gripper_trigger_scale=2.0,
+        calibration={"enabled": False},
+    )
+    data = {
+        "left_controller": {
+            "position": [0.0, 0.0, 0.0],
+            "orientation": [0.0, 0.0, 0.0, 1.0],
+            "grip": 1.0,
+            "trigger": 0.4,
+        }
+    }
+    expert._snapshot = lambda: data
+    tcp_pose = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+
+    action, replaced, info = expert.get_action(
+        tcp_pose,
+        None,
+        gripper_enabled=True,
+        direct=True,
+        current_gripper_action=0.3,
+    )
+    assert replaced
+    assert action[6] == pytest.approx(0.3)
+    assert info["pico_gripper_reference_trigger"] == pytest.approx(0.4)
+    assert info["pico_gripper_reference_action"] == pytest.approx(0.3)
+
+    data["left_controller"]["trigger"] = 0.65
+    action, replaced, _ = expert.get_action(
+        tcp_pose,
+        None,
+        gripper_enabled=True,
+        direct=True,
+        current_gripper_action=0.9,
+    )
+    assert replaced
+    assert action[6] == pytest.approx(-0.2)
+
+    data["left_controller"]["grip"] = 0.0
+    _, replaced, _ = expert.get_action(
+        tcp_pose,
+        None,
+        gripper_enabled=True,
+        direct=True,
+        current_gripper_action=-0.2,
+    )
+    assert not replaced
+
+    data["left_controller"].update({"grip": 1.0, "trigger": 0.7})
+    action, replaced, _ = expert.get_action(
+        tcp_pose,
+        None,
+        gripper_enabled=True,
+        direct=True,
+        current_gripper_action=-0.2,
+    )
+    assert replaced
+    assert action[6] == pytest.approx(-0.2)
+
+    data["left_controller"]["trigger"] = 0.2
+    action, _, _ = expert.get_action(
+        tcp_pose,
+        None,
+        gripper_enabled=True,
+        direct=True,
+        current_gripper_action=-0.2,
+    )
+    assert action[6] == pytest.approx(0.8)
+
+    data["left_controller"]["trigger"] = -0.5
+    action, _, _ = expert.get_action(
+        tcp_pose,
+        None,
+        gripper_enabled=True,
+        direct=True,
+        current_gripper_action=-0.2,
+    )
+    assert action[6] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0, np.nan, np.inf])
+def test_relative_trigger_gripper_rejects_invalid_scale(monkeypatch, scale):
+    monkeypatch.setattr(pico_expert.PicoExpert, "start", lambda self: None)
+
+    with pytest.raises(ValueError, match="gripper_trigger_scale"):
+        pico_expert.PicoExpert(
+            gripper_control_mode="relative_trigger",
+            gripper_trigger_scale=scale,
+            calibration={"enabled": False},
+        )

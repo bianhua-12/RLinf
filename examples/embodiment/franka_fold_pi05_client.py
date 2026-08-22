@@ -482,6 +482,9 @@ def create_env(args: argparse.Namespace):
                 zmq_addr=args.pico_zmq_addr,
                 control_trigger="grip",
                 control_threshold=args.pico_control_threshold,
+                gripper_control_mode="relative_trigger",
+                gripper_trigger="trigger",
+                gripper_trigger_scale=2.0,
                 max_stale_s=0.2,
                 ready_timeout_s=args.pico_ready_timeout_s,
                 trajectory_filter={
@@ -493,13 +496,11 @@ def create_env(args: argparse.Namespace):
                     "enabled": True,
                     "required": True,
                     "auto_calibrate_on_start": True,
-                    "button": "trigger",
+                    "button": None,
                     "threshold": 0.5,
                     "head_forward_axis": "-z",
                     "base_position": [0.0, 0.0, 0.0],
                 },
-                left={"gripper_close_button": "X", "gripper_open_button": "Y"},
-                right={"gripper_close_button": "A", "gripper_open_button": "B"},
             )
         except Exception:
             env.close()

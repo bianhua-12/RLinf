@@ -324,6 +324,28 @@ Current button semantics:
 If neither A nor B is pressed, the gripper action is ``0.0``. Releasing the
 button does not automatically open the gripper.
 
+For continuous gripper control without a jump when PICO takes over, use the
+trigger-relative mode:
+
+.. code-block:: yaml
+
+   env:
+     eval:
+       pico:
+         gripper_control_mode: "relative_trigger"
+         gripper_trigger: "trigger"
+         gripper_trigger_scale: 2.0
+         calibration:
+           button: null
+
+When ``grip`` first crosses ``control_threshold``, RLinf records both the
+current gripper action and the current trigger value. Further trigger travel is
+applied relative to those references and clipped to ``[-1, 1]``. With the
+default direction, increasing the trigger closes the gripper; set
+``gripper_invert: true`` to reverse it. A scale of ``2.0`` maps a full trigger
+stroke to the full action range. Do not bind the same trigger to calibration;
+set ``calibration.button`` to ``null`` as above or choose another button.
+
 
 Cluster Setup Notes
 ---------------------

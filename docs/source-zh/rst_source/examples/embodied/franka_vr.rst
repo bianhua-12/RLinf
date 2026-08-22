@@ -297,6 +297,26 @@ GELLO 数采使用
 
 如果 A/B 都不按，夹爪动作输出为 ``0.0``，不会因为松开按钮而自动打开。
 
+如需连续控制夹爪，并避免 PICO 接管瞬间发生跳变，可使用 trigger 相对模式：
+
+.. code-block:: yaml
+
+   env:
+     eval:
+       pico:
+         gripper_control_mode: "relative_trigger"
+         gripper_trigger: "trigger"
+         gripper_trigger_scale: 2.0
+         calibration:
+           button: null
+
+当 ``grip`` 首次越过 ``control_threshold`` 时，RLinf 会同时记录当前夹爪动作和
+当前 trigger 值。之后的 trigger 行程相对于这两个参考值计算，并裁剪到
+``[-1, 1]``。默认方向下，增大 trigger 会闭合夹爪；设置
+``gripper_invert: true`` 可反转方向。``2.0`` 的缩放值会把 trigger 的完整行程
+映射到完整动作范围。不要同时把同一个 trigger 用于标定；请像上例一样将
+``calibration.button`` 设为 ``null``，或改绑其他按键。
+
 集群配置注意事项
 ---------------------
 

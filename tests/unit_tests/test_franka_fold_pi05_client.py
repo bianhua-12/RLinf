@@ -300,6 +300,7 @@ def test_create_env_streams_video_for_pi05_and_pico(monkeypatch, tmp_path):
         observation_space = gym.spaces.Dict({})
 
     captured = []
+    pico_configs = []
 
     class _CollectEpisode:
         def __init__(self, env, **kwargs):
@@ -318,7 +319,12 @@ def test_create_env_streams_video_for_pi05_and_pico(monkeypatch, tmp_path):
     pico_module = ModuleType(
         "rlinf.envs.realworld.common.wrappers.pico_joint_intervention"
     )
-    pico_module.DualFrankaJointPicoIntervention = lambda env, **kwargs: env
+
+    def _pico_wrapper(env, **kwargs):
+        pico_configs.append(kwargs)
+        return env
+
+    pico_module.DualFrankaJointPicoIntervention = _pico_wrapper
     monkeypatch.setitem(sys.modules, pico_module.__name__, pico_module)
     args = Namespace(
         left_robot_ip="left",
@@ -346,6 +352,11 @@ def test_create_env_streams_video_for_pi05_and_pico(monkeypatch, tmp_path):
     client.create_env(args)
 
     assert len(captured) == 2
+    assert len(pico_configs) == 1
+    assert pico_configs[0]["gripper_control_mode"] == "relative_trigger"
+    assert pico_configs[0]["gripper_trigger"] == "trigger"
+    assert pico_configs[0]["gripper_trigger_scale"] == 2.0
+    assert pico_configs[0]["calibration"]["button"] is None
     for kwargs in captured:
         assert kwargs["fps"] == 30
         assert kwargs["use_videos"] is True

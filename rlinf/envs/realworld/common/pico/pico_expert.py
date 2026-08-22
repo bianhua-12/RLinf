@@ -172,7 +172,9 @@ class PicoExpert:
         hand: str = "right",
         control_trigger: str = "grip",
         control_threshold: float = 0.9,
+        gripper_control_mode: str = "buttons",
         gripper_trigger: str = "trigger",
+        gripper_trigger_scale: float = 2.0,
         gripper_close_threshold: float = 0.5,
         gripper_close_button: str = "A",
         gripper_open_button: str = "B",
@@ -202,7 +204,18 @@ class PicoExpert:
         self.hand = hand
         self.control_trigger = control_trigger
         self.control_threshold = float(control_threshold)
+        self.gripper_control_mode = str(gripper_control_mode).strip().lower()
+        if self.gripper_control_mode not in ("buttons", "relative_trigger"):
+            raise ValueError(
+                "PICO gripper_control_mode must be 'buttons' or 'relative_trigger'."
+            )
         self.gripper_trigger = gripper_trigger
+        self.gripper_trigger_scale = float(gripper_trigger_scale)
+        if (
+            not np.isfinite(self.gripper_trigger_scale)
+            or self.gripper_trigger_scale <= 0.0
+        ):
+            raise ValueError("PICO gripper_trigger_scale must be positive and finite.")
         self.gripper_close_threshold = float(gripper_close_threshold)
         self.gripper_close_button = gripper_close_button
         self.gripper_open_button = gripper_open_button
@@ -272,6 +285,8 @@ class PicoExpert:
         self._ref_controller_rot: Optional[R] = None
         self._ref_tcp_pos: Optional[np.ndarray] = None
         self._ref_tcp_rot: Optional[R] = None
+        self._ref_gripper_trigger: Optional[float] = None
+        self._ref_gripper_action: Optional[float] = None
 
         self._calibrated = False
         self._calibration_rot = R.identity()
@@ -316,6 +331,7 @@ class PicoExpert:
         *,
         gripper_enabled: bool = True,
         direct: bool = False,
+        current_gripper_action: Optional[float] = None,
     ) -> tuple[np.ndarray, bool, dict[str, Any]]:
         data = self._snapshot()
         if data is None:
@@ -371,6 +387,8 @@ class PicoExpert:
 
         if active and not self._active:
             self._activate(controller_pos, controller_rot, tcp_pose)
+            if gripper_enabled and self.gripper_control_mode == "relative_trigger":
+                self._activate_relative_gripper(data, current_gripper_action)
         elif not active and self._active:
             self._deactivate()
         self._active = active
@@ -418,33 +436,39 @@ class PicoExpert:
 
         gripper_close = False
         if gripper_enabled:
-            close_pressed = self._control_pressed(
-                data,
-                self.hand,
-                self.gripper_close_button,
-                self.gripper_close_threshold,
-            )
-            open_pressed = self._control_pressed(
-                data,
-                self.hand,
-                self.gripper_open_button,
-                self.gripper_close_threshold,
-            )
-            if self.gripper_invert:
-                close_pressed, open_pressed = open_pressed, close_pressed
+            if self.gripper_control_mode == "relative_trigger":
+                gripper_action, trigger_value = self._relative_gripper_action(data)
+                info["pico_gripper_trigger_value"] = trigger_value
+                info["pico_gripper_reference_trigger"] = self._ref_gripper_trigger
+                info["pico_gripper_reference_action"] = self._ref_gripper_action
+            else:
+                close_pressed = self._control_pressed(
+                    data,
+                    self.hand,
+                    self.gripper_close_button,
+                    self.gripper_close_threshold,
+                )
+                open_pressed = self._control_pressed(
+                    data,
+                    self.hand,
+                    self.gripper_open_button,
+                    self.gripper_close_threshold,
+                )
+                if self.gripper_invert:
+                    close_pressed, open_pressed = open_pressed, close_pressed
 
-            gripper_action = 0.0
-            if close_pressed:
-                gripper_action = -1.0
-            elif open_pressed:
-                gripper_action = 1.0
+                gripper_action = 0.0
+                if close_pressed:
+                    gripper_action = -1.0
+                elif open_pressed:
+                    gripper_action = 1.0
+                info["pico_gripper_close_pressed"] = close_pressed
+                info["pico_gripper_open_pressed"] = open_pressed
             gripper_close = gripper_action < 0.0
             expert_action = np.concatenate(
                 (expert_action, np.array([gripper_action], dtype=np.float64)),
                 axis=0,
             )
-            info["pico_gripper_close_pressed"] = close_pressed
-            info["pico_gripper_open_pressed"] = open_pressed
             info["pico_gripper_action"] = gripper_action
             info["pico_gripper_close"] = gripper_close
 
@@ -509,6 +533,38 @@ class PicoExpert:
             )
         logger.info("PICO %s controller activated", self.hand)
 
+    def _activate_relative_gripper(
+        self,
+        data: Mapping[str, Any],
+        current_gripper_action: Optional[float],
+    ) -> None:
+        trigger_value = self._gripper_trigger_value(data)
+        if current_gripper_action is None:
+            current_gripper_action = (
+                float(self._last_action[6]) if self._last_action.size >= 7 else 0.0
+            )
+        current_gripper_action = float(current_gripper_action)
+        if not np.isfinite(current_gripper_action):
+            raise ValueError("Current gripper action must be finite.")
+        self._ref_gripper_trigger = trigger_value
+        self._ref_gripper_action = float(np.clip(current_gripper_action, -1.0, 1.0))
+
+    def _relative_gripper_action(self, data: Mapping[str, Any]) -> tuple[float, float]:
+        if self._ref_gripper_trigger is None or self._ref_gripper_action is None:
+            self._activate_relative_gripper(data, None)
+        trigger_value = self._gripper_trigger_value(data)
+        direction = 1.0 if self.gripper_invert else -1.0
+        action = self._ref_gripper_action + direction * self.gripper_trigger_scale * (
+            trigger_value - self._ref_gripper_trigger
+        )
+        return float(np.clip(action, -1.0, 1.0)), trigger_value
+
+    def _gripper_trigger_value(self, data: Mapping[str, Any]) -> float:
+        value = self._control_value(data, self.hand, self.gripper_trigger)
+        if not np.isfinite(value):
+            raise ValueError("PICO gripper trigger value must be finite.")
+        return float(np.clip(value, 0.0, 1.0))
+
     def _deactivate(self) -> None:
         if self._active:
             logger.info("PICO %s controller deactivated", self.hand)
@@ -517,6 +573,8 @@ class PicoExpert:
         self._ref_controller_rot = None
         self._ref_tcp_pos = None
         self._ref_tcp_rot = None
+        self._ref_gripper_trigger = None
+        self._ref_gripper_action = None
         if self._trajectory_filter is not None:
             self._trajectory_filter.reset()
 
