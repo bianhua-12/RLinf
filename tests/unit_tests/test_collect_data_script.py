@@ -65,3 +65,44 @@ def test_run_collect_data_rejects_invalid_episode_count_before_cleanup():
 
     assert result.returncode == 2
     assert "positive_episode_count" in result.stderr
+
+
+def test_run_collect_data_sources_ros_before_launch(tmp_path):
+    repo_path = Path(__file__).resolve().parents[2]
+    setup_files = []
+    for index in range(3):
+        setup_file = tmp_path / f"setup_{index}.bash"
+        setup_file.write_text(
+            f"export TEST_ROS_SETUP_{index}=loaded\n", encoding="utf-8"
+        )
+        setup_files.append(setup_file)
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "[[ ${TEST_ROS_SETUP_0:-} == loaded ]] && "
+        "[[ ${TEST_ROS_SETUP_1:-} == loaded ]] && "
+        "[[ ${TEST_ROS_SETUP_2:-} == loaded ]]\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "RLINF_ROS_SETUP": str(setup_files[0]),
+            "RLINF_FRANKA_ROS2_SETUP": str(setup_files[1]),
+            "RLINF_ROS2_SETUP": str(setup_files[2]),
+            "RLINF_PYTHON": str(fake_python),
+            "RLINF_COLLECT_PREFLIGHT_ONLY": "1",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(repo_path / "run_collect_data.sh"), "3"],
+        cwd=repo_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
