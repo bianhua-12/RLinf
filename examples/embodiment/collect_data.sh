@@ -18,12 +18,25 @@ else
     shift
 fi
 
-echo "Using Python at $(which python)"
+PYTHON_BIN="${RLINF_PYTHON:-${REPO_PATH}/.venv/bin/python}"
+if [[ "${PYTHON_BIN}" == */* ]]; then
+    if [[ ! -x "${PYTHON_BIN}" ]]; then
+        echo "Python interpreter is not executable: ${PYTHON_BIN}" >&2
+        exit 127
+    fi
+else
+    PYTHON_BIN="$(command -v "${PYTHON_BIN}")" || {
+        echo "Python interpreter not found: ${RLINF_PYTHON}" >&2
+        exit 127
+    }
+fi
+
+echo "Using Python at ${PYTHON_BIN}"
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')" #/$(date +'%Y%m%d-%H:%M:%S')"
 MEGA_LOG_FILE="${LOG_DIR}/run_embodiment.log"
 mkdir -p "${LOG_DIR}"
 CMD=(
-    python "${SRC_FILE}"
+    "${PYTHON_BIN}" "${SRC_FILE}"
     --config-path "${EMBODIED_PATH}/config/"
     --config-name "${CONFIG_NAME}"
     "$@"
