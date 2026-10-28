@@ -1,7 +1,7 @@
 # Completion cost for direct-gradient PickCube / 尽早完成的计分规则
 
-Status: implemented; 23 focused tests and Ruff passed. Task improvement requires
-native evaluation from a fresh controlled training run.
+Status: implemented and tested; the controlled run did not establish stable
+improvement. [Results and provenance](../../experiments/refl-completion-cost-20261028.md).
 
 ## Problem / 问题
 
@@ -92,3 +92,9 @@ multi-state batch. Existing native objective tests remain intact.
 Native reward parity diagnostics continue checking the unmodified environment
 oracle. Training objective curves now have a different scale and must not be
 compared numerically across rules; native task success is the acceptance measure.
+
+The completed trial reached92.38% selected but82.23% final versus91.99% for the
+native control. The score-order property is verified; a robust learning benefit
+is not. This rule remains experimental.
+
+计分顺序验证通过；实际训练最佳92.38%、最终82.23%，未证明稳健收益。
