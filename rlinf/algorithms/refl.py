@@ -58,11 +58,29 @@ def frozen_parameters(module):
             parameter.requires_grad_(flag)
 
 
-def imagined_objective(actor, dynamics, reward, start, horizon, gamma):
+def score_native_reward(native_reward, rule):
+    """Convert bounded native progress rewards into a versioned training score."""
+    if rule == "native":
+        return native_reward
+    if rule != "completion_cost_v1":
+        raise ValueError(f"Unknown ReFL reward rule: {rule}")
+    valid = torch.isfinite(native_reward) & (native_reward >= 0) & (native_reward <= 1)
+    if not valid.all():
+        raise ValueError("completion_cost_v1 requires native rewards in [0, 1]")
+    # Native success is exactly one; all unfinished PickCube states score below it.
+    # Squaring changes pre-success pathwise gradients; subtracting one alone cannot.
+    return native_reward.square() - 1
+
+
+def imagined_objective(
+    actor, dynamics, reward, start, horizon, gamma, reward_rule="native"
+):
     """Return discounted post-action rewards without a value bootstrap.
 
-    A terminal transition contributes its reward once. Subsequent states are
-    absorbing; the discrete success mask is deliberately detached.
+    Terminal states are absorbing with zero subsequent score. Native scoring
+    preserves the original objective. completion_cost_v1 charges unfinished
+    transitions r**2-1 and scores native success as zero. Hard success masks
+    remain detached; neither rule adds a value bootstrap.
     """
     if horizon < 1 or not 0 < gamma <= 1:
         raise ValueError("Expected a positive horizon and gamma in (0, 1]")
@@ -76,7 +94,8 @@ def imagined_objective(actor, dynamics, reward, start, horizon, gamma):
         action = actor(state)
         predicted = dynamics.step(state, action, **context)
         next_state = torch.where(alive[:, None].bool(), predicted, state)
-        total = total + gamma**step * alive * reward(next_state)
+        score = score_native_reward(reward(next_state), reward_rule)
+        total = total + gamma**step * alive * score
         alive = alive * (~reward.terminated(next_state).detach()).float()
         context = {
             "previous_state": state,

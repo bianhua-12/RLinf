@@ -51,6 +51,8 @@ def main():
         parser.error("collection_sampler must explicitly select bins or kir")
     if cfg.get("replay_backend") not in ("ring", "trajectory"):
         parser.error("replay_backend must explicitly select ring or trajectory")
+    if cfg.get("reward_rule") not in ("native", "completion_cost_v1"):
+        parser.error("reward_rule must explicitly select native or completion_cost_v1")
     if cfg["imagination_horizon"] != 13:
         parser.error("This PickCube migration preserves the H13 imagination contract")
     if cfg["wandb_mode"] not in ("online", "offline"):

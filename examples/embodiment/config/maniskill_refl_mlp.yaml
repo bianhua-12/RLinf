@@ -9,6 +9,7 @@ seed: 0
 precision: bf16
 collection_sampler: bins
 replay_backend: ring
+reward_rule: completion_cost_v1
 iterations: 20
 actor_updates_per_iteration: 10
 wm_updates_per_actor: 10

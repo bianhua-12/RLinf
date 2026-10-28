@@ -149,6 +149,7 @@ class ReFLActorWorker(Worker):
         return {
             "collection_sampler": self.cfg["collection_sampler"],
             "replay_backend": self.cfg["replay_backend"],
+            "reward_rule": self.cfg["reward_rule"],
             "kir_group_counts": getattr(self.sampler, "group_counts", None),
             "reward_source_sha256": self.oracle.provenance,
             "source_bank_valid_count": source_valid_count,
@@ -223,6 +224,7 @@ class ReFLActorWorker(Worker):
                     start,
                     self.cfg["imagination_horizon"],
                     self.cfg["gamma"],
+                    reward_rule=self.cfg["reward_rule"],
                 )
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 (-objective / self.cfg["imagination_horizon"]).backward()

@@ -26,6 +26,7 @@ from rlinf.algorithms.refl import (
     imagined_objective,
     isolated_rng,
     mixed_windows,
+    score_native_reward,
     validate_source_columns,
     world_model_batch,
 )
@@ -90,6 +91,115 @@ def test_terminal_reward_counts_once_and_no_bootstrap():
     assert objective.item() == pytest.approx(1.2)
     objective.backward()
     assert actor.weight.grad.item() == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize("horizon", [3, 13])
+def test_completion_cost_prefers_immediate_success_to_waiting(horizon):
+    class Schedule:
+        def __init__(self, delay):
+            self.delay, self.step_count = delay, 0
+
+        def step(self, state, action, **context):
+            done = self.step_count >= self.delay
+            self.step_count += 1
+            return state.new_tensor([1.0 if done else 0.55, float(done)]).expand_as(
+                state
+            )
+
+    class ScheduledReward:
+        def __call__(self, state):
+            return state[:, 0]
+
+        def terminated(self, state):
+            return state[:, 1].bool()
+
+    initial = {k: torch.zeros(1, 4, 2) for k in start()}
+
+    def actor(state):
+        return torch.zeros_like(state[:, :1])
+
+    values = [
+        imagined_objective(
+            actor,
+            Schedule(delay),
+            ScheduledReward(),
+            initial,
+            horizon,
+            0.8,
+            "completion_cost_v1",
+        ).item()
+        for delay in [0, 1, 2, horizon]
+    ]
+    assert values[0] == 0.0
+    assert all(a > b for a, b in zip(values, values[1:]))
+    old = [
+        imagined_objective(
+            actor, Schedule(delay), ScheduledReward(), initial, horizon, 0.8
+        ).item()
+        for delay in [0, 1]
+    ]
+    assert old == pytest.approx([1.0, 1.35])
+
+
+def test_completion_cost_changes_gradient_not_only_displayed_score():
+    class Dynamics:
+        def step(self, state, action, **context):
+            return state + torch.cat([action, torch.zeros_like(action)], -1)
+
+    class SumReward:
+        def __init__(self, offset=0.0):
+            self.offset = offset
+
+        def __call__(self, state):
+            return state.sum(-1) + self.offset
+
+        def terminated(self, state):
+            return torch.zeros(len(state), dtype=torch.bool)
+
+    actor = nn.Linear(2, 1, bias=False)
+    actor.weight.data.fill_(0.1)
+    initial = {k: torch.tensor([[[0.2, 0.0], [0.0, 0.6]]]) for k in start()}
+
+    def objective(rule="native", offset=0.0):
+        return imagined_objective(
+            actor, Dynamics(), SumReward(offset), initial, 1, 0.8, rule
+        )
+
+    native_gradient = torch.autograd.grad(objective(), actor.weight)[0]
+    shifted_gradient = torch.autograd.grad(objective(offset=-1), actor.weight)[0]
+    cost_gradient = torch.autograd.grad(objective("completion_cost_v1"), actor.weight)[
+        0
+    ]
+    torch.testing.assert_close(shifted_gradient, native_gradient)
+    assert not torch.allclose(
+        cost_gradient / cost_gradient.norm(), native_gradient / native_gradient.norm()
+    )
+    for i in range(2):
+        with torch.no_grad():
+            actor.weight[0, i] += 1e-3
+            plus = objective("completion_cost_v1")
+            actor.weight[0, i] -= 2e-3
+            minus = objective("completion_cost_v1")
+            actor.weight[0, i] += 1e-3
+        assert cost_gradient[0, i].item() == pytest.approx(
+            ((plus - minus) / 2e-3).item(), rel=2e-3, abs=1e-4
+        )
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, float("nan")])
+def test_completion_cost_rejects_invalid_native_score(value):
+    with pytest.raises(ValueError, match="native rewards in"):
+        score_native_reward(torch.tensor([value]), "completion_cost_v1")
+
+
+def test_completion_cost_is_bounded_and_improves_with_progress():
+    rewards = torch.tensor([0.0, 0.2, 0.55, 0.8, 1.0])
+    scores = score_native_reward(rewards, "completion_cost_v1")
+    assert ((scores >= -1) & (scores <= 0)).all()
+    assert (scores[1:] > scores[:-1]).all()
+    assert scores[-1] == 0
+    with pytest.raises(ValueError, match="Unknown"):
+        score_native_reward(rewards, "unknown")
 
 
 def test_freeze_restores_flags_on_exception():
