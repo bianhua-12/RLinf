@@ -1,6 +1,7 @@
 # Restore replay before comparing collection samplers / 恢复 replay 后比较采集器
 
-Status: implemented; 16 focused CPU tests pass. Controlled GPU results pending.
+Status: implemented; 16 focused CPU tests and two controlled GPU runs completed.
+[Results and provenance](../../experiments/refl-replay-sampler-20261028.md).
 
 ## Problem / 问题
 
@@ -89,8 +90,9 @@ Sixteen tests passed in the requested image, including ring wraparound, terminal
 target retention, executed/clean-action alignment, fixed-window boundaries,
 BinSampler held-out isolation, and RNG restoration after an exception. The
 copied eight classes/functions/dataclasses pass normalized AST equality checks.
-Independent review and GPU results are recorded separately before claiming
-recovery of the historical success rate. Exact training resume remains unsupported.
+Independent review passed. The two GPU runs reached91.99% (BinSampler) and90.43%
+(KIR) selected native success; this is partial recovery, not full reproduction
+of the historical93.75% no-RM result. Exact training resume remains unsupported.
 
 Implementation: [replay](../../../rlinf/data/refl_replay.py),
 [samplers](../../../rlinf/envs/sim/maniskill/refl_pickcube.py),
