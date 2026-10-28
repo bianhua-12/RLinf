@@ -47,6 +47,10 @@ def main():
             parser.error(f"{field} must be a positive integer")
     if cfg["batch_size"] % 2:
         parser.error("batch_size must be even")
+    if cfg.get("collection_sampler") not in ("bins", "kir"):
+        parser.error("collection_sampler must explicitly select bins or kir")
+    if cfg.get("replay_backend") not in ("ring", "trajectory"):
+        parser.error("replay_backend must explicitly select ring or trajectory")
     if cfg["imagination_horizon"] != 13:
         parser.error("This PickCube migration preserves the H13 imagination contract")
     if cfg["wandb_mode"] not in ("online", "offline"):

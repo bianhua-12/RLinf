@@ -176,6 +176,7 @@ jobs:
               - 'tests/e2e_tests/offline_rl/**'
               - '.github/workflows/offline_rl-e2e-tests.yml'
             unit_test_filter: &unit
+              - 'rlinf/data/refl_replay.py'
               - 'rlinf/algorithms/refl.py'
               - 'rlinf/models/embodiment/refl_pickcube.py'
               - 'rlinf/workers/actor/refl_actor_worker.py'

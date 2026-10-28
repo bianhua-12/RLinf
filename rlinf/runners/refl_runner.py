@@ -85,8 +85,13 @@ def prepare_run(config, repository):
         raise ValueError("Run output must be outside the source checkout")
     if not config.get("container_image"):
         raise ValueError("An explicit execution container image identity is required")
-    if set(config["inputs"]) != {"actor", "world_model", "dataset", "bank"}:
-        raise ValueError("Expected actor, world_model, dataset and bank inputs")
+    if set(config["inputs"]) not in (
+        {"actor", "world_model", "dataset", "bank"},
+        {"actor", "world_model", "dataset", "bank", "bank_mask"},
+    ):
+        raise ValueError(
+            "Expected actor, world_model, dataset, bank and optional bank_mask inputs"
+        )
     for name, item in config["inputs"].items():
         if not all(item.get(k) for k in ("path", "sha256", "version", "protocol")):
             raise ValueError(f"Missing input identity fields for {name}")

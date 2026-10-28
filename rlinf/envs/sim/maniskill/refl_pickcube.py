@@ -373,3 +373,59 @@ class KIRSampler:
         # KIR deliberately keeps the phase mixture fixed; it does not turn into
         # a return-bin sampler after policy performance changes.
         return None
+
+
+class BinSampler:
+    """One-second bins; native discounted return, fixed Gmax=1/(1-gamma).
+
+    A bin refers to time within each source environment's reference trajectory.
+    Environment source IDs never cross the training/validation partition.
+    """
+
+    def __init__(self, valid, frame_times, gamma=0.99):
+        self.valid, self.times, self.gamma = valid, frame_times, gamma
+        self.bins = (frame_times // 20).long()
+        self.nbins = int(self.bins.max()) + 1
+        self.returns = torch.zeros(self.nbins, valid.shape[1], device=valid.device)
+        self.memory = torch.ones_like(self.returns)
+        self.available = torch.stack(
+            [valid[self.bins == b].any(0) for b in range(self.nbins)]
+        )
+        if not self.available.any(0).all():
+            raise ValueError("An environment has no restorable reference frames")
+        self.last = {}
+
+    def weights(self):
+        uniform = self.available.float() / self.available.sum(0)
+        logits = -25 * self.returns * (1 - self.gamma)
+        hard = torch.softmax(logits.masked_fill(~self.available, -torch.inf), dim=0)
+        hist = self.memory * self.available
+        hist = hist / hist.sum(0).clamp_min(1e-12)
+        return 0.5 * uniform + 0.4 * hard + 0.1 * hist, hard
+
+    def sample(self, generator=None, adaptive=True):
+        w, hard = self.weights()
+        if not adaptive:
+            w = self.available.float() / self.available.sum(0)
+        selected = torch.multinomial(w.T, 1, generator=generator).squeeze(-1)
+        eligible = self.valid & (self.bins[:, None] == selected[None])
+        frames = torch.multinomial(eligible.T.float(), 1, generator=generator).squeeze(
+            -1
+        )
+        self.last = {
+            "bin_ids": selected,
+            "frames": frames,
+            "probabilities": w,
+            "hard": hard,
+        }
+        return frames, selected
+
+    def update(self, bin_ids, returns, env_mask=None):
+        _, hard = self.weights()
+        ids = torch.arange(self.valid.shape[1], device=self.valid.device)
+        if env_mask is not None:
+            ids = ids[env_mask]
+        b = bin_ids[ids]
+        self.returns[b, ids] = 0.8 * self.returns[b, ids] + 0.2 * returns[ids]
+        # Keep validation environments' historical weights untouched.
+        self.memory[:, ids] = 0.9 * self.memory[:, ids] + 0.1 * hard[:, ids]

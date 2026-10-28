@@ -24,10 +24,12 @@ from rlinf.algorithms.refl import (
     TransitionWindows,
     frozen_parameters,
     imagined_objective,
+    isolated_rng,
     mixed_windows,
     validate_source_columns,
     world_model_batch,
 )
+from rlinf.data.refl_replay import ReplayBuffer, Windows, record_online
 from rlinf.runners.refl_runner import assert_clean_source
 
 
@@ -180,6 +182,81 @@ def test_source_identity_rejects_column_permutation():
     validate_source_columns(columns, 4)
     with pytest.raises(ValueError, match="declared split"):
         validate_source_columns(columns[:, [0, 2, 1, 3]], 4)
+
+
+def test_diagnostics_and_evaluation_do_not_advance_training_rng():
+    import random
+
+    import numpy as np
+
+    data = transitions()
+    windows = TransitionWindows(data, torch.tensor([0]), 3)
+    generator = torch.Generator().manual_seed(31000)
+    torch_state = torch.get_rng_state().clone()
+    windows.sample(512, generator)
+    torch.testing.assert_close(torch.get_rng_state(), torch_state, rtol=0, atol=0)
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    with pytest.raises(RuntimeError), isolated_rng("cpu"):
+        torch.rand(100)
+        random.random()
+        np.random.random(100)
+        raise RuntimeError("evaluation interrupted")
+    torch.testing.assert_close(torch.get_rng_state(), torch_state, rtol=0, atol=0)
+    assert random.getstate() == python_state
+    np.testing.assert_equal(np.random.get_state(), numpy_state)
+
+
+def test_original_ring_preserves_executed_actions_and_terminal_states():
+    data = transitions()
+    for t in range(6):
+        data["state"][t, :, 0] = torch.tensor([t, 100 + t])
+        data["next_state"][t] = data["state"][t] + 1
+        data["action"][t] = data["state"][t, :, :1]
+    data["clean_action"] = -data["action"]
+    data["reward"] = torch.zeros(6, 2)
+    data["terminated"][2, 0] = True
+    data["alive"][3:, 0] = False
+    data["truncated"][5, 1] = True
+    data["reset"][0] = True
+    replay = ReplayBuffer(2, 6, 48, 8, 57, "cpu")
+    record_online(replay, data, torch.arange(2))
+    assert replay.window_mask(3)[0, 0]
+    batch = replay.sample_windows(512, 3)
+    torch.testing.assert_close(batch.states[1:, :, 0], batch.states[:-1, :, 0] + 1)
+    torch.testing.assert_close(batch.a_exec[:, :, 0], batch.states[:-1, :, 0])
+    torch.testing.assert_close(batch.a_clean, -batch.a_exec)
+    torch.testing.assert_close(batch.done.bool(), batch.states[1:, :, 0] == 3)
+    starts = replay.sample_starts(256, 1)
+    assert not torch.isin(starts.state[:, 0], torch.tensor([3.0, 106.0])).any()
+    assert (batch.states[-1, :, 0] == 3).any()
+    assert (batch.states[-1, :, 0] == 106).any()
+
+
+def test_original_fixed_windows_include_terminal_target_not_reset_crossing():
+    data = transitions()
+    data["terminated"][2, 0] = True
+    windows = Windows(data, torch.tensor([0]), 3)
+    assert windows.starts.tolist() == [0, 3]
+
+
+def test_bin_sampler_adapts_training_columns_only():
+    pytest.importorskip("mani_skill")
+    from rlinf.envs.sim.maniskill.refl_pickcube import BinSampler
+
+    valid = torch.ones(3, 4, dtype=torch.bool)
+    valid[2, 0] = False
+    sampler = BinSampler(valid, torch.tensor([0, 20, 40]), gamma=0.99)
+    weights, _ = sampler.weights()
+    torch.testing.assert_close(weights.sum(0), torch.ones(4))
+    assert weights[2, 0] == 0
+    sampler.update(
+        torch.ones(4, dtype=torch.long),
+        torch.ones(4) * 50,
+        torch.tensor([True, False, True, False]),
+    )
+    updated, _ = sampler.weights()
+    torch.testing.assert_close(updated[:, [1, 3]], weights[:, [1, 3]])
+    assert (updated[1, [0, 2]] < weights[1, [0, 2]]).all()
 
 
 def test_provenance_rejects_dirty_ignored_and_wrong_commit(tmp_path):

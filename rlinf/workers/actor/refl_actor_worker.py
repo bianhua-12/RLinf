@@ -14,6 +14,7 @@
 
 """Colocated policy, differentiable dynamics, and native PickCube collection."""
 
+import hashlib
 from collections import deque
 from pathlib import Path
 
@@ -23,9 +24,18 @@ from rlinf.algorithms.refl import (
     TransitionWindows,
     frozen_parameters,
     imagined_objective,
+    isolated_rng,
     mixed_windows,
+    ring_start_dict,
     validate_source_columns,
     world_model_batch,
+)
+from rlinf.data.refl_replay import (
+    MixedReplay,
+    ReplayBuffer,
+    WarmupReplay,
+    Windows,
+    record_online,
 )
 from rlinf.scheduler import Worker
 
@@ -39,6 +49,7 @@ class ReFLActorWorker(Worker):
 
     def initialize(self):
         from rlinf.envs.sim.maniskill.refl_pickcube import (
+            BinSampler,
             KIRSampler,
             NativeRewardOracle,
             make_env,
@@ -59,6 +70,7 @@ class ReFLActorWorker(Worker):
         ):
             raise ValueError("Worker imported a different RLinf checkout")
         torch.manual_seed(self.cfg["seed"])
+        torch.set_float32_matmul_precision("highest")
         self.torch_platform.manual_seed_all(self.cfg["seed"])
         self.device = torch.device("cuda", self.torch_platform.current_device())
         self.root = Path(self.cfg["output_dir"])
@@ -89,28 +101,64 @@ class ReFLActorWorker(Worker):
         self.train_ids = torch.arange(3584, device=self.device)
         self.val_ids = torch.arange(3584, 3840, device=self.device)
         validate_source_columns(packed["data"]["source_env"], 4096)
-        self.fixed = TransitionWindows(packed["data"], self.train_ids, 3)
-        self.fixed_val = TransitionWindows(packed["data"], self.val_ids, 3).sample(512)
+        self.ring = self.cfg["replay_backend"] == "ring"
+        self.fixed = (Windows if self.ring else TransitionWindows)(
+            packed["data"], self.train_ids, 3
+        )
+        self.diagnostic_generator = torch.Generator(device=self.device).manual_seed(
+            31000
+        )
+        self.fixed_val = TransitionWindows(packed["data"], self.val_ids, 3).sample(
+            512, self.diagnostic_generator
+        )
         self.bank = self.inputs["bank"]
         if tuple(self.bank["observations"].shape[1:]) != (4096, 42):
             raise ValueError("Expected the original 4096-environment state42 bank")
-        self.online = deque(maxlen=self.cfg["online_iterations"])
+        if self.ring:
+            self.replay = ReplayBuffer(3584, 1000, 48, 8, 57, self.device)
+            self.mixed_replay = MixedReplay(WarmupReplay(self.fixed), self.replay)
+        else:
+            self.online = deque(maxlen=self.cfg["online_iterations"])
         self.oracle = NativeRewardOracle()
         self.env = make_env("PickCube-v1", 4096)
         self.evaluation = make_env("PickCube-v1", 128)
         source_valid_count = int(self.bank["valid"].sum())
         self.bank = dict(self.bank)
-        self.bank["valid"] = validate_reference_bank(self.env, self.bank)
+        if "bank_mask" in self.inputs:
+            mask = self.inputs["bank_mask"]
+            if (
+                mask.dtype != torch.bool
+                or mask.shape != self.bank["valid"].shape
+                or (mask & ~self.bank["valid"]).any()
+                or not mask.any(0).all()
+            ):
+                raise ValueError(
+                    "Cached bank validity mask is incompatible with source bank"
+                )
+            self.bank["valid"] = mask
+        else:
+            with isolated_rng(self.device):
+                self.bank["valid"] = validate_reference_bank(self.env, self.bank)
         torch.save(self.bank["valid"].cpu(), self.root / "runtime_bank_valid.pt")
-        self.sampler = KIRSampler(self.bank)
+        self.sampler = (
+            BinSampler(self.bank["valid"], self.bank["times"], gamma=0.99)
+            if self.cfg["collection_sampler"] == "bins"
+            else KIRSampler(self.bank)
+        )
         self.save_checkpoint("initial.pt")
         return {
-            "kir_group_counts": self.sampler.group_counts,
+            "collection_sampler": self.cfg["collection_sampler"],
+            "replay_backend": self.cfg["replay_backend"],
+            "kir_group_counts": getattr(self.sampler, "group_counts", None),
             "reward_source_sha256": self.oracle.provenance,
             "source_bank_valid_count": source_valid_count,
             "runtime_bank_valid_count": int(self.bank["valid"].sum()),
             "reward_model_parameters": 0,
             "critic_parameters": 0,
+            "initial_training_rng_sha256": hashlib.sha256(
+                torch.get_rng_state().cpu().numpy().tobytes()
+                + self.torch_platform.get_rng_state().cpu().numpy().tobytes()
+            ).hexdigest(),
         }
 
     def train_iteration(self):
@@ -136,15 +184,24 @@ class ReFLActorWorker(Worker):
                 self.oracle.terminated(truth), native_done
             ):
                 raise ValueError("Native state reward/termination parity failed")
-        self.online.append(data)
-        merged = {k: torch.cat([chunk[k] for chunk in self.online]) for k in data}
-        online = TransitionWindows(merged, self.train_ids, 3)
-        actor_starts = TransitionWindows(merged, self.train_ids, 1)
+        if self.ring:
+            record_online(self.replay, data, self.train_ids)
+        else:
+            self.online.append(data)
+            merged = {k: torch.cat([chunk[k] for chunk in self.online]) for k in data}
+            online = TransitionWindows(merged, self.train_ids, 3)
+            actor_starts = TransitionWindows(merged, self.train_ids, 1)
         batch_size = self.cfg["batch_size"]
         for _ in range(self.cfg["actor_updates_per_iteration"]):
             for _ in range(self.cfg["wm_updates_per_actor"]):
-                batch = mixed_windows(self.fixed, online, batch_size)
-                loss, _ = self.wm.replay_loss(world_model_batch(batch))
+                batch = (
+                    self.mixed_replay.sample_windows(batch_size, 3)
+                    if self.ring
+                    else world_model_batch(
+                        mixed_windows(self.fixed, online, batch_size)
+                    )
+                )
+                loss, _ = self.wm.replay_loss(batch)
                 self.wm_optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 wm_norm = torch.nn.utils.clip_grad_norm_(
@@ -153,7 +210,11 @@ class ReFLActorWorker(Worker):
                 self.wm_optimizer.step()
                 self.wm_updates += 1
             self.wm_optimizer.zero_grad(set_to_none=True)
-            start = actor_starts.sample(batch_size)
+            start = (
+                ring_start_dict(self.replay.sample_starts(batch_size, 1))
+                if self.ring
+                else actor_starts.sample(batch_size)
+            )
             with frozen_parameters(self.wm):
                 objective = imagined_objective(
                     self.actor,
@@ -190,7 +251,10 @@ class ReFLActorWorker(Worker):
             **{"collection/" + key: value for key, value in collection.items()},
             **self.wm_diagnostics(self.fixed_val, "fixed_val"),
             **self.wm_diagnostics(
-                TransitionWindows(data, self.val_ids, 3).sample(512), "current_val"
+                TransitionWindows(data, self.val_ids, 3).sample(
+                    512, self.diagnostic_generator
+                ),
+                "current_val",
             ),
         }
         self.save_checkpoint("latest.pt")
@@ -264,6 +328,10 @@ class ReFLActorWorker(Worker):
         temporary.replace(destination)
 
     def evaluate(self, checkpoint=None, seed=30000):
+        with isolated_rng(self.device):
+            return self._evaluate(checkpoint, seed)
+
+    def _evaluate(self, checkpoint=None, seed=30000):
         from rlinf.envs.sim.maniskill.refl_pickcube import evaluate_policy
         from rlinf.models.embodiment.refl_pickcube import (
             SingleActor,

@@ -1,5 +1,8 @@
 # PickCube ReFL through a physical world model / PickCube 世界模型梯度直传
 
+This note records the initial85c61ed5 implementation. The current default replay
+and sampler follow the [restoration decision](refl-replay-sampler-ablation.md).
+
 Status: implemented and validated in one native GPU run. See the
 [execution evidence](../../experiments/refl-pickcube-20261028.md) for the clean
 commit, independent success rates, W&B verification and TOS archive.

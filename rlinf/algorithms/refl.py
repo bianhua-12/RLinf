@@ -14,10 +14,36 @@
 
 """Direct policy gradients through learned dynamics and a state reward function."""
 
+import random
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import numpy as np
 import torch
+
+
+@contextmanager
+def isolated_rng(device):
+    """Keep validation and checkpoint probes out of the training RNG stream."""
+    device = torch.device(device)
+    devices = [] if device.type == "cpu" else [device.index]
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    try:
+        with torch.random.fork_rng(devices=devices, device_type=device.type):
+            yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+
+
+def ring_start_dict(start):
+    """Adapt an original ring start without resampling or changing its context."""
+    return {
+        "state": start.state[None],
+        "previous_state": start.xi[None, :, :48],
+        "previous_action": start.xi[None, :, 48:56],
+        "reset": start.xi[None, :, 56],
+    }
 
 
 @contextmanager
