@@ -15,23 +15,24 @@
 """Colocated policy, differentiable dynamics, and native PickCube collection."""
 
 import hashlib
-from collections import deque
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 
 from rlinf.algorithms.refl import (
     TransitionWindows,
-    bootstrapped_lambda_targets,
     checkpoint_uses_critic,
-    frozen_parameters,
-    imagined_objective,
     isolated_rng,
-    mixed_windows,
-    ring_start_dict,
     validate_source_columns,
-    world_model_batch,
+)
+from rlinf.algorithms.refl_maniskill import (
+    NativeRewardModule,
+    PolicyTrainer,
+    PolicyTrainerCfg,
+    SingleImagination,
+    SingleModel,
+    WMTrainerCfg,
+    WorldModelTrainer,
 )
 from rlinf.data.refl_replay import (
     MixedReplay,
@@ -54,10 +55,8 @@ class ReFLActorWorker(Worker):
     def initialize(self):
         from rlinf.envs.sim.maniskill.refl_pickcube import (
             BinSampler,
-            KIRSampler,
             NativeRewardOracle,
             make_env,
-            validate_reference_bank,
         )
         from rlinf.models.embodiment.refl_pickcube import (
             SingleActor,
@@ -87,30 +86,63 @@ class ReFLActorWorker(Worker):
         if warm.get("format") != "single-pickcube-ppo-warmstart-v1":
             raise ValueError("Expected the PPO790 warmstart format")
         validate_warmstart(warm, self.cfg["gamma"])
+        self.oracle = NativeRewardOracle()
+        self.wm = load_world_model(self.inputs["world_model"], self.device)
         self.actor = SingleActor().to(self.device)
         self.actor.net.load_state_dict(warm["actor_mean"], strict=True)
-        self.wm = load_world_model(self.inputs["world_model"], self.device)
-        set_precision(self.actor, self.cfg["precision"])
-        set_precision(self.wm, self.cfg["precision"])
-        self.actor_optimizer = torch.optim.Adam(
-            self.actor.parameters(), lr=self.cfg["actor_lr"], betas=(0.9, 0.95)
-        )
-        self.wm_optimizer = torch.optim.Adam(self.wm.parameters(), lr=self.cfg["wm_lr"])
-        self.critic = self.critic_optimizer = None
+        self.critic = None
         if self.cfg["use_critic"]:
-            with isolated_rng(self.device):
-                self.critic = SingleCritic().to(self.device)
-                self.critic.net.load_state_dict(warm["critic"], strict=True)
-                set_precision(self.critic, self.cfg["precision"])
-            self.critic_optimizer = torch.optim.Adam(
-                self.critic.parameters(), lr=self.cfg["critic_lr"]
-            )
+            self.critic = SingleCritic().to(self.device)
+            self.critic.net.load_state_dict(warm["critic"], strict=True)
             self.initial_critic = {
                 k: p.detach().clone() for k, p in self.critic.named_parameters()
             }
-            self.critic_generator = torch.Generator(device=self.device).manual_seed(
-                41000 + self.cfg["seed"]
-            )
+        self.model = SingleModel(self.wm, NativeRewardModule(self.oracle))
+        self.imagination = SingleImagination(
+            self.model, self.actor, self.oracle.terminated
+        )
+        policy_cfg = PolicyTrainerCfg(
+            horizon=self.cfg["imagination_horizon"],
+            batch_size=self.cfg["batch_size"],
+            history=1,
+            gamma=self.cfg["gamma"],
+            gae_lambda=self.cfg["critic_gae_lambda"],
+            lr=self.cfg["actor_lr"],
+            critic_lr=self.cfg["critic_lr"],
+            use_critic=self.cfg["use_critic"],
+            critic_epochs=self.cfg["critic_epochs"] if self.cfg["use_critic"] else 0,
+            critic_minibatches=self.cfg["critic_minibatches"]
+            if self.cfg["use_critic"]
+            else 0,
+            obs_noise=False,
+            compile=None,
+        )
+        self.policy_trainer = PolicyTrainer(
+            self.model,
+            self.actor,
+            self.critic,
+            None,
+            policy_cfg,
+            rollout_fn=self.imagination,
+            critic_inputs_fn=self.imagination.critic_inputs,
+        )
+        wm_cfg = WMTrainerCfg(
+            window=3,
+            batches_per_update=self.cfg["wm_updates_per_actor"],
+            batch_size=self.cfg["batch_size"],
+            lr=self.cfg["wm_lr"],
+            compile=None,
+        )
+        self.wm_trainer = WorldModelTrainer(
+            self.wm, None, wm_cfg, loss_fn=self.wm.replay_loss
+        )
+        self.actor_optimizer = self.policy_trainer.opt
+        self.critic_optimizer = self.policy_trainer.critic_opt
+        self.wm_optimizer = self.wm_trainer.opt
+        for module in [self.model, self.actor] + (
+            [self.critic] if self.critic is not None else []
+        ):
+            set_precision(module, self.cfg["precision"])
         packed = self.inputs["dataset"]
         if packed["coverage"].get("splits") != {
             "train": [0, 3583],
@@ -121,10 +153,7 @@ class ReFLActorWorker(Worker):
         self.train_ids = torch.arange(3584, device=self.device)
         self.val_ids = torch.arange(3584, 3840, device=self.device)
         validate_source_columns(packed["data"]["source_env"], 4096)
-        self.ring = self.cfg["replay_backend"] == "ring"
-        self.fixed = (Windows if self.ring else TransitionWindows)(
-            packed["data"], self.train_ids, 3
-        )
+        self.fixed = Windows(packed["data"], self.train_ids, 3)
         self.diagnostic_generator = torch.Generator(device=self.device).manual_seed(
             31000
         )
@@ -134,37 +163,15 @@ class ReFLActorWorker(Worker):
         self.bank = self.inputs["bank"]
         if tuple(self.bank["observations"].shape[1:]) != (4096, 42):
             raise ValueError("Expected the original 4096-environment state42 bank")
-        if self.ring:
-            self.replay = ReplayBuffer(3584, 1000, 48, 8, 57, self.device)
-            self.mixed_replay = MixedReplay(WarmupReplay(self.fixed), self.replay)
-        else:
-            self.online = deque(maxlen=self.cfg["online_iterations"])
-        self.oracle = NativeRewardOracle()
+        self.replay = ReplayBuffer(3584, 1000, 48, 8, 57, self.device)
+        self.mixed_replay = MixedReplay(WarmupReplay(self.fixed), self.replay)
         self.env = make_env("PickCube-v1", 4096)
         self.evaluation = make_env("PickCube-v1", 128)
         source_valid_count = int(self.bank["valid"].sum())
-        self.bank = dict(self.bank)
         if "bank_mask" in self.inputs:
-            mask = self.inputs["bank_mask"]
-            if (
-                mask.dtype != torch.bool
-                or mask.shape != self.bank["valid"].shape
-                or (mask & ~self.bank["valid"]).any()
-                or not mask.any(0).all()
-            ):
-                raise ValueError(
-                    "Cached bank validity mask is incompatible with source bank"
-                )
-            self.bank["valid"] = mask
-        else:
-            with isolated_rng(self.device):
-                self.bank["valid"] = validate_reference_bank(self.env, self.bank)
+            raise ValueError("ManiSkill alignment uses the original source bank mask")
+        self.sampler = BinSampler(self.bank["valid"], self.bank["times"], gamma=0.99)
         torch.save(self.bank["valid"].cpu(), self.root / "runtime_bank_valid.pt")
-        self.sampler = (
-            BinSampler(self.bank["valid"], self.bank["times"], gamma=0.99)
-            if self.cfg["collection_sampler"] == "bins"
-            else KIRSampler(self.bank)
-        )
         self.save_checkpoint("initial.pt")
         return {
             "collection_sampler": self.cfg["collection_sampler"],
@@ -173,7 +180,8 @@ class ReFLActorWorker(Worker):
             "kir_group_counts": getattr(self.sampler, "group_counts", None),
             "reward_source_sha256": self.oracle.provenance,
             "source_bank_valid_count": source_valid_count,
-            "runtime_bank_valid_count": int(self.bank["valid"].sum()),
+            "training_bank_valid_count": int(self.bank["valid"].sum()),
+            "bank_validity": "source",
             "reward_model_parameters": 0,
             "critic_parameters": sum(p.numel() for p in self.critic.parameters())
             if self.critic is not None
@@ -207,96 +215,46 @@ class ReFLActorWorker(Worker):
                 self.oracle.terminated(truth), native_done
             ):
                 raise ValueError("Native state reward/termination parity failed")
-        if self.ring:
-            record_online(self.replay, data, self.train_ids)
-        else:
-            self.online.append(data)
-            merged = {k: torch.cat([chunk[k] for chunk in self.online]) for k in data}
-            online = TransitionWindows(merged, self.train_ids, 3)
-            actor_starts = TransitionWindows(merged, self.train_ids, 1)
-        batch_size = self.cfg["batch_size"]
+        record_online(self.replay, data, self.train_ids)
         for _ in range(self.cfg["actor_updates_per_iteration"]):
-            for _ in range(self.cfg["wm_updates_per_actor"]):
-                batch = (
-                    self.mixed_replay.sample_windows(batch_size, 3)
-                    if self.ring
-                    else world_model_batch(
-                        mixed_windows(self.fixed, online, batch_size)
-                    )
-                )
-                loss, _ = self.wm.replay_loss(batch)
-                self.wm_optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                wm_norm = torch.nn.utils.clip_grad_norm_(
-                    self.wm.parameters(), 1.0, error_if_nonfinite=True
-                )
-                self.wm_optimizer.step()
-                self.wm_updates += 1
-            self.wm_optimizer.zero_grad(set_to_none=True)
-            start = (
-                ring_start_dict(self.replay.sample_starts(batch_size, 1))
-                if self.ring
-                else actor_starts.sample(batch_size)
-            )
-            if self.critic_optimizer is not None:
-                self.critic_optimizer.zero_grad(set_to_none=True)
-            with (
-                frozen_parameters(self.wm),
-                (
-                    frozen_parameters(self.critic)
-                    if self.critic is not None
-                    else nullcontext()
-                ),
-            ):
-                result = imagined_objective(
-                    self.actor,
-                    self.wm,
-                    self.oracle,
-                    start,
-                    self.cfg["imagination_horizon"],
-                    self.cfg["gamma"],
-                    reward_rule=self.cfg["reward_rule"],
-                    critic=self.critic,
-                    return_rollout=self.critic is not None,
-                )
-                if self.critic is not None:
-                    objective, trajectory = result
-                    bootstrap = float(trajectory.bootstrap.detach())
-                else:
-                    objective, bootstrap = result, 0.0
-                self.actor_optimizer.zero_grad(set_to_none=True)
-                (-objective / self.cfg["imagination_horizon"]).backward()
-                actor_norm = torch.nn.utils.clip_grad_norm_(
-                    self.actor.parameters(), 1.0, error_if_nonfinite=True
-                )
-                if not float(actor_norm) > 0:
-                    raise ValueError("Policy gradient through WM is zero")
-                if any(p.grad is not None for p in self.wm.parameters()):
-                    raise ValueError("Actor update accumulated world-model gradients")
-                if self.critic is not None and any(
-                    p.grad is not None for p in self.critic.parameters()
-                ):
-                    raise ValueError(
-                        "Actor update accumulated critic parameter gradients"
-                    )
-                torch.nn.utils.clip_grad_value_(self.actor.parameters(), 0.1)
-                self.actor_optimizer.step()
+            wm_metrics = self.wm_trainer.update(self.mixed_replay)
+            self.wm_updates += self.cfg["wm_updates_per_actor"]
+            actor_metrics = self.policy_trainer.update(self.replay)
             self.actor_updates += 1
-            critic_metrics = (
-                self._fit_critic(trajectory) if self.critic is not None else {}
-            )
+            if self.critic is not None:
+                self.critic_updates += (
+                    self.cfg["critic_epochs"] * self.cfg["critic_minibatches"]
+                )
+        critic_metrics = {}
+        if self.critic is not None:
+            delta = sum(
+                (p.detach() - self.initial_critic[k]).square().sum()
+                for k, p in self.critic.named_parameters()
+            ).sqrt()
+            grad_norm = sum(
+                p.grad.detach().square().sum()
+                for p in self.critic.parameters()
+                if p.grad is not None
+            ).sqrt()
+            critic_metrics = {
+                "critic/loss": actor_metrics["critic_loss"],
+                "critic/gradient_norm": float(grad_norm),
+                "critic/parameter_delta_l2": float(delta),
+                "critic/value_mean": actor_metrics["critic_value_mean"],
+                "critic/target_mean": actor_metrics["critic_target_mean"],
+            }
         result = {
             "iteration": self.iteration,
             "updates/actor": self.actor_updates,
             "updates/wm": self.wm_updates,
             "updates/rm": 0,
             "updates/critic": self.critic_updates,
-            "actor/bootstrap": bootstrap,
+            "actor/bootstrap": actor_metrics["imag_bootstrap"],
             **critic_metrics,
-            "actor/gradient_norm": float(actor_norm),
-            "actor/imagined_objective": float(objective.detach()),
-            "wm/loss": float(loss.detach()),
-            "wm/gradient_norm": float(wm_norm),
+            "actor/gradient_norm": actor_metrics["policy_grad_norm"],
+            "actor/imagined_objective": actor_metrics["imag_objective"],
+            "wm/loss": wm_metrics["loss"],
+            "wm/gradient_norm": wm_metrics["grad_norm"],
             "reward/native_parity_max": parity,
             **{"collection/" + key: value for key, value in collection.items()},
             **self.wm_diagnostics(self.fixed_val, "fixed_val"),
@@ -309,48 +267,6 @@ class ReFLActorWorker(Worker):
         }
         self.save_checkpoint("latest.pt")
         return result
-
-    def _fit_critic(self, rollout):
-        with torch.no_grad():
-            states = rollout.states.detach()
-            values = self.critic(states)
-            targets = bootstrapped_lambda_targets(
-                rollout.rewards.detach(),
-                rollout.stops,
-                values,
-                self.cfg["gamma"],
-                self.cfg["critic_gae_lambda"],
-            )
-            active = rollout.active.bool()
-            inputs, targets = states[:-1][active], targets[active]
-        n = len(inputs)
-        if n < self.cfg["critic_minibatches"]:
-            raise ValueError("Insufficient live critic samples")
-        for _ in range(self.cfg["critic_epochs"]):
-            order = torch.randperm(
-                n, device=self.device, generator=self.critic_generator
-            )
-            for ids in order.tensor_split(self.cfg["critic_minibatches"]):
-                prediction = self.critic(inputs[ids])
-                loss = torch.nn.functional.mse_loss(prediction, targets[ids])
-                self.critic_optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.critic.parameters(), 1.0, error_if_nonfinite=True
-                )
-                self.critic_optimizer.step()
-                self.critic_updates += 1
-        delta = sum(
-            (p.detach() - self.initial_critic[k]).square().sum()
-            for k, p in self.critic.named_parameters()
-        ).sqrt()
-        return {
-            "critic/loss": float(loss.detach()),
-            "critic/gradient_norm": float(grad_norm),
-            "critic/target_mean": float(targets.mean()),
-            "critic/live_samples": n,
-            "critic/parameter_delta_l2": float(delta),
-        }
 
     @torch.no_grad()
     def wm_diagnostics(self, batch, label):
@@ -392,7 +308,7 @@ class ReFLActorWorker(Worker):
             action = self.actor(state)
             next_state = self.wm.step(state, action, **context)
         checkpoint = {
-            "format": "rlinf-refl-pickcube-v2",
+            "format": "rlinf-refl-pickcube-v3",
             "config": self.cfg,
             "actor": self.actor.state_dict(),
             "world_model": self.wm.state_dict(),

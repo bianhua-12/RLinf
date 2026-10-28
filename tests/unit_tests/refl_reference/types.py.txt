@@ -1,0 +1,15 @@
+"""Backend-independent imagined rollout tensors."""
+from dataclasses import dataclass
+import torch
+
+@dataclass
+class ImagRollout:
+    states: torch.Tensor  # (H+1, n, state_dim)
+    actions: torch.Tensor  # (H, n, action_dim)
+    rewards: torch.Tensor  # (H, n)      r_{t+1}
+    dhat: torch.Tensor  # (H+1, n)    predicted termination prob of s_t (d_0 = 0)
+    survival: torch.Tensor  # (H+1, n)    c_t
+    goals: torch.Tensor  # (H+1, n, goal_dim)
+    e_root: torch.Tensor  # (H+1, n, 4)
+    frames: torch.Tensor  # (H+1, n)
+    reward_terms: dict  # mean of each reward term over the rollout (diagnostics)

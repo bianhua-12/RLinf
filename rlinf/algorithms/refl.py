@@ -83,14 +83,9 @@ def imagined_objective(
     critic=None,
     return_rollout=False,
 ):
-    """Return discounted post-action rewards without a value bootstrap.
+    """Native ManiSkill objective: discounted rewards plus surviving H-step value."""
+    from rlinf.algorithms.refl_maniskill import policy_objective
 
-    Terminal states are absorbing with zero subsequent score. Native scoring
-    preserves the original objective. completion_cost_v1 charges unfinished
-    transitions r**2-1 and scores native success as zero. Hard success masks
-    remain detached. An optional frozen critic bootstraps each success boundary
-    once and each surviving horizon boundary once, retaining state derivatives.
-    """
     if horizon < 1 or not 0 < gamma <= 1:
         raise ValueError("Expected a positive horizon and gamma in (0, 1]")
     if critic is not None and reward_rule != "native":
@@ -99,52 +94,46 @@ def imagined_objective(
     context = {
         k: start[k][0].detach() for k in ("previous_state", "previous_action", "reset")
     }
-    alive = torch.ones(state.shape[0], device=state.device)
-    total = torch.zeros_like(alive)
-    bootstrap = torch.zeros_like(alive)
-    states, rewards, stops, active = [state], [], [], []
-    for step in range(horizon):
+    alive = torch.ones(len(state), device=state.device)
+    states, rewards, stops, survival = [state], [], [], [alive]
+    for _ in range(horizon):
         action = actor(state)
         predicted = dynamics.step(state, action, **context)
         next_state = torch.where(alive[:, None].bool(), predicted, state)
-        native_reward = reward(next_state)
-        score = score_native_reward(native_reward, reward_rule)
-        total = total + gamma**step * alive * score
-        stop = reward.terminated(next_state).detach()
-        if critic is not None:
-            bootstrap = bootstrap + gamma ** (step + 1) * alive * stop * critic(
-                next_state
-            )
-        if return_rollout:
-            states.append(next_state)
-            rewards.append(native_reward)
-            stops.append(stop)
-            active.append(alive)
+        score = score_native_reward(reward(next_state), reward_rule) * alive
+        stop = reward.terminated(next_state).detach() | ~alive.bool()
+        states.append(next_state)
+        rewards.append(score)
+        stops.append(stop)
         alive = alive * (~stop).float()
+        survival.append(alive)
         context = {
             "previous_state": state,
             "previous_action": action,
             "reset": torch.zeros_like(alive),
         }
         state = next_state
-    if critic is not None:
-        bootstrap = bootstrap + gamma**horizon * alive * critic(state)
-    objective = (total + bootstrap).mean()
-    if not return_rollout:
-        return objective
-    return objective, SimpleNamespace(
+    rollout = SimpleNamespace(
         states=torch.stack(states),
         rewards=torch.stack(rewards),
         stops=torch.stack(stops),
-        active=torch.stack(active),
-        bootstrap=bootstrap.mean(),
-        reward_objective=total.mean(),
+        survival=torch.stack(survival),
     )
+    value = critic(state) if critic is not None else None
+    objective = policy_objective(rollout, value, gamma)
+    if not return_rollout:
+        return objective
+    rollout.active = rollout.survival[:-1]
+    rollout.reward_objective = policy_objective(rollout, None, gamma)
+    rollout.bootstrap = objective - rollout.reward_objective
+    return objective, rollout
 
 
 @torch.no_grad()
 def bootstrapped_lambda_targets(rewards, stops, values, gamma, gae_lambda):
-    """Cut lambda traces at success while retaining V(final_observation), as PPO does."""
+    """Original ManiSkill lambda returns: true termination zeros continuation."""
+    from rlinf.algorithms.refl_maniskill import gae_targets
+
     if not 0 < gamma <= 1 or not 0 <= gae_lambda <= 1:
         raise ValueError("Invalid gamma or GAE lambda")
     if (
@@ -152,15 +141,7 @@ def bootstrapped_lambda_targets(rewards, stops, values, gamma, gae_lambda):
         or stops.shape != rewards.shape
     ):
         raise ValueError("Expected H rewards/stops and H+1 value rows")
-    result = []
-    target = values[-1]
-    for step in range(len(rewards) - 1, -1, -1):
-        continuation = (1 - gae_lambda) * values[step + 1] + gae_lambda * target
-        target = rewards[step] + gamma * torch.where(
-            stops[step], values[step + 1], continuation
-        )
-        result.append(target)
-    return torch.stack(result[::-1])
+    return gae_targets(rewards, stops.float(), values, gamma, gae_lambda)
 
 
 def checkpoint_uses_critic(bundle):
@@ -171,7 +152,7 @@ def checkpoint_uses_critic(bundle):
         enabled = False
         if bundle.get("config", {}).get("use_critic", False):
             raise ValueError("Historical v1 checkpoints cannot enable a critic")
-    elif version == "rlinf-refl-pickcube-v2":
+    elif version in ("rlinf-refl-pickcube-v2", "rlinf-refl-pickcube-v3"):
         enabled = bundle.get("config", {}).get("use_critic")
         if not isinstance(enabled, bool):
             raise ValueError("v2 checkpoint requires explicit use_critic")
@@ -180,8 +161,13 @@ def checkpoint_uses_critic(bundle):
     rule = config.get("reward_rule", "native" if version.endswith("v1") else None)
     if rule not in ("native", "completion_cost_v1"):
         raise ValueError("Unknown checkpoint reward semantics")
+    expected_bootstrap = (
+        "horizon_only" if version.endswith("v3") else "success_and_horizon"
+    )
+    if version.endswith("v3") and config.get("implementation") != "maniskill_56814f6":
+        raise ValueError("Unknown ManiSkill implementation contract")
     if enabled and (
-        rule != "native" or config.get("critic_bootstrap") != "success_and_horizon"
+        rule != "native" or config.get("critic_bootstrap") != expected_bootstrap
     ):
         raise ValueError("Unknown checkpoint critic semantics")
     if any((name in bundle) != enabled for name in ("critic", "critic_optimizer")):

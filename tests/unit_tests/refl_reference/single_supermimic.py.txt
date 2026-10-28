@@ -1,0 +1,192 @@
+"""Single-Panda adapters for the shared SuperMimic actor/critic/WM trainers."""
+from types import SimpleNamespace
+import torch
+from torch import nn
+from supermimic.data.replay_buffer import WindowBatch
+from supermimic.imagination.types import ImagRollout
+from .adapter import _vel
+from .single_warmup_data import restore,phases,assert_layout
+from .reference_sampling import tree_map
+from .precision import neural_forward
+
+
+def ppo_net(output):
+    return nn.Sequential(nn.Linear(42,256),nn.Tanh(),nn.Linear(256,256),nn.Tanh(),
+                         nn.Linear(256,256),nn.Tanh(),nn.Linear(256,output))
+
+
+class SingleActor(nn.Module):
+    def __init__(self):super().__init__();self.net=ppo_net(8);self.precision='float32'
+    def raw(self,state):return neural_forward(self.net,state[...,:42],precision=self.precision)
+    def forward(self,state):return self.raw(state).clamp(-1,1)
+
+
+class SingleCritic(nn.Module):
+    def __init__(self):super().__init__();self.net=ppo_net(1);self.precision='float32'
+    def forward(self,state,goal=None,xi=None,e_root=None):return neural_forward(self.net,state[...,:42],precision=self.precision).squeeze(-1)
+
+
+def validate_warmstart(warm,gamma):
+    expected=('PickCube-v1',42,8,.8,1.,20,100,'identity')
+    actual=tuple(warm.get(k) for k in ['env_id','state_dim','action_dim','gamma','reward_scale','control_hz','sim_hz','input_normalization'])
+    if actual!=expected or gamma!=warm['gamma'] or not warm['evaluation']['accepted']:
+        raise ValueError('Actor/value warmstart contract mismatch')
+
+
+def inference_policy_checkpoint(checkpoint,evaluation):
+    use_critic=checkpoint['config']['policy_trainer']['use_critic']
+    if use_critic != ('critic' in checkpoint):raise ValueError('Critic checkpoint/config mismatch')
+    payload=dict(format='single-pickcube-supermimic-policy-v1',
+                 actor_mean={k.removeprefix('net.'):v for k,v in checkpoint['actor'].items()},
+                 actor_logstd=checkpoint['actor_logstd'],use_critic=use_critic,
+                 env_id='PickCube-v1',state_dim=42,action_dim=8,input_normalization='identity',
+                 gamma=.8,reward_scale=1.,control_hz=20,sim_hz=100,
+                 iteration=checkpoint['iteration'],evaluation=evaluation,
+                 neural_precision=checkpoint['config'].get('neural_precision','float32'))
+    if use_critic:payload['critic']={k.removeprefix('net.'):v for k,v in checkpoint['critic'].items()}
+    return payload
+
+
+def context_from_xi(xi):
+    return dict(previous_state=xi[...,:48],previous_action=xi[...,48:56],reset=xi[...,56])
+
+
+class SingleModel(nn.Module):
+    def __init__(self,dynamics,reward):
+        super().__init__();self.dynamics=dynamics;self.reward=reward
+        self.spec=SimpleNamespace(normalize_xi=lambda xi:xi)
+
+
+class SingleImagination:
+    def __init__(self,model,policy,terminated):
+        self.model,self.policy,self.terminated=model,policy,terminated;self.last_saturation=0.
+
+    def __call__(self,start,horizon):
+        s=start.state;ctx=context_from_xi(start.xi);alive=torch.ones(len(s),device=s.device)
+        states=[s];actions=[];rewards=[];done=[torch.zeros_like(alive)];survival=[alive];saturation=[]
+        for _ in range(horizon):
+            raw=self.policy.raw(s);a=raw.clamp(-1,1)
+            predicted=self.model.dynamics.step(s,a,**ctx)
+            nxt=torch.where(alive[:,None].bool(),predicted,s)
+            r=self.model.reward(nxt)[0]*alive
+            terminal=self.terminated(nxt).detach() | ~alive.bool()
+            actions.append(a);rewards.append(r);states.append(nxt)
+            done.append(terminal.float());alive=alive*(~terminal).float();survival.append(alive)
+            saturation.append((raw.detach().abs()>1).float().mean())
+            ctx=dict(previous_state=s,previous_action=a,reset=torch.zeros_like(alive));s=nxt
+        states=torch.stack(states);shape=states.shape[:2]
+        self.last_saturation=float(torch.stack(saturation).mean())
+        return ImagRollout(states,torch.stack(actions),torch.stack(rewards),torch.stack(done),
+                           torch.stack(survival),states[...,26:29],torch.zeros(*shape,4,device=s.device),
+                           start.frame[None].expand(horizon+1,-1),{})
+
+    def critic_inputs(self,rollout):return rollout.states[...,:42],rollout.goals,rollout.e_root
+
+
+@torch.no_grad()
+def physical_state(env,observation):
+    cube=env.unwrapped.cube
+    return torch.cat([observation,_vel(cube,'linear_velocity'),_vel(cube,'angular_velocity')],-1).clone()
+
+
+@torch.no_grad()
+def collect(env,policy,bank,sampler,iteration,seed,train_ids):
+    n=env.unwrapped.num_envs;device=train_ids.device;native=iteration%5==0
+    if n!=4096:raise ValueError('Reference bank requires its original4096-environment layout')
+    if native:obs,_=env.reset(seed=seed+iteration);length=50;bins=None
+    else:
+        frames,bins=sampler.sample();held_frames,held_bins=sampler.sample(adaptive=False)
+        frames[3584:]=held_frames[3584:];bins[3584:]=held_bins[3584:]
+        ids=torch.arange(n,device=device)
+        obs=restore(env,tree_map(lambda x:x[frames,ids],bank['states']));length=32
+    assert_layout(env,obs)
+    previous=physical_state(env,obs);previous_action=torch.zeros(n,8,device=device)
+    alive=torch.ones(n,dtype=torch.bool,device=device);returns=torch.zeros(n,device=device)
+    success=torch.zeros_like(alive);grasp=success.clone();parts={}
+    for t in range(length):
+        s=physical_state(env,obs);clean=policy(obs);action=(clean+.1*torch.randn_like(clean)).clamp(-1,1)
+        nxt,reward,terminated,truncated,info=env.step(action);next_state=physical_state(env,nxt)
+        cut=truncated|~alive
+        if t==length-1:cut=cut|~terminated
+        row=dict(state=s,next_state=next_state,action=action,clean_action=clean,reward=reward,
+                 terminated=terminated,truncated=cut,alive=alive,previous_state=previous,
+                 previous_action=previous_action,reset=torch.full_like(alive,t==0),
+                 native=torch.full_like(alive,native),source_env=torch.arange(n,device=device),
+                 episode_id=torch.arange(n,device=device)+iteration*n,**phases(nxt,info,obs))
+        for key,value in row.items():parts.setdefault(key,[]).append(value.detach().clone())
+        returns+=(sampler.gamma**t)*reward*alive;success|=info['success']&alive;grasp|=info['is_grasped']&alive
+        alive=alive&~(terminated|truncated);previous,previous_action=s,action;obs=nxt
+    if bins is not None:sampler.update(bins,returns,torch.arange(n,device=device)<3584)
+    data={k:torch.stack(v) for k,v in parts.items()}
+    return data,dict(origin='native' if native else 'reference',vector_steps=length,
+                     transitions=int(data['alive'][:,train_ids].sum()),success_rate=float(success[train_ids].float().mean()),
+                     grasp_rate=float(grasp[train_ids].float().mean()),sampler_return=float(returns[train_ids].mean()))
+
+
+@torch.no_grad()
+def record_online(buffer,data,ids):
+    for t in range(len(data['state'])):
+        local=data['alive'][t,ids].nonzero().flatten();source=ids[local]
+        if not len(local):continue
+        s=data['state'][t,source];a=data['action'][t,source];zero=torch.zeros(len(local),device=s.device)
+        xi=torch.cat([data['previous_state'][t,source],data['previous_action'][t,source],data['reset'][t,source,None].float()],-1)
+        frame=torch.full_like(local,t)
+        buffer.add(local,s,data['clean_action'][t,source],a,xi,data['reward'][t,source],zero,frame,frame*0,zero.bool(),data['reset'][t,source])
+        end=data['terminated'][t,source]|data['truncated'][t,source]
+        if t==len(data['state'])-1:end=torch.ones_like(end)
+        if end.any():
+            terminal_xi=torch.cat([s[end],a[end],zero[end,None]],-1)
+            buffer.add(local[end],data['next_state'][t,source[end]],torch.zeros_like(a[end]),torch.zeros_like(a[end]),
+                       terminal_xi,zero[end],data['terminated'][t,source[end]].float(),frame[end]+1,frame[end]*0,
+                       torch.ones_like(end[end]),torch.zeros_like(end[end]))
+            buffer.end_episode(local[end])
+
+
+class MixedReplay:
+    def __init__(self,offline,online):self.offline,self.online=offline,online
+    def sample_windows(self,n,k):
+        old=self.offline.sample_windows(n//2,k);new=self.online.sample_windows(n-n//2,k)
+        return WindowBatch(**{key:torch.cat([getattr(old,key),getattr(new,key)],dim=0 if key=='xi' else 1)
+                              for key in WindowBatch.__dataclass_fields__})
+
+
+def reward_update(model,optimizer,buffer,offline,oracle,batch):
+    with torch.no_grad():
+        old=offline.sample(batch//2);w=buffer.sample_windows(batch//4,3)
+        pred=model.dynamics.rollout(w.states[0],w.a_exec,**context_from_xi(w.xi))
+        if old['next_state'].shape[:2]!=(3,batch//2) or w.reward.shape!=(3,batch//4):
+            raise ValueError('RM requires complete three-step windows and the original2:1:1 mixture')
+        historical=old['next_state'].flatten(0,1);historical_reward=old['reward'].flatten()
+        true=w.states[1:].flatten(0,1);imagined=pred.flatten(0,1)
+        native=w.reward.flatten();actual=oracle(true)
+        parity=float((actual-native).abs().max())
+        if parity>1e-6:raise ValueError('Online native reward parity failed')
+        states=torch.cat([historical,true,imagined])
+        targets=torch.cat([historical_reward,native,oracle(imagined)])
+    error=(model.reward(states)[0]-targets)/.02;loss=error.square().mean()
+    optimizer.zero_grad(set_to_none=True);loss.backward()
+    gn=nn.utils.clip_grad_norm_(model.reward.parameters(),1.,error_if_nonfinite=True);optimizer.step()
+    return dict(loss=float(loss.detach()),grad_norm=float(gn),native_label_parity_max=parity,
+                historical_pairs=len(historical),online_pairs=len(true),predicted_pairs=len(imagined),
+                historical_terminal_success_samples=int((historical_reward>=1-1e-6).sum()),
+                online_terminal_success_samples=int((native>=1-1e-6).sum()))
+
+
+@torch.no_grad()
+def evaluate_policy(env,policy,seed,episodes=512):
+    n=env.unwrapped.num_envs
+    if episodes%n:raise ValueError('Evaluation population must be a multiple of scene size')
+    successes=[];returns=[];grasps=[];saturations=[]
+    for batch in range(episodes//n):
+        obs,_=env.reset(seed=seed+batch);total=torch.zeros(n,device=obs.device)
+        success=torch.zeros(n,dtype=torch.bool,device=obs.device);grasp=success.clone()
+        for _ in range(50):
+            raw=neural_forward(policy.net,obs,precision=getattr(policy,'precision','float32'));obs,r,_,_,info=env.step(raw.clamp(-1,1))
+            total+=r;success|=info['success'];grasp|=info['is_grasped']
+            saturations.append((raw.abs()>1).float().mean())
+        successes.append(success);returns.append(total);grasps.append(grasp)
+    successes=torch.cat(successes);returns=torch.cat(returns);grasps=torch.cat(grasps)
+    metrics=dict(episodes=episodes,successes=int(successes.sum()),success_rate=float(successes.float().mean()),
+                 mean_return=float(returns.mean()),grasp_rate=float(grasps.float().mean()),
+                 action_saturation=float(torch.stack(saturations).mean()),seed_start=seed,horizon=50)
+    return metrics,dict(success=successes.cpu(),returns=returns.cpu(),grasp=grasps.cpu())

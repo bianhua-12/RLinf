@@ -58,11 +58,9 @@ def main():
     if cfg["use_critic"]:
         if (
             cfg["reward_rule"] != "native"
-            or cfg.get("critic_bootstrap") != "success_and_horizon"
+            or cfg.get("critic_bootstrap") != "horizon_only"
         ):
-            parser.error(
-                "Critic requires native rewards and success_and_horizon bootstrap"
-            )
+            parser.error("Critic requires native rewards and horizon_only bootstrap")
         for field in ("critic_epochs", "critic_minibatches"):
             if not isinstance(cfg.get(field), int) or cfg[field] < 1:
                 parser.error(f"{field} must be positive")
@@ -76,6 +74,17 @@ def main():
         parser.error("wandb_mode must be online or offline")
     if not 0 < cfg["gamma"] <= 1 or min(cfg["actor_lr"], cfg["wm_lr"]) <= 0:
         parser.error("Invalid gamma or optimizer learning rate")
+    required = {
+        "implementation": "maniskill_56814f6",
+        "bank_validity": "source",
+        "collection_sampler": "bins",
+        "replay_backend": "ring",
+        "reward_rule": "native",
+    }
+    if any(cfg.get(key) != value for key, value in required.items()):
+        parser.error(
+            "This entrypoint requires the pinned native ManiSkill update profile"
+        )
     repo = Path(__file__).resolve().parents[2]
     cfg = prepare_run(cfg, repo)
     cluster = Cluster(num_nodes=1)

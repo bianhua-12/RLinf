@@ -596,7 +596,7 @@ class SingleCritic(nn.Module):
         self.net = ppo_net(1)
         self.precision = "float32"
 
-    def forward(self, state):
+    def forward(self, state, goal=None, xi=None, e_root=None):
         return neural_forward(
             self.net, state[..., :42], precision=self.precision
         ).squeeze(-1)

@@ -1,6 +1,8 @@
 # Restore native reward and add a value critic / 恢复原奖励并加回 critic
 
-Status: implemented; 27 focused tests pass. Native task validation pending.
+Status: historical variant, superseded for training. Its success-boundary
+bootstrap differs from the original ManiSkill equation. See the
+[alignment decision](refl-maniskill-alignment.md).
 The user explicitly superseded the previous no-critic preference and stopped
 completion-cost shaping. No reward model is introduced.
 
@@ -86,3 +88,6 @@ final policy. Its reference control is the native-score no-critic BinSampler+rin
 run at375a55c1 (91.99% selected/final). We report actual critic optimizer counts,
 parameter changes, finite value loss, native reward parity, cloud history and
 independent task success separately.
+
+The55158db9 run completed with82.42% selected/82.62% final success. These results
+belong to the altered objective and must not be labeled original-ManiSkill parity.

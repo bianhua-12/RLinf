@@ -178,6 +178,7 @@ jobs:
             unit_test_filter: &unit
               - 'rlinf/data/refl_replay.py'
               - 'rlinf/algorithms/refl.py'
+              - 'rlinf/algorithms/refl_maniskill.py'
               - 'rlinf/models/embodiment/refl_pickcube.py'
               - 'rlinf/workers/actor/refl_actor_worker.py'
               - 'rlinf/runners/refl_runner.py'

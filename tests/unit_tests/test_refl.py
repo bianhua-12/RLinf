@@ -205,7 +205,7 @@ def test_completion_cost_is_bounded_and_improves_with_progress():
 
 
 @pytest.mark.parametrize("terminal", [False, True])
-def test_critic_bootstrap_counts_each_cut_once_and_keeps_input_gradient(terminal):
+def test_horizon_only_critic_zeros_terminal_tail_and_keeps_input_gradient(terminal):
     actor = nn.Linear(1, 1, bias=False)
     actor.weight.data.fill_(0.1)
     critic = nn.Linear(1, 1, bias=False)
@@ -232,9 +232,9 @@ def test_critic_bootstrap_counts_each_cut_once_and_keeps_input_gradient(terminal
             return_rollout=True,
         )
         if terminal:
-            assert objective.item() == pytest.approx(1.2 + 0.8 * 2 * 1.2)
+            assert objective.item() == pytest.approx(1.2)
             objective.backward()
-            assert actor.weight.grad.item() == pytest.approx(2 * (1 + 0.8 * 2))
+            assert actor.weight.grad.item() == pytest.approx(2.0)
             assert rollout.active.sum().item() == 4
         else:
             expected = (
@@ -246,15 +246,13 @@ def test_critic_bootstrap_counts_each_cut_once_and_keeps_input_gradient(terminal
         assert actor.weight.grad.abs().sum() > 0
 
 
-def test_lambda_targets_cut_success_trace_without_erasing_final_value():
+def test_lambda_targets_zero_terminal_continuation():
     rewards = torch.tensor([[1.0], [2.0], [99.0]], requires_grad=True)
     stops = torch.tensor([[False], [True], [False]])
     values = torch.tensor([[4.0], [5.0], [6.0], [7.0]], requires_grad=True)
     targets = bootstrapped_lambda_targets(rewards, stops, values, 0.8, 0.95)
-    assert targets[1].item() == pytest.approx(2 + 0.8 * 6)
-    assert targets[0].item() == pytest.approx(
-        1 + 0.8 * (0.05 * 5 + 0.95 * (2 + 0.8 * 6))
-    )
+    assert targets[1].item() == pytest.approx(2.0)
+    assert targets[0].item() == pytest.approx(1 + 0.8 * (0.05 * 5 + 0.95 * 2))
     assert targets[2].item() == pytest.approx(99 + 0.8 * 7)
     assert not targets.requires_grad
 
@@ -274,6 +272,30 @@ def test_critic_checkpoint_contract_is_explicit():
         "probe": {"value": torch.tensor(1.0)},
     }
     assert checkpoint_uses_critic(modern)
+    aligned = {
+        **modern,
+        "format": "rlinf-refl-pickcube-v3",
+        "config": {
+            **modern["config"],
+            "critic_bootstrap": "horizon_only",
+            "implementation": "maniskill_56814f6",
+        },
+    }
+    assert checkpoint_uses_critic(aligned)
+    with pytest.raises(ValueError, match="semantics"):
+        checkpoint_uses_critic(
+            {
+                **aligned,
+                "config": {
+                    **aligned["config"],
+                    "critic_bootstrap": "success_and_horizon",
+                },
+            }
+        )
+    with pytest.raises(ValueError, match="implementation"):
+        checkpoint_uses_critic(
+            {**aligned, "config": {**aligned["config"], "implementation": "unknown"}}
+        )
     for key in ("critic", "critic_optimizer"):
         broken = dict(modern)
         del broken[key]
