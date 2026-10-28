@@ -53,6 +53,8 @@ def main():
     try:
         torch.manual_seed(cfg["seed"])
         torch.set_float32_matmul_precision("highest")
+        if set(cfg["diagnostic_checkpoints"]) != {"initial", "final"}:
+            raise ValueError("Expected initial and final diagnostic checkpoints")
         bundles = {}
         for name, item in cfg["diagnostic_checkpoints"].items():
             if sha256(item["path"]) != item["sha256"]:
@@ -60,6 +62,13 @@ def main():
             bundles[name] = torch.load(
                 item["path"], map_location="cuda", weights_only=False
             )
+            bundle = bundles[name]
+            if (
+                bundle.get("format") != "rlinf-refl-pickcube-v3"
+                or bundle.get("config", {}).get("critic_bootstrap") != "horizon_only"
+                or not bundle.get("config", {}).get("use_critic")
+            ):
+                raise ValueError("Expected a v3 horizon-only critic checkpoint")
         data = torch.load(
             cfg["inputs"]["dataset"]["path"], map_location="cuda", weights_only=False
         )

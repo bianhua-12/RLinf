@@ -1,7 +1,9 @@
 # Align with the original ManiSkill trainer / 对齐原 ManiSkill 训练器
 
-Status: implementation restored; CPU reference parity passed. Real-checkpoint
-GPU parity and native learning evaluation are required before accepting the port.
+Status: implementation restored; CPU and real-checkpoint GPU parity passed.
+Native learning validation failed (53.91% initial,12.50% final); the port is not
+accepted as successful training. See the
+[experiment report](../../experiments/refl-maniskill-alignment-20261028.md).
 
 ## Correction / 更正
 
