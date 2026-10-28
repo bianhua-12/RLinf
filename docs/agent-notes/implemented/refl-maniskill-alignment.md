@@ -89,3 +89,12 @@ Checkpointv3 records `implementation: maniskill_56814f6` and
 `critic_bootstrap: horizon_only`. Historicalv2 retains its success-and-horizon
 meaning for inference reload; it is never silently reinterpreted asv3. Exact
 training resume remains unsupported. The rejected variant's artifacts are kept.
+
+## Read-only gradient diagnosis / 只读梯度诊断
+
+`examples/embodiment/diagnose_refl_critic.py` measures reward and horizon-value
+actor gradients on the same 256 held-out real starts, crossing initial/final
+actor-WM and critic weights. No parameters or losses are changed. Raw-gradient
+cosines precede clipping/Adam and cannot establish a causal training attribution.
+It also measures whether native512 evaluation consumes global Torch RNG. Input
+checkpoint hashes, clean diagnostic commit and environment are recorded.
