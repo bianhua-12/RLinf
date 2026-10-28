@@ -588,6 +588,20 @@ def ppo_net(output):
     )
 
 
+class SingleCritic(nn.Module):
+    """PPO790 state42 value network; preserve derivatives through input states."""
+
+    def __init__(self):
+        super().__init__()
+        self.net = ppo_net(1)
+        self.precision = "float32"
+
+    def forward(self, state):
+        return neural_forward(
+            self.net, state[..., :42], precision=self.precision
+        ).squeeze(-1)
+
+
 class SingleActor(nn.Module):
     def __init__(self):
         super().__init__()

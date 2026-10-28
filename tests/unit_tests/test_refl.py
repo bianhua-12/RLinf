@@ -22,6 +22,8 @@ from torch import nn
 
 from rlinf.algorithms.refl import (
     TransitionWindows,
+    bootstrapped_lambda_targets,
+    checkpoint_uses_critic,
     frozen_parameters,
     imagined_objective,
     isolated_rng,
@@ -200,6 +202,95 @@ def test_completion_cost_is_bounded_and_improves_with_progress():
     assert scores[-1] == 0
     with pytest.raises(ValueError, match="Unknown"):
         score_native_reward(rewards, "unknown")
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_critic_bootstrap_counts_each_cut_once_and_keeps_input_gradient(terminal):
+    actor = nn.Linear(1, 1, bias=False)
+    actor.weight.data.fill_(0.1)
+    critic = nn.Linear(1, 1, bias=False)
+    critic.weight.data.fill_(2.0)
+
+    class Value(nn.Module):
+        def __init__(self, net):
+            super().__init__()
+            self.net = net
+
+        def forward(self, state):
+            return self.net(state).squeeze(-1)
+
+    value = Value(critic)
+    with frozen_parameters(value):
+        objective, rollout = imagined_objective(
+            actor,
+            LinearDynamics(),
+            Reward(terminal),
+            start(),
+            3,
+            0.8,
+            critic=value,
+            return_rollout=True,
+        )
+        if terminal:
+            assert objective.item() == pytest.approx(1.2 + 0.8 * 2 * 1.2)
+            objective.backward()
+            assert actor.weight.grad.item() == pytest.approx(2 * (1 + 0.8 * 2))
+            assert rollout.active.sum().item() == 4
+        else:
+            expected = (
+                sum(0.8**t * 1.2 ** (t + 1) for t in range(3)) + 0.8**3 * 2 * 1.2**3
+            )
+            assert objective.item() == pytest.approx(expected)
+            objective.backward()
+        assert critic.weight.grad is None
+        assert actor.weight.grad.abs().sum() > 0
+
+
+def test_lambda_targets_cut_success_trace_without_erasing_final_value():
+    rewards = torch.tensor([[1.0], [2.0], [99.0]], requires_grad=True)
+    stops = torch.tensor([[False], [True], [False]])
+    values = torch.tensor([[4.0], [5.0], [6.0], [7.0]], requires_grad=True)
+    targets = bootstrapped_lambda_targets(rewards, stops, values, 0.8, 0.95)
+    assert targets[1].item() == pytest.approx(2 + 0.8 * 6)
+    assert targets[0].item() == pytest.approx(
+        1 + 0.8 * (0.05 * 5 + 0.95 * (2 + 0.8 * 6))
+    )
+    assert targets[2].item() == pytest.approx(99 + 0.8 * 7)
+    assert not targets.requires_grad
+
+
+def test_critic_checkpoint_contract_is_explicit():
+    legacy = {"format": "rlinf-refl-pickcube-v1", "config": {}, "probe": {}}
+    assert not checkpoint_uses_critic(legacy)
+    modern = {
+        "format": "rlinf-refl-pickcube-v2",
+        "config": {
+            "use_critic": True,
+            "reward_rule": "native",
+            "critic_bootstrap": "success_and_horizon",
+        },
+        "critic": {},
+        "critic_optimizer": {},
+        "probe": {"value": torch.tensor(1.0)},
+    }
+    assert checkpoint_uses_critic(modern)
+    for key in ("critic", "critic_optimizer"):
+        broken = dict(modern)
+        del broken[key]
+        with pytest.raises(ValueError, match="mismatch"):
+            checkpoint_uses_critic(broken)
+    with pytest.raises(ValueError, match="Historical"):
+        checkpoint_uses_critic({**legacy, "config": {"use_critic": True}})
+    with pytest.raises(ValueError, match="explicit"):
+        checkpoint_uses_critic({**modern, "config": {}})
+    for key, value in [
+        ("reward_rule", "completion_cost_v1"),
+        ("critic_bootstrap", "horizon_only"),
+    ]:
+        with pytest.raises(ValueError, match="semantics"):
+            checkpoint_uses_critic(
+                {**modern, "config": {**modern["config"], key: value}}
+            )
 
 
 def test_freeze_restores_flags_on_exception():

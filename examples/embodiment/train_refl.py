@@ -53,6 +53,23 @@ def main():
         parser.error("replay_backend must explicitly select ring or trajectory")
     if cfg.get("reward_rule") not in ("native", "completion_cost_v1"):
         parser.error("reward_rule must explicitly select native or completion_cost_v1")
+    if not isinstance(cfg.get("use_critic"), bool):
+        parser.error("use_critic must explicitly select true or false")
+    if cfg["use_critic"]:
+        if (
+            cfg["reward_rule"] != "native"
+            or cfg.get("critic_bootstrap") != "success_and_horizon"
+        ):
+            parser.error(
+                "Critic requires native rewards and success_and_horizon bootstrap"
+            )
+        for field in ("critic_epochs", "critic_minibatches"):
+            if not isinstance(cfg.get(field), int) or cfg[field] < 1:
+                parser.error(f"{field} must be positive")
+        if cfg["batch_size"] < cfg["critic_minibatches"] or cfg["critic_lr"] <= 0:
+            parser.error("Invalid critic batch count or learning rate")
+        if not 0 <= cfg["critic_gae_lambda"] <= 1:
+            parser.error("critic_gae_lambda must be in [0, 1]")
     if cfg["imagination_horizon"] != 13:
         parser.error("This PickCube migration preserves the H13 imagination contract")
     if cfg["wandb_mode"] not in ("online", "offline"):

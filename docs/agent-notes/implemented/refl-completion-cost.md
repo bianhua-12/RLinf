@@ -98,3 +98,6 @@ native control. The score-order property is verified; a robust learning benefit
 is not. This rule remains experimental.
 
 计分顺序验证通过；实际训练最佳92.38%、最终82.23%，未证明稳健收益。
+
+The user subsequently stopped this shaping trial; the template now restores
+native rewards with a critic. See [the critic decision](refl-critic-native.md).

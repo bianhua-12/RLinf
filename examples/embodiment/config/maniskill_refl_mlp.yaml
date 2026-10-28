@@ -1,4 +1,4 @@
-# Contract: docs/agent-notes/implemented/refl-pickcube.md
+# Contract: docs/agent-notes/implemented/refl-critic-native.md
 # Copy this config outside the checkout and bind local paths before launch.
 commit: null
 repository: null
@@ -9,8 +9,13 @@ seed: 0
 precision: bf16
 collection_sampler: bins
 replay_backend: ring
-# Experimental; see docs/experiments/refl-completion-cost-20261028.md
-reward_rule: completion_cost_v1
+reward_rule: native
+use_critic: true
+critic_bootstrap: success_and_horizon
+critic_lr: 0.0001
+critic_epochs: 5
+critic_minibatches: 4
+critic_gae_lambda: 0.95
 iterations: 20
 actor_updates_per_iteration: 10
 wm_updates_per_actor: 10

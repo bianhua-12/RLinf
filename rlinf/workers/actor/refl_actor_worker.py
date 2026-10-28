@@ -16,12 +16,15 @@
 
 import hashlib
 from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 
 from rlinf.algorithms.refl import (
     TransitionWindows,
+    bootstrapped_lambda_targets,
+    checkpoint_uses_critic,
     frozen_parameters,
     imagined_objective,
     isolated_rng,
@@ -46,6 +49,7 @@ class ReFLActorWorker(Worker):
         self.cfg = config
         self.env = self.evaluation = None
         self.iteration = self.actor_updates = self.wm_updates = 0
+        self.critic_updates = 0
 
     def initialize(self):
         from rlinf.envs.sim.maniskill.refl_pickcube import (
@@ -57,6 +61,7 @@ class ReFLActorWorker(Worker):
         )
         from rlinf.models.embodiment.refl_pickcube import (
             SingleActor,
+            SingleCritic,
             load_world_model,
             set_precision,
             validate_warmstart,
@@ -91,6 +96,21 @@ class ReFLActorWorker(Worker):
             self.actor.parameters(), lr=self.cfg["actor_lr"], betas=(0.9, 0.95)
         )
         self.wm_optimizer = torch.optim.Adam(self.wm.parameters(), lr=self.cfg["wm_lr"])
+        self.critic = self.critic_optimizer = None
+        if self.cfg["use_critic"]:
+            with isolated_rng(self.device):
+                self.critic = SingleCritic().to(self.device)
+                self.critic.net.load_state_dict(warm["critic"], strict=True)
+                set_precision(self.critic, self.cfg["precision"])
+            self.critic_optimizer = torch.optim.Adam(
+                self.critic.parameters(), lr=self.cfg["critic_lr"]
+            )
+            self.initial_critic = {
+                k: p.detach().clone() for k, p in self.critic.named_parameters()
+            }
+            self.critic_generator = torch.Generator(device=self.device).manual_seed(
+                41000 + self.cfg["seed"]
+            )
         packed = self.inputs["dataset"]
         if packed["coverage"].get("splits") != {
             "train": [0, 3583],
@@ -155,7 +175,9 @@ class ReFLActorWorker(Worker):
             "source_bank_valid_count": source_valid_count,
             "runtime_bank_valid_count": int(self.bank["valid"].sum()),
             "reward_model_parameters": 0,
-            "critic_parameters": 0,
+            "critic_parameters": sum(p.numel() for p in self.critic.parameters())
+            if self.critic is not None
+            else 0,
             "initial_training_rng_sha256": hashlib.sha256(
                 torch.get_rng_state().cpu().numpy().tobytes()
                 + self.torch_platform.get_rng_state().cpu().numpy().tobytes()
@@ -216,8 +238,17 @@ class ReFLActorWorker(Worker):
                 if self.ring
                 else actor_starts.sample(batch_size)
             )
-            with frozen_parameters(self.wm):
-                objective = imagined_objective(
+            if self.critic_optimizer is not None:
+                self.critic_optimizer.zero_grad(set_to_none=True)
+            with (
+                frozen_parameters(self.wm),
+                (
+                    frozen_parameters(self.critic)
+                    if self.critic is not None
+                    else nullcontext()
+                ),
+            ):
+                result = imagined_objective(
                     self.actor,
                     self.wm,
                     self.oracle,
@@ -225,7 +256,14 @@ class ReFLActorWorker(Worker):
                     self.cfg["imagination_horizon"],
                     self.cfg["gamma"],
                     reward_rule=self.cfg["reward_rule"],
+                    critic=self.critic,
+                    return_rollout=self.critic is not None,
                 )
+                if self.critic is not None:
+                    objective, trajectory = result
+                    bootstrap = float(trajectory.bootstrap.detach())
+                else:
+                    objective, bootstrap = result, 0.0
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 (-objective / self.cfg["imagination_horizon"]).backward()
                 actor_norm = torch.nn.utils.clip_grad_norm_(
@@ -235,16 +273,26 @@ class ReFLActorWorker(Worker):
                     raise ValueError("Policy gradient through WM is zero")
                 if any(p.grad is not None for p in self.wm.parameters()):
                     raise ValueError("Actor update accumulated world-model gradients")
+                if self.critic is not None and any(
+                    p.grad is not None for p in self.critic.parameters()
+                ):
+                    raise ValueError(
+                        "Actor update accumulated critic parameter gradients"
+                    )
                 torch.nn.utils.clip_grad_value_(self.actor.parameters(), 0.1)
                 self.actor_optimizer.step()
             self.actor_updates += 1
+            critic_metrics = (
+                self._fit_critic(trajectory) if self.critic is not None else {}
+            )
         result = {
             "iteration": self.iteration,
             "updates/actor": self.actor_updates,
             "updates/wm": self.wm_updates,
             "updates/rm": 0,
-            "updates/critic": 0,
-            "actor/bootstrap": 0,
+            "updates/critic": self.critic_updates,
+            "actor/bootstrap": bootstrap,
+            **critic_metrics,
             "actor/gradient_norm": float(actor_norm),
             "actor/imagined_objective": float(objective.detach()),
             "wm/loss": float(loss.detach()),
@@ -261,6 +309,48 @@ class ReFLActorWorker(Worker):
         }
         self.save_checkpoint("latest.pt")
         return result
+
+    def _fit_critic(self, rollout):
+        with torch.no_grad():
+            states = rollout.states.detach()
+            values = self.critic(states)
+            targets = bootstrapped_lambda_targets(
+                rollout.rewards.detach(),
+                rollout.stops,
+                values,
+                self.cfg["gamma"],
+                self.cfg["critic_gae_lambda"],
+            )
+            active = rollout.active.bool()
+            inputs, targets = states[:-1][active], targets[active]
+        n = len(inputs)
+        if n < self.cfg["critic_minibatches"]:
+            raise ValueError("Insufficient live critic samples")
+        for _ in range(self.cfg["critic_epochs"]):
+            order = torch.randperm(
+                n, device=self.device, generator=self.critic_generator
+            )
+            for ids in order.tensor_split(self.cfg["critic_minibatches"]):
+                prediction = self.critic(inputs[ids])
+                loss = torch.nn.functional.mse_loss(prediction, targets[ids])
+                self.critic_optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.critic.parameters(), 1.0, error_if_nonfinite=True
+                )
+                self.critic_optimizer.step()
+                self.critic_updates += 1
+        delta = sum(
+            (p.detach() - self.initial_critic[k]).square().sum()
+            for k, p in self.critic.named_parameters()
+        ).sqrt()
+        return {
+            "critic/loss": float(loss.detach()),
+            "critic/gradient_norm": float(grad_norm),
+            "critic/target_mean": float(targets.mean()),
+            "critic/live_samples": n,
+            "critic/parameter_delta_l2": float(delta),
+        }
 
     @torch.no_grad()
     def wm_diagnostics(self, batch, label):
@@ -302,7 +392,7 @@ class ReFLActorWorker(Worker):
             action = self.actor(state)
             next_state = self.wm.step(state, action, **context)
         checkpoint = {
-            "format": "rlinf-refl-pickcube-v1",
+            "format": "rlinf-refl-pickcube-v2",
             "config": self.cfg,
             "actor": self.actor.state_dict(),
             "world_model": self.wm.state_dict(),
@@ -314,6 +404,7 @@ class ReFLActorWorker(Worker):
             "iteration": self.iteration,
             "actor_updates": self.actor_updates,
             "wm_updates": self.wm_updates,
+            "critic_updates": self.critic_updates,
             "torch_rng": torch.get_rng_state(),
             "accelerator_rng": self.torch_platform.get_rng_state_all(),
             "resume_supported": False,
@@ -324,6 +415,11 @@ class ReFLActorWorker(Worker):
                 "next_state": next_state,
             },
         }
+        if self.critic is not None:
+            checkpoint["critic"] = self.critic.state_dict()
+            checkpoint["critic_optimizer"] = self.critic_optimizer.state_dict()
+            with torch.no_grad():
+                checkpoint["probe"]["value"] = self.critic(state)
         destination = self.root / name
         temporary = destination.with_suffix(".tmp")
         torch.save(checkpoint, temporary)
@@ -337,6 +433,7 @@ class ReFLActorWorker(Worker):
         from rlinf.envs.sim.maniskill.refl_pickcube import evaluate_policy
         from rlinf.models.embodiment.refl_pickcube import (
             SingleActor,
+            SingleCritic,
             load_world_model,
             set_precision,
         )
@@ -346,8 +443,7 @@ class ReFLActorWorker(Worker):
             bundle = torch.load(
                 self.root / checkpoint, map_location=self.device, weights_only=False
             )
-            if bundle.get("format") != "rlinf-refl-pickcube-v1":
-                raise ValueError("Expected rlinf-refl-pickcube-v1 checkpoint")
+            has_critic = checkpoint_uses_critic(bundle)
             actor = SingleActor().to(self.device)
             actor.load_state_dict(bundle["actor"], strict=True)
             set_precision(actor, self.cfg["precision"])
@@ -367,6 +463,18 @@ class ReFLActorWorker(Worker):
                 prediction, probe["next_state"], rtol=0, atol=1e-6
             )
             del restored_wm
+            if has_critic:
+                restored_critic = SingleCritic().to(self.device)
+                restored_critic.load_state_dict(bundle["critic"], strict=True)
+                set_precision(restored_critic, bundle["config"]["precision"])
+                with torch.no_grad():
+                    torch.testing.assert_close(
+                        restored_critic(probe["state"]),
+                        probe["value"],
+                        rtol=0,
+                        atol=1e-6,
+                    )
+                del restored_critic
         result, episodes = evaluate_policy(self.evaluation, actor, seed)
         if checkpoint:
             torch.save(episodes, self.root / (checkpoint + ".episodes.pt"))
