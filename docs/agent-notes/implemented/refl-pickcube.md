@@ -1,7 +1,8 @@
 # PickCube ReFL through a physical world model / PickCube 世界模型梯度直传
 
-Status: implemented; focused CPU tests passed. GPU execution and task improvement
-remain unverified until a run produces independent native evaluation results.
+Status: implemented and validated in one native GPU run. See the
+[execution evidence](../../experiments/refl-pickcube-20261028.md) for the clean
+commit, independent success rates, W&B verification and TOS archive.
 
 ## Decision / 决策
 
@@ -113,9 +114,10 @@ reports two pre-existing relative-link errors in the upstream test-install skill
 that file is unchanged. Independent static review found missing source-column validation and incorrect
 cleanup completion handling; both were addressed before GPU launch.
 
-GPU physics compatibility, reference restoration, actual input loading, checkpoint
-round-trip and initial/selected/final task success require runtime evidence.
-No learning or convergence claim follows from these unit tests.
+The recorded GPU run subsequently passed physics/input loading, reference
+restoration, actor/WM checkpoint probes and initial/selected/final native evaluation.
+Its selected success increased from53.91% to87.70%. This is single-seed evidence;
+it does not establish convergence or a comparison against other algorithms.
 
 ## Source attribution / 来源
 
