@@ -1,0 +1,47 @@
+# Contract: docs/agent-notes/implemented/refl-pickcube.md
+# Copy this config outside the checkout and bind local paths before launch.
+commit: null
+repository: null
+output_dir: null
+container_image: null
+run_id: null
+seed: 0
+precision: bf16
+iterations: 20
+actor_updates_per_iteration: 10
+wm_updates_per_actor: 10
+online_iterations: 20
+batch_size: 256
+imagination_horizon: 13
+gamma: 0.8
+actor_lr: 0.0001
+wm_lr: 0.0001
+eval_every: 5
+initial_success_range: [0.45, 0.60]
+wandb_project: rlinf-refl-pickcube
+wandb_mode: online
+inputs:
+  actor:
+    path: null
+    receipt_path: null
+    sha256: b6756badebbbc817667ef5edc1f4739f8a07149d94d997c452569d12cec00a71
+    version: 9df4739c8888106267735632e240ef53c98c187cf3245ac32755d3ee18fc8db1
+    protocol: single-pickcube-ppo-warmstart-v1
+  world_model:
+    path: null
+    receipt_path: null
+    sha256: 4bb64e7226787407ed82e29ee7945304b2cee4552fb8ebeaf0cc92b3b1e9a471
+    version: a497d816871c6abc2de3464af25fe0bea10b2a53bea3ba3efcec93878b5eb77b
+    protocol: goal-free-physical48-cuboi_nominal_rotvec_v1
+  dataset:
+    path: null
+    receipt_path: null
+    sha256: 738906ea5afda0a589b60dfcad737cf4069a491d19d78a9251a7df122d526fc2
+    version: f268007dd114fdf280de0e865bc133d7182fdcabfc2df3b248c215aa571a9748
+    protocol: dataset793-physical48-env-split-v1
+  bank:
+    path: null
+    receipt_path: null
+    sha256: 5ad5d188dbf419e95d63921afd2816d785dd5a9ba4e20de1436d7f686681bd93
+    version: f268007dd114fdf280de0e865bc133d7182fdcabfc2df3b248c215aa571a9748
+    protocol: pickcube4096-restorable-reference-bank-v1

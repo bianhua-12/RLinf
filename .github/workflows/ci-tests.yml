@@ -176,6 +176,12 @@ jobs:
               - 'tests/e2e_tests/offline_rl/**'
               - '.github/workflows/offline_rl-e2e-tests.yml'
             unit_test_filter: &unit
+              - 'rlinf/algorithms/refl.py'
+              - 'rlinf/models/embodiment/refl_pickcube.py'
+              - 'rlinf/workers/actor/refl_actor_worker.py'
+              - 'rlinf/runners/refl_runner.py'
+              - 'examples/embodiment/train_refl.py'
+              - 'examples/embodiment/config/maniskill_refl_mlp.yaml'
               - *shared
               - 'rlinf/robotics/**'
               # Unit tests import env modules directly (robot task envs, the

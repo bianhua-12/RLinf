@@ -1,0 +1,308 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Colocated policy, differentiable dynamics, and native PickCube collection."""
+
+from collections import deque
+from pathlib import Path
+
+import torch
+
+from rlinf.algorithms.refl import (
+    TransitionWindows,
+    frozen_parameters,
+    imagined_objective,
+    mixed_windows,
+    validate_source_columns,
+    world_model_batch,
+)
+from rlinf.scheduler import Worker
+
+
+class ReFLActorWorker(Worker):
+    def __init__(self, config):
+        super().__init__()
+        self.cfg = config
+        self.env = self.evaluation = None
+        self.iteration = self.actor_updates = self.wm_updates = 0
+
+    def initialize(self):
+        from rlinf.envs.sim.maniskill.refl_pickcube import (
+            KIRSampler,
+            NativeRewardOracle,
+            make_env,
+            validate_reference_bank,
+        )
+        from rlinf.models.embodiment.refl_pickcube import (
+            SingleActor,
+            load_world_model,
+            set_precision,
+            validate_warmstart,
+        )
+        from rlinf.runners.refl_runner import assert_clean_source
+
+        assert_clean_source(Path(self.cfg["repository"]), self.cfg["commit"])
+        if (
+            Path(__file__).resolve().parents[3]
+            != Path(self.cfg["repository"]).resolve()
+        ):
+            raise ValueError("Worker imported a different RLinf checkout")
+        torch.manual_seed(self.cfg["seed"])
+        self.torch_platform.manual_seed_all(self.cfg["seed"])
+        self.device = torch.device("cuda", self.torch_platform.current_device())
+        self.root = Path(self.cfg["output_dir"])
+        self.inputs = {
+            key: torch.load(value["path"], map_location=self.device, weights_only=False)
+            for key, value in self.cfg["inputs"].items()
+        }
+        warm = self.inputs["actor"]
+        if warm.get("format") != "single-pickcube-ppo-warmstart-v1":
+            raise ValueError("Expected the PPO790 warmstart format")
+        validate_warmstart(warm, self.cfg["gamma"])
+        self.actor = SingleActor().to(self.device)
+        self.actor.net.load_state_dict(warm["actor_mean"], strict=True)
+        self.wm = load_world_model(self.inputs["world_model"], self.device)
+        set_precision(self.actor, self.cfg["precision"])
+        set_precision(self.wm, self.cfg["precision"])
+        self.actor_optimizer = torch.optim.Adam(
+            self.actor.parameters(), lr=self.cfg["actor_lr"], betas=(0.9, 0.95)
+        )
+        self.wm_optimizer = torch.optim.Adam(self.wm.parameters(), lr=self.cfg["wm_lr"])
+        packed = self.inputs["dataset"]
+        if packed["coverage"].get("splits") != {
+            "train": [0, 3583],
+            "val": [3584, 3839],
+            "test": [3840, 4095],
+        }:
+            raise ValueError("Expected the dataset793 disjoint environment split")
+        self.train_ids = torch.arange(3584, device=self.device)
+        self.val_ids = torch.arange(3584, 3840, device=self.device)
+        validate_source_columns(packed["data"]["source_env"], 4096)
+        self.fixed = TransitionWindows(packed["data"], self.train_ids, 3)
+        self.fixed_val = TransitionWindows(packed["data"], self.val_ids, 3).sample(512)
+        self.bank = self.inputs["bank"]
+        if tuple(self.bank["observations"].shape[1:]) != (4096, 42):
+            raise ValueError("Expected the original 4096-environment state42 bank")
+        self.online = deque(maxlen=self.cfg["online_iterations"])
+        self.oracle = NativeRewardOracle()
+        self.env = make_env("PickCube-v1", 4096)
+        self.evaluation = make_env("PickCube-v1", 128)
+        source_valid_count = int(self.bank["valid"].sum())
+        self.bank = dict(self.bank)
+        self.bank["valid"] = validate_reference_bank(self.env, self.bank)
+        torch.save(self.bank["valid"].cpu(), self.root / "runtime_bank_valid.pt")
+        self.sampler = KIRSampler(self.bank)
+        self.save_checkpoint("initial.pt")
+        return {
+            "kir_group_counts": self.sampler.group_counts,
+            "reward_source_sha256": self.oracle.provenance,
+            "source_bank_valid_count": source_valid_count,
+            "runtime_bank_valid_count": int(self.bank["valid"].sum()),
+            "reward_model_parameters": 0,
+            "critic_parameters": 0,
+        }
+
+    def train_iteration(self):
+        from rlinf.envs.sim.maniskill.refl_pickcube import collect
+
+        self.iteration += 1
+        data, collection = collect(
+            self.env,
+            self.actor,
+            self.bank,
+            self.sampler,
+            self.iteration,
+            self.cfg["seed"],
+            self.train_ids,
+        )
+        live = data["alive"][:, self.train_ids]
+        truth = data["next_state"][:, self.train_ids][live][:4096]
+        native_reward = data["reward"][:, self.train_ids][live][:4096]
+        native_done = data["terminated"][:, self.train_ids][live][:4096]
+        with torch.no_grad():
+            parity = float((self.oracle(truth) - native_reward).abs().max())
+            if parity > 1e-6 or not torch.equal(
+                self.oracle.terminated(truth), native_done
+            ):
+                raise ValueError("Native state reward/termination parity failed")
+        self.online.append(data)
+        merged = {k: torch.cat([chunk[k] for chunk in self.online]) for k in data}
+        online = TransitionWindows(merged, self.train_ids, 3)
+        actor_starts = TransitionWindows(merged, self.train_ids, 1)
+        batch_size = self.cfg["batch_size"]
+        for _ in range(self.cfg["actor_updates_per_iteration"]):
+            for _ in range(self.cfg["wm_updates_per_actor"]):
+                batch = mixed_windows(self.fixed, online, batch_size)
+                loss, _ = self.wm.replay_loss(world_model_batch(batch))
+                self.wm_optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                wm_norm = torch.nn.utils.clip_grad_norm_(
+                    self.wm.parameters(), 1.0, error_if_nonfinite=True
+                )
+                self.wm_optimizer.step()
+                self.wm_updates += 1
+            self.wm_optimizer.zero_grad(set_to_none=True)
+            start = actor_starts.sample(batch_size)
+            with frozen_parameters(self.wm):
+                objective = imagined_objective(
+                    self.actor,
+                    self.wm,
+                    self.oracle,
+                    start,
+                    self.cfg["imagination_horizon"],
+                    self.cfg["gamma"],
+                )
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                (-objective / self.cfg["imagination_horizon"]).backward()
+                actor_norm = torch.nn.utils.clip_grad_norm_(
+                    self.actor.parameters(), 1.0, error_if_nonfinite=True
+                )
+                if not float(actor_norm) > 0:
+                    raise ValueError("Policy gradient through WM is zero")
+                if any(p.grad is not None for p in self.wm.parameters()):
+                    raise ValueError("Actor update accumulated world-model gradients")
+                torch.nn.utils.clip_grad_value_(self.actor.parameters(), 0.1)
+                self.actor_optimizer.step()
+            self.actor_updates += 1
+        result = {
+            "iteration": self.iteration,
+            "updates/actor": self.actor_updates,
+            "updates/wm": self.wm_updates,
+            "updates/rm": 0,
+            "updates/critic": 0,
+            "actor/bootstrap": 0,
+            "actor/gradient_norm": float(actor_norm),
+            "actor/imagined_objective": float(objective.detach()),
+            "wm/loss": float(loss.detach()),
+            "wm/gradient_norm": float(wm_norm),
+            "reward/native_parity_max": parity,
+            **{"collection/" + key: value for key, value in collection.items()},
+            **self.wm_diagnostics(self.fixed_val, "fixed_val"),
+            **self.wm_diagnostics(
+                TransitionWindows(data, self.val_ids, 3).sample(512), "current_val"
+            ),
+        }
+        self.save_checkpoint("latest.pt")
+        return result
+
+    @torch.no_grad()
+    def wm_diagnostics(self, batch, label):
+        context = {
+            key: batch[key][0] for key in ("previous_state", "previous_action", "reset")
+        }
+        pred = self.wm.rollout(batch["state"][0], batch["action"], **context)
+        truth = batch["next_state"]
+        metrics = {
+            f"wm/{label}/h3_normalized_mse": float(
+                self.wm.residual(pred[-1], truth[-1]).square().mean()
+            )
+        }
+        for name, mask in {
+            "all": torch.ones(len(truth[0]), dtype=torch.bool, device=truth.device),
+            "grasped": truth[..., 18].ge(0.5).any(0),
+            "near_object": truth[..., 36:39].norm(dim=-1).lt(0.06).any(0),
+            "near_goal": truth[..., 39:42].norm(dim=-1).lt(0.05).any(0),
+        }.items():
+            metrics[f"wm/{label}/{name}/count"] = int(mask.sum())
+            if mask.any():
+                metrics[f"wm/{label}/{name}/cube_error_m"] = float(
+                    (pred[-1, mask, 29:32] - truth[-1, mask, 29:32]).norm(dim=-1).mean()
+                )
+                metrics[f"wm/{label}/{name}/reward_error"] = float(
+                    (self.oracle(pred[-1, mask]) - self.oracle(truth[-1, mask]))
+                    .abs()
+                    .mean()
+                )
+        return metrics
+
+    def save_checkpoint(self, name):
+        state = self.fixed_val["state"][0, :8]
+        context = {
+            k: self.fixed_val[k][0, :8]
+            for k in ("previous_state", "previous_action", "reset")
+        }
+        with torch.no_grad():
+            action = self.actor(state)
+            next_state = self.wm.step(state, action, **context)
+        checkpoint = {
+            "format": "rlinf-refl-pickcube-v1",
+            "config": self.cfg,
+            "actor": self.actor.state_dict(),
+            "world_model": self.wm.state_dict(),
+            "world_model_constructor": {
+                k: v for k, v in self.inputs["world_model"].items() if k != "model"
+            },
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "wm_optimizer": self.wm_optimizer.state_dict(),
+            "iteration": self.iteration,
+            "actor_updates": self.actor_updates,
+            "wm_updates": self.wm_updates,
+            "torch_rng": torch.get_rng_state(),
+            "accelerator_rng": self.torch_platform.get_rng_state_all(),
+            "resume_supported": False,
+            "probe": {
+                "state": state,
+                "context": context,
+                "action": action,
+                "next_state": next_state,
+            },
+        }
+        destination = self.root / name
+        temporary = destination.with_suffix(".tmp")
+        torch.save(checkpoint, temporary)
+        temporary.replace(destination)
+
+    def evaluate(self, checkpoint=None, seed=30000):
+        from rlinf.envs.sim.maniskill.refl_pickcube import evaluate_policy
+        from rlinf.models.embodiment.refl_pickcube import (
+            SingleActor,
+            load_world_model,
+            set_precision,
+        )
+
+        actor = self.actor
+        if checkpoint is not None:
+            bundle = torch.load(
+                self.root / checkpoint, map_location=self.device, weights_only=False
+            )
+            if bundle.get("format") != "rlinf-refl-pickcube-v1":
+                raise ValueError("Expected rlinf-refl-pickcube-v1 checkpoint")
+            actor = SingleActor().to(self.device)
+            actor.load_state_dict(bundle["actor"], strict=True)
+            set_precision(actor, self.cfg["precision"])
+            restored_wm = load_world_model(
+                {**bundle["world_model_constructor"], "model": bundle["world_model"]},
+                self.device,
+            )
+            set_precision(restored_wm, self.cfg["precision"])
+            probe = bundle["probe"]
+            with torch.no_grad():
+                action = actor(probe["state"])
+                prediction = restored_wm.step(
+                    probe["state"], action, **probe["context"]
+                )
+            torch.testing.assert_close(action, probe["action"], rtol=0, atol=1e-6)
+            torch.testing.assert_close(
+                prediction, probe["next_state"], rtol=0, atol=1e-6
+            )
+            del restored_wm
+        result, episodes = evaluate_policy(self.evaluation, actor, seed)
+        if checkpoint:
+            torch.save(episodes, self.root / (checkpoint + ".episodes.pt"))
+        return result
+
+    def close(self):
+        for env in (self.env, self.evaluation):
+            if env is not None:
+                env.close()
