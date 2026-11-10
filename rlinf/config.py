@@ -1536,6 +1536,8 @@ def validate_embodied_cfg(cfg):
                     return "pd_ee_delta_pos"
                 elif robot == "panda-ee-target-dpos":  # for GSEnv
                     return "pd_ee_target_delta_pose"
+                elif robot == "panda-ee-delta-pose":
+                    return "pd_ee_delta_pose"
                 elif "google_robot_static" in robot:
                     return "arm_pd_ee_delta_pose_align_interpolate_by_planner_gripper_pd_joint_target_delta_pos_interpolate_by_planner"
                 elif "widowx" in robot:

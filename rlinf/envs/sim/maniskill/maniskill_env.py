@@ -65,6 +65,14 @@ class ManiskillEnv(gym.Env):
         self.num_group = num_envs // cfg.group_size
         self.group_size = cfg.group_size
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
+        self.main_camera = getattr(cfg, "main_camera", "3rd_view_camera")
+        # World-model ReFL: add the physical state and its one-step history
+        # to the observation as ``refl_*`` keys.
+        self.refl_carry = None
+        if getattr(cfg, "refl_physical_state", False):
+            from rlinf.models.embodiment.physical_wm.refl_scorer import CarryTracker
+
+            self.refl_carry = CarryTracker(cfg.max_episode_steps)
 
         self.video_cfg = cfg.video_cfg
 
@@ -180,7 +188,7 @@ class ManiskillEnv(gym.Env):
                 }
 
         # Default
-        obs_image = raw_obs["sensor_data"]["3rd_view_camera"]["rgb"].to(
+        obs_image = raw_obs["sensor_data"][self.main_camera]["rgb"].to(
             torch.uint8
         )  # [B, H, W, C]
         proprioception: torch.Tensor = self.env.unwrapped.agent.robot.get_qpos().to(
@@ -287,6 +295,11 @@ class ManiskillEnv(gym.Env):
         raw_obs, infos = self.env.reset(seed=seed, options=options)
         self._show_goal_site_visual()
         extracted_obs = self._wrap_obs(raw_obs, infos=infos)
+        if self.refl_carry is not None:
+            self.refl_carry.reset(
+                self.env.unwrapped.get_physical_state(), options.get("env_idx")
+            )
+            extracted_obs.update(self.refl_carry.observation(self.elapsed_steps))
         if "env_idx" in options:
             env_idx = options["env_idx"]
             self._reset_metrics(env_idx)
@@ -301,6 +314,9 @@ class ManiskillEnv(gym.Env):
             actions = actions.to(self.device)
         raw_obs, _reward, terminations, truncations, infos = self.env.step(actions)
         extracted_obs = self._wrap_obs(raw_obs, infos=infos)
+        if self.refl_carry is not None:
+            self.refl_carry.step(self.env.unwrapped.get_physical_state(), actions)
+            extracted_obs.update(self.refl_carry.observation(self.elapsed_steps))
         step_reward = self._calc_step_reward(_reward, infos)
 
         infos = self._record_metrics(step_reward, infos)
