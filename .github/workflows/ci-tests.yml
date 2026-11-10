@@ -187,6 +187,8 @@ jobs:
               # CPU diffusion tests use the SD3 model and compose its example config.
               - 'rlinf/models/diffusion/**'
               - 'examples/diffusion/config/**'
+              # CPU tests of the physical world model and its ReFL scorer.
+              - 'rlinf/models/embodiment/physical_wm/**'
               # test_data.py loads this script to test reward split preprocessing.
               - 'examples/reward/preprocess_reward_dataset.py'
               - 'tests/unit_tests/**'

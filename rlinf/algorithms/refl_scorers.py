@@ -67,3 +67,12 @@ def _build_image_reward(cfg: Any, device: torch.device | str) -> ReFLScorer:
 
 
 register_refl_scorer("image_reward", _build_image_reward)
+
+
+def _build_physical_wm(cfg: Any, device: torch.device | str) -> ReFLScorer:
+    from rlinf.models.embodiment.physical_wm.refl_scorer import PhysicalWMScorer
+
+    return PhysicalWMScorer.from_config(cfg, device)
+
+
+register_refl_scorer("physical_wm", _build_physical_wm)

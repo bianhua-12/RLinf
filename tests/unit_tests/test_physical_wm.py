@@ -14,8 +14,13 @@
 
 """Physical-state world model, its ReFL scorer and the env-side carry."""
 
-import torch
+import json
 
+import pytest
+import torch
+from omegaconf import OmegaConf
+
+from rlinf.algorithms.refl_scorers import build_refl_scorer
 from rlinf.models.embodiment.physical_wm.geometry import RobotFK
 from rlinf.models.embodiment.physical_wm.model import (
     SCHEMAS,
@@ -24,6 +29,12 @@ from rlinf.models.embodiment.physical_wm.model import (
     feature_floor,
     load_wm,
     pushcube_reward,
+)
+from rlinf.models.embodiment.physical_wm.refl_scorer import (
+    CARRY_KEYS,
+    CarryTracker,
+    PhysicalWMScorer,
+    decode_env_actions,
 )
 
 
@@ -110,3 +121,82 @@ def test_world_model_step_keeps_kinematics_and_survives_checkpoint():
     torch.testing.assert_close(
         load_wm(wm.checkpoint())(carry, torch.zeros(3, 7)).state, nxt.state
     )
+
+
+def _start(batch):
+    """Scorer inputs at the first step of an episode, as the env sends them."""
+    tracker = CarryTracker(episode_steps=50)
+    tracker.reset(_state(batch))
+    return tracker.observation(torch.zeros(batch, dtype=torch.long))
+
+
+def test_decode_env_actions_unnormalizes_and_keeps_the_hard_gripper():
+    samples = torch.zeros(1, 10, 32)
+    samples[..., 0] = 3.0  # past q99: the controller saturates
+    samples[..., 6] = 1.0  # raw gripper above 0.5: open
+    q01, q99 = torch.full((7,), -0.5), torch.full((7,), 0.5)
+    actions = decode_env_actions(samples, q01, q99)
+    assert actions.shape == (1, 10, 7)
+    torch.testing.assert_close(actions[..., 1], torch.zeros(1, 10), atol=1e-5, rtol=0)
+    assert (actions[..., 0] == 1).all() and (actions[..., 6] == 1).all()
+
+
+def test_scorer_gradient_reaches_only_the_executed_arm_actions(tmp_path):
+    torch.save(_wm().checkpoint(), tmp_path / "wm.pt")
+    stats = {"norm_stats": {"actions": {"q01": [-1.0] * 32, "q99": [1.0] * 32}}}
+    (tmp_path / "norm_stats.json").write_text(json.dumps(stats))
+    cfg = OmegaConf.create(
+        {
+            "type": "physical_wm",
+            "checkpoint_path": str(tmp_path / "wm.pt"),
+            "norm_stats_path": str(tmp_path / "norm_stats.json"),
+            "horizon": 5,
+            "gamma": 0.99,
+        }
+    )
+    scorer = build_refl_scorer(cfg, torch.device("cpu"))
+    assert not any(p.requires_grad for p in scorer.parameters())
+    samples = (0.1 * torch.randn(4, 10, 32)).requires_grad_()
+    rewards = scorer(samples, _start(4))
+    assert rewards.shape == (4,) and torch.isfinite(rewards).all()
+    rewards.sum().backward()
+    grad = samples.grad
+    assert grad[:, :5, :6].abs().sum() > 0
+    assert grad[:, :, 6].abs().sum() == 0  # hard gripper threshold
+    assert grad[:, 5:].abs().sum() == 0  # past the imagination horizon
+    assert grad[..., 7:].abs().sum() == 0  # padded model action dims
+
+
+def test_scorer_rejects_a_malformed_carry():
+    scorer = PhysicalWMScorer(_wm(), -torch.ones(7), torch.ones(7), 5, 0.99)
+    obs = _start(2)
+    obs["refl_context"] = torch.zeros(2)
+    with pytest.raises(ValueError, match="elapsed episode fraction"):
+        scorer(torch.zeros(2, 10, 32), obs)
+
+
+def test_carry_tracker_follows_steps_and_partial_resets():
+    tracker = CarryTracker(episode_steps=50)
+    s0 = torch.zeros(2, 41)
+    tracker.reset(s0)
+    obs = tracker.observation(torch.zeros(2))
+    assert set(obs) == set(CARRY_KEYS.values())
+    assert obs["refl_reset"].tolist() == [1.0, 1.0]
+
+    tracker.step(s0 + 1, torch.full((2, 7), 2.0))
+    obs = tracker.observation(torch.ones(2))
+    torch.testing.assert_close(obs["refl_previous"], s0)
+    torch.testing.assert_close(obs["refl_state"], s0 + 1)
+    torch.testing.assert_close(obs["refl_previous_action"], torch.ones(2, 7))
+    assert obs["refl_reset"].tolist() == [0.0, 0.0]
+    torch.testing.assert_close(obs["refl_context"], torch.full((2, 1), 1 / 50))
+
+    s1 = s0 + 1
+    s1[1] = -5
+    tracker.reset(s1, torch.tensor([1]))
+    obs = tracker.observation(torch.tensor([1, 0]))
+    assert obs["refl_reset"].tolist() == [0.0, 1.0]
+    torch.testing.assert_close(obs["refl_previous"][0], s0[0])
+    torch.testing.assert_close(obs["refl_previous"][1], torch.full((41,), -5.0))
+    torch.testing.assert_close(obs["refl_previous_action"][0], torch.ones(7))
+    assert obs["refl_previous_action"][1].abs().sum() == 0
