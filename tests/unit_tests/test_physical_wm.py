@@ -15,6 +15,7 @@
 """Physical-state world model, its ReFL scorer and the env-side carry."""
 
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -200,3 +201,22 @@ def test_carry_tracker_follows_steps_and_partial_resets():
     torch.testing.assert_close(obs["refl_previous"][1], torch.full((41,), -5.0))
     torch.testing.assert_close(obs["refl_previous_action"][0], torch.ones(7))
     assert obs["refl_previous_action"][1].abs().sum() == 0
+
+
+def test_pushcube_refl_config_composes(monkeypatch):
+    from hydra import compose, initialize_config_dir
+
+    repo = Path(__file__).resolve().parents[2]
+    monkeypatch.setenv("EMBODIED_PATH", str(repo / "examples/embodiment"))
+    with initialize_config_dir(
+        config_dir=str(repo / "examples/embodiment/config"), version_base="1.1"
+    ):
+        cfg = compose(config_name="maniskill_refl_openpi_pi05_pushcube")
+        OmegaConf.resolve(cfg)
+    assert cfg.algorithm.loss_type == "embodied_refl"
+    assert cfg.algorithm.refl_margin is None
+    assert cfg.actor.refl_reward_model.type == "physical_wm"
+    assert cfg.actor.model.openpi.refl_late_fraction == 0.5
+    assert cfg.actor.model.num_steps == 4
+    assert cfg.env.train.refl_physical_state and cfg.env.eval.refl_physical_state
+    assert cfg.env.train.init_params.id == "PushCubeReFL-v1"

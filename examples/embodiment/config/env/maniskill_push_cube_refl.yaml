@@ -1,0 +1,43 @@
+env_type: maniskill
+
+total_num_envs: null
+
+# Policy input: base_camera RGB, qpos and the task instruction.
+wrap_obs_mode: default
+main_camera: base_camera
+# Add the 41-D physical state and its one-step history (refl_* keys) that the
+# world-model ReFL scorer starts from.
+refl_physical_state: True
+auto_reset: True
+ignore_terminations: False
+use_rel_reward: False
+reward_mode: raw
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: False
+max_steps_per_rollout_epoch: 50
+max_episode_steps: 50 # also the world-model episode length (context = t / 50)
+
+video_cfg:
+  save_video: False
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+enable_offload: False
+
+init_params:
+  id: "PushCubeReFL-v1"
+  num_envs: null # will be set in ManiSkillEnv init
+  obs_mode: "rgb"
+  control_mode: "pd_ee_delta_pose"
+  reward_mode: "normalized_dense"
+  sim_backend: "gpu"
+  sim_config:
+    sim_freq: 100
+    control_freq: 20
+  max_episode_steps: ${..max_episode_steps}
+  sensor_configs:
+    shader_pack: "default"
+    width: 224
+    height: 224
+  render_mode: all
