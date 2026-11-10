@@ -98,7 +98,8 @@ def compute_grpo_advantages(
 
     Args:
         rewards (torch.Tensor): Reward or score values. Shape: [num_groups, group_size]
-        loss_mask (torch.Tensor): Loss mask for valid entries. Shape: [num_groups, group_size]
+        loss_mask (torch.Tensor): Loss mask for valid entries. Shape: [num_groups, group_size].
+            None for embodied rollouts without an episode mask (auto-reset envs).
         group_size (int): Group size for advantage computation.
 
     Returns:
@@ -420,7 +421,8 @@ def compute_raw_advantages(
 
     Args:
         rewards (torch.Tensor): Reward or score values. Shape: [num_groups, group_size]
-        loss_mask (torch.Tensor): Loss mask for valid entries. Shape: [num_groups, group_size]
+        loss_mask (torch.Tensor): Loss mask for valid entries. Shape: [num_groups, group_size].
+            None for embodied rollouts without an episode mask (auto-reset envs).
         normalize_advantages (bool): Whether to normalize advantages.
 
     Returns:
@@ -428,6 +430,9 @@ def compute_raw_advantages(
     """
     if rewards.ndim == 2:
         rewards = rewards.reshape(-1)
+    if loss_mask is None:
+        # Auto-reset embodied rollouts have no episode mask: every step is valid.
+        loss_mask = rewards.new_ones(kwargs["n_steps"], rewards.shape[0])
     advantages = rewards.unsqueeze(0).expand_as(loss_mask) * loss_mask
 
     # Simple baseline subtraction (mean of valid advantages)

@@ -296,6 +296,22 @@ def test_reinpp_baseline_leaves_the_caller_rewards_unchanged():
     assert rewards.tolist() == [1.0, 0.0, 1.0, 1.0]
 
 
+def test_raw_embodied_advantages_cover_every_step_without_a_loss_mask():
+    # Auto-reset envs give no loss mask; each step carries its episode score.
+    rewards = torch.tensor([[[1.0], [0.0]], [[2.0], [3.0]]])  # [chunk_steps, bsz, 1]
+    advantages = calculate_adv_and_returns(
+        task_type="embodied",
+        adv_type="raw",
+        rewards=rewards,
+        dones=torch.zeros(3, 2, 1, dtype=torch.bool),
+        loss_mask=None,
+        reward_type="chunk_level",
+        group_size=1,
+    )["advantages"]
+    assert advantages.shape == (2, 2, 1)
+    assert advantages[..., 0].tolist() == [[3.0, 3.0], [3.0, 3.0]]
+
+
 def _load_checkpoint_utils():
     module_path = (
         Path(__file__).resolve().parents[2] / "rlinf" / "utils" / "checkpoint.py"
