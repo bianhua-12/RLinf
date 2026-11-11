@@ -56,6 +56,9 @@ class Pi0RLConfig:
     # ReFL: fraction of the latest denoising steps stored for the one-step x0
     # prediction (0 disables). With 4 steps, 0.5 keeps t = 0.5 and 0.25.
     refl_late_fraction: float = 0.0
+    # ReFL gradient path: "late_one_step" predicts x0 in one step from a stored
+    # late flow state; "full_chain" replays every flow step with grad.
+    refl_grad_mode: str = "late_one_step"
     config_name: str = ""
 
 
@@ -599,11 +602,18 @@ class Pi0RL(EnvIO, Pi0):
         The model owns the choice of flow state: ``xt_source`` picks a stored
         late rollout state or renoises the executed ``x0``. ``refl_inputs``
         overrides that choice with an explicit ``x_t`` and ``timesteps``.
+        ``rl_cfg.refl_grad_mode`` of ``full_chain`` ignores both and replays
+        the whole flow ODE from the rollout noise instead.
         Returns ``samples`` in model action space, [B, horizon, action_dim].
         """
         del kwargs
         observation = self._observation_from_forward_inputs(forward_inputs)
         _, prefix_mask, kv_cache = self._build_prefix_cache_for_actor(observation)
+        if self.rl_cfg.refl_grad_mode == "full_chain":
+            samples = self._refl_full_chain(
+                observation, prefix_mask, kv_cache, forward_inputs
+            )
+            return {"samples": samples}
         if refl_inputs is None:
             refl_inputs = self._sample_refl_state(forward_inputs, xt_source)
         x_t = refl_inputs["x_t"].to(device=self.device, dtype=torch.float32)
@@ -634,6 +644,39 @@ class Pi0RL(EnvIO, Pi0):
         x0 = forward_inputs["x0"]
         t_bc = t.view(-1, *([1] * (x0.ndim - 1)))
         return {"x_t": (1 - t_bc) * x0 + t_bc * torch.randn_like(x0), "timesteps": t}
+
+    def _refl_full_chain(
+        self,
+        observation: Observation,
+        prefix_mask: torch.Tensor,
+        kv_cache: Any,
+        forward_inputs: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Replay the flow ODE from the rollout noise with every step in the graph.
+
+        Reuses the rollout's own noise (``chains[:, 0]``), so with ``flow_ode``
+        the replayed ``x0`` matches the executed one up to recompute error.
+        """
+        x_t = forward_inputs["chains"][:, 0].to(device=self.device, dtype=torch.float32)
+        batch = x_t.shape[0]
+        timesteps = rl_sampler.get_timesteps(self.num_steps, self.device)
+        idx_step = torch.empty(batch, device=self.device, dtype=torch.long)
+        for idx in range(self.num_steps):
+            t = torch.full(
+                (batch,), float(timesteps[idx]), device=self.device, dtype=torch.float32
+            )
+            suffix_act = self.run_suffix(observation, x_t, t, kv_cache, prefix_mask)
+            v_t = self.velocity_from_suffix(suffix_act).to(torch.float32)
+            idx_step.fill_(idx)
+            x_t, _ = rl_sampler.sample_mean_var(
+                x_t,
+                v_t,
+                idx_step,
+                noise_method="flow_ode",
+                noise_level=0.0,
+                num_steps=self.num_steps,
+            )
+        return x_t
 
 
 def _clone_replay_obs(repacked: dict[str, Any]) -> dict[str, Any]:

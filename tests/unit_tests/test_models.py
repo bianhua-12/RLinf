@@ -1755,6 +1755,42 @@ def test_lingbotvlav2_smoke_config_composes(monkeypatch):
     assert cfg.runner.max_steps == 2 and cfg.env.train.total_num_envs == 4
 
 
+def test_pi0_refl_full_chain_replays_the_rollout_sample():
+    rl = pytest.importorskip("rlinf.models.embodiment.openpi.tasks.rl")
+    from rlinf.models.embodiment.openpi.sampling import rl_sampler
+
+    num_steps = 4
+    torch.manual_seed(0)
+    noise = torch.randn(2, 3, 4)
+    # A fixed velocity field, so the replay and the rollout see the same model.
+    velocity = torch.randn(2, 3, 4)
+
+    owner = SimpleNamespace(
+        num_steps=num_steps,
+        device=torch.device("cpu"),
+        rl_cfg=SimpleNamespace(refl_grad_mode="full_chain"),
+        run_suffix=lambda *a, **k: None,
+        velocity_from_suffix=lambda _: velocity,
+    )
+    replayed = rl.Pi0RL._refl_full_chain(
+        owner, None, None, None, {"chains": noise[:, None].expand(2, 5, 3, 4)}
+    )
+
+    # The rollout path: the same Euler steps through sample_mean_var.
+    x_t, idx = noise, torch.zeros(2, dtype=torch.long)
+    for step in range(num_steps):
+        idx.fill_(step)
+        x_t, _ = rl_sampler.sample_mean_var(
+            x_t,
+            velocity,
+            idx,
+            noise_method="flow_ode",
+            noise_level=0.0,
+            num_steps=num_steps,
+        )
+    torch.testing.assert_close(replayed, x_t)
+
+
 @pytest.mark.parametrize("xt_source", ["rollout", "resample"])
 def test_pi0_refl_samples_a_late_state_when_none_is_given(xt_source):
     rl = pytest.importorskip("rlinf.models.embodiment.openpi.tasks.rl")

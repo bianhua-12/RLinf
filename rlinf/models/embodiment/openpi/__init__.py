@@ -187,6 +187,9 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
             refl_late_fraction=float(
                 OmegaConf.select(model_cfg, "refl_late_fraction", default=0.0)
             ),
+            refl_grad_mode=str(
+                OmegaConf.select(model_cfg, "refl_grad_mode", default="late_one_step")
+            ),
             config_name=config_name,
         )
         model = Pi0RL(
