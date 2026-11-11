@@ -47,7 +47,9 @@ class EmbodiedReFLFSDPPolicy(EmbodiedFSDPActor):
 
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
-        self.refl_margin = float(cfg.algorithm.refl_margin)
+        # None maximises the raw reward; a float applies the paper's hinge.
+        margin = cfg.algorithm.get("refl_margin", None)
+        self.refl_margin = None if margin is None else float(margin)
         self.refl_grad_scale = float(cfg.algorithm.refl_grad_scale)
         self.refl_xt_source = str(cfg.algorithm.refl_xt_source)
         self.refl_pre_loss_weight = float(cfg.algorithm.refl_pre_loss_weight)
@@ -109,7 +111,10 @@ class EmbodiedReFLFSDPPolicy(EmbodiedFSDPActor):
                 f"ReFL scorer must return rewards of shape {samples.shape[:1]}, "
                 f"got {rewards.shape}."
             )
-        loss = F.relu(self.refl_margin - rewards).mean() * self.refl_grad_scale
+        if self.refl_margin is None:
+            loss = -rewards.mean() * self.refl_grad_scale
+        else:
+            loss = F.relu(self.refl_margin - rewards).mean() * self.refl_grad_scale
         return loss, {
             "actor/refl_reward": rewards.mean().item(),
             "actor/refl_reward_loss": loss.item(),
