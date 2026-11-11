@@ -1729,6 +1729,9 @@ class EnvOutput:
         }
         if "reset_mask" in obs:
             prepared["reset_mask"] = obs["reset_mask"]
+        # Inputs of a differentiable ReFL scorer, such as the simulator state a
+        # world model starts from.
+        prepared.update({k: v for k, v in obs.items() if k.startswith("refl_")})
         return prepared
 
     def to_dict(self) -> dict[str, Any]:

@@ -1753,3 +1753,54 @@ def test_lingbotvlav2_smoke_config_composes(monkeypatch):
     )
     assert cfg.algorithm.adv_type == "gae" and cfg.algorithm.loss_type == "actor_critic"
     assert cfg.runner.max_steps == 2 and cfg.env.train.total_num_envs == 4
+
+
+@pytest.mark.parametrize("xt_source", ["rollout", "resample"])
+def test_pi0_refl_samples_a_late_state_when_none_is_given(xt_source):
+    rl = pytest.importorskip("rlinf.models.embodiment.openpi.tasks.rl")
+
+    torch.manual_seed(0)
+    latents = torch.randn(3, 2, 4, 5)
+    forward_inputs = {
+        "latents": latents,
+        "timesteps": torch.tensor([[0.5, 0.25]] * 3),
+        "x0": torch.randn(3, 4, 5),
+    }
+    owner = SimpleNamespace()
+    picked = rl.Pi0RL._sample_refl_state(owner, forward_inputs, xt_source)
+
+    assert picked["x_t"].shape == (3, 4, 5)
+    assert set(picked["timesteps"].tolist()) <= {0.5, 0.25}
+    if xt_source == "rollout":
+        # Every row must be one of the states the rollout passed through.
+        assert all(
+            any(torch.equal(picked["x_t"][i], latents[i, s]) for s in range(2))
+            for i in range(3)
+        )
+
+
+def test_pi0_refl_rejects_an_unknown_xt_source():
+    rl = pytest.importorskip("rlinf.models.embodiment.openpi.tasks.rl")
+
+    with pytest.raises(ValueError, match="xt_source"):
+        rl.Pi0RL._sample_refl_state(SimpleNamespace(), {}, "nonsense")
+
+
+@pytest.mark.parametrize(
+    ("late_fraction", "kept"), [(0.5, [0.5, 0.25]), (0.25, [0.25]), (1.0, None)]
+)
+def test_pi0_refl_inputs_keep_the_late_flow_states(late_fraction, kept):
+    rl = pytest.importorskip("rlinf.models.embodiment.openpi.tasks.rl")
+    from rlinf.models.embodiment.openpi.sampling.rl_sampler import get_timesteps
+
+    owner = SimpleNamespace(
+        num_steps=4, rl_cfg=SimpleNamespace(refl_late_fraction=late_fraction)
+    )
+    # chains[:, i] is the flow state at timesteps[i]; chains[:, -1] is x0.
+    chains = torch.arange(2 * 5, dtype=torch.float32).reshape(2, 5, 1, 1)
+    timesteps = get_timesteps(4, "cpu")
+    out = rl.Pi0RL._refl_forward_inputs(owner, chains, timesteps, chains[:, -1])
+    kept = kept or timesteps[:4].tolist()
+    torch.testing.assert_close(out["timesteps"], torch.tensor([kept] * 2))
+    torch.testing.assert_close(out["latents"], chains[:, 4 - len(kept) : 4])
+    torch.testing.assert_close(out["x0"], chains[:, 4])

@@ -931,6 +931,16 @@ def test_infer_obs_batch_size_raises_when_unbatched():
         infer_obs_batch_size({"obs": {}})
 
 
+def test_env_output_forwards_refl_scorer_inputs_to_the_policy():
+    state = torch.arange(6.0).reshape(2, 3)
+    obs = {"states": torch.zeros(2, 3), "refl_state": state, "unused": torch.ones(2)}
+    sent = EnvOutput(obs=obs, final_obs=obs).to_dict()
+
+    assert torch.equal(sent["obs"]["refl_state"], state)
+    assert torch.equal(sent["final_obs"]["refl_state"], state)
+    assert "unused" not in sent["obs"]
+
+
 def test_env_output_composes_one_transition_object():
     transition = EnvTransition(
         rewards=torch.ones(2, 1),

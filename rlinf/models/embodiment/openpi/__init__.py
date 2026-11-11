@@ -184,6 +184,9 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
                 OmegaConf.select(model_cfg, "train_expert_only", default=False)
             ),
             is_nft=bool(OmegaConf.select(model_cfg, "is_nft", default=False)),
+            refl_late_fraction=float(
+                OmegaConf.select(model_cfg, "refl_late_fraction", default=0.0)
+            ),
             config_name=config_name,
         )
         model = Pi0RL(

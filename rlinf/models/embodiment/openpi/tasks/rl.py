@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import random
 from typing import Any, Literal, Sequence
 
@@ -52,6 +53,9 @@ class Pi0RLConfig:
     chunk_critic_input: bool = False
     train_expert_only: bool = False
     is_nft: bool = False
+    # ReFL: fraction of the latest denoising steps stored for the one-step x0
+    # prediction (0 disables). With 4 steps, 0.5 keeps t = 0.5 and 0.25.
+    refl_late_fraction: float = 0.0
     config_name: str = ""
 
 
@@ -173,6 +177,12 @@ class Pi0RL(EnvIO, Pi0):
         )
         # Match OpenPI: stash raw env obs so the actor can re-transform.
         result["forward_inputs"].update(_clone_replay_obs(repacked))
+        if self.rl_cfg.refl_late_fraction > 0:
+            # Env-provided inputs of a differentiable ReFL scorer (e.g. the
+            # simulator state a world model starts from) ride along unchanged.
+            for key, value in env_obs.items():
+                if key.startswith("refl_") and torch.is_tensor(value):
+                    result["forward_inputs"][key] = value.detach().contiguous()
         return actions, result
 
     def _predict_train(
@@ -310,6 +320,10 @@ class Pi0RL(EnvIO, Pi0):
         if nft_state is not None:
             forward_inputs.update(nft_state)
             forward_inputs["nft_x0"] = x_0.detach()
+        if rl_cfg.refl_late_fraction > 0:
+            forward_inputs.update(
+                self._refl_forward_inputs(chains_tensor, timesteps, x_0)
+            )
 
         return actions, {
             "prev_logprobs": log_probs_picked,
@@ -413,6 +427,8 @@ class Pi0RL(EnvIO, Pi0):
             return self.default_forward(**kwargs)
         if forward_type == ForwardType.NFT:
             return self.nft_forward(**kwargs)
+        if forward_type == ForwardType.REFL:
+            return self.refl_forward(**kwargs)
         if forward_type == ForwardType.SFT:
             return super().sft_forward(**kwargs)
         raise NotImplementedError(
@@ -549,6 +565,75 @@ class Pi0RL(EnvIO, Pi0):
                     self.value_head, suffix_act, action_chunk=self.action_chunk
                 )[:, None]
         return result
+
+    def _refl_forward_inputs(
+        self, chains: torch.Tensor, timesteps: torch.Tensor, x_0: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Keep the late denoising window ReFL samples its states from.
+
+        ``chains[:, i]`` is the state at ``timesteps[i]`` (1 = noise, 0 = data),
+        the layout the ReFL worker shares with SD3.
+        """
+        num_steps = self.num_steps
+        start = num_steps - math.ceil(num_steps * self.rl_cfg.refl_late_fraction)
+        start = min(max(start, 0), num_steps - 1)
+        batch = chains.shape[0]
+        return {
+            "latents": chains[:, start:num_steps].detach().contiguous(),
+            "timesteps": timesteps[start:num_steps][None]
+            .expand(batch, -1)
+            .float()
+            .contiguous(),
+            "x0": x_0.detach().contiguous(),
+        }
+
+    def refl_forward(
+        self,
+        forward_inputs: dict[str, torch.Tensor],
+        refl_inputs: dict[str, torch.Tensor] | None = None,
+        xt_source: str = "rollout",
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        """One-step x0 prediction ``x_t - t * v(x_t, t)`` with grad to the expert.
+
+        The model owns the choice of flow state: ``xt_source`` picks a stored
+        late rollout state or renoises the executed ``x0``. ``refl_inputs``
+        overrides that choice with an explicit ``x_t`` and ``timesteps``.
+        Returns ``samples`` in model action space, [B, horizon, action_dim].
+        """
+        del kwargs
+        observation = self._observation_from_forward_inputs(forward_inputs)
+        _, prefix_mask, kv_cache = self._build_prefix_cache_for_actor(observation)
+        if refl_inputs is None:
+            refl_inputs = self._sample_refl_state(forward_inputs, xt_source)
+        x_t = refl_inputs["x_t"].to(device=self.device, dtype=torch.float32)
+        t = refl_inputs["timesteps"].to(device=self.device, dtype=torch.float32)
+        suffix_act = self.run_suffix(observation, x_t, t, kv_cache, prefix_mask)
+        v_t = self.velocity_from_suffix(suffix_act).to(torch.float32)
+        return {"samples": x_t - t[:, None, None] * v_t}
+
+    def _sample_refl_state(
+        self, forward_inputs: dict[str, torch.Tensor], xt_source: str
+    ) -> dict[str, torch.Tensor]:
+        """Pick one late flow state per sample, with ``t`` in [0, 1].
+
+        ``rollout`` reuses a state the rollout actually passed through;
+        ``resample`` renoises the executed ``x0`` to the same time.
+        """
+        if xt_source not in {"rollout", "resample"}:
+            raise ValueError(
+                "OpenPI ReFL xt_source must be 'rollout' or 'resample', "
+                f"got {xt_source!r}."
+            )
+        latents = forward_inputs["latents"]
+        rows = torch.arange(latents.shape[0], device=latents.device)
+        steps = torch.randint(0, latents.shape[1], rows.shape, device=latents.device)
+        t = forward_inputs["timesteps"][rows, steps]
+        if xt_source == "rollout":
+            return {"x_t": latents[rows, steps], "timesteps": t}
+        x0 = forward_inputs["x0"]
+        t_bc = t.view(-1, *([1] * (x0.ndim - 1)))
+        return {"x_t": (1 - t_bc) * x0 + t_bc * torch.randn_like(x0), "timesteps": t}
 
 
 def _clone_replay_obs(repacked: dict[str, Any]) -> dict[str, Any]:
